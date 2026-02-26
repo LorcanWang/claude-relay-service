@@ -1093,50 +1093,22 @@ class ClaudeRelayService {
 
     // 如果不是真实的 Claude Code 请求，需要设置 Claude Code 系统提示词
     if (!isRealClaudeCode) {
-      const claudeCodePrompt = {
-        type: 'text',
-        text: this.claudeCodeSystemPrompt,
-        cache_control: {
-          type: 'ephemeral'
-        }
+      if (typeof processedBody.system === 'string') {
+        // 字符串格式：规范化为数组
+        processedBody.system = [{ type: 'text', text: processedBody.system }]
       }
 
-      if (processedBody.system) {
-        if (typeof processedBody.system === 'string') {
-          // 字符串格式：转换为数组，Claude Code 提示词在第一位
-          const userSystemPrompt = {
+      if (!Array.isArray(processedBody.system) || processedBody.system.length === 0) {
+        // 客户端没有提供 system prompt，注入 Claude Code 默认提示词
+        processedBody.system = [
+          {
             type: 'text',
-            text: processedBody.system
+            text: this.claudeCodeSystemPrompt,
+            cache_control: { type: 'ephemeral' }
           }
-          // 如果用户的提示词与 Claude Code 提示词相同，只保留一个
-          if (processedBody.system.trim() === this.claudeCodeSystemPrompt) {
-            processedBody.system = [claudeCodePrompt]
-          } else {
-            processedBody.system = [claudeCodePrompt, userSystemPrompt]
-          }
-        } else if (Array.isArray(processedBody.system)) {
-          // 检查第一个元素是否是 Claude Code 系统提示词
-          const firstItem = processedBody.system[0]
-          const isFirstItemClaudeCode =
-            firstItem && firstItem.type === 'text' && firstItem.text === this.claudeCodeSystemPrompt
-
-          if (!isFirstItemClaudeCode) {
-            // 如果第一个不是 Claude Code 提示词，需要在开头插入
-            // 同时检查数组中是否有其他位置包含 Claude Code 提示词，如果有则移除
-            const filteredSystem = processedBody.system.filter(
-              (item) => !(item && item.type === 'text' && item.text === this.claudeCodeSystemPrompt)
-            )
-            processedBody.system = [claudeCodePrompt, ...filteredSystem]
-          }
-        } else {
-          // 其他格式，记录警告但不抛出错误，尝试处理
-          logger.warn('⚠️ Unexpected system field type:', typeof processedBody.system)
-          processedBody.system = [claudeCodePrompt]
-        }
-      } else {
-        // 用户没有传递 system，需要添加 Claude Code 提示词
-        processedBody.system = [claudeCodePrompt]
+        ]
       }
+      // 客户端提供了自己的 system prompt，保留不变
     }
 
     // 移除 x-anthropic-billing-header 系统元素，避免将客户端 billing 标识传递给上游 API
@@ -1501,8 +1473,11 @@ class ClaudeRelayService {
     requestPayload = extensionResult.body
     finalHeaders = extensionResult.headers
 
+    // API 客户端（有自定义 system prompt）跳过工具名称变换，避免破坏 run_skill 等自定义工具
+    const isApiClient = Array.isArray(requestPayload?.system) && requestPayload.system.length > 0
+
     let toolNameMap = null
-    if (!isRealClaudeCode) {
+    if (!isRealClaudeCode && !isApiClient) {
       toolNameMap = this._transformToolNamesInRequestBody(requestPayload, {
         useRandomizedToolNames: requestOptions.useRandomizedToolNames === true
       })

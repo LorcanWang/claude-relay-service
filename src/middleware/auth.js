@@ -537,7 +537,11 @@ const authenticateApiKey = async (req, res, next) => {
           if (globalClaudeCodeOnly || keyClaudeCodeOnly) {
             const isClaudeCode = ClaudeCodeValidator.validate(req)
 
-            if (!isClaudeCode) {
+            // API 客户端（有自定义 system prompt）允许通过，不受 Claude Code-only 限制
+            const hasCustomSystemPrompt =
+              Array.isArray(req.body?.system) && req.body.system.length > 0
+
+            if (!isClaudeCode && !hasCustomSystemPrompt) {
               const clientIP = req.ip || req.connection?.remoteAddress || 'unknown'
               logger.api(
                 `❌ Claude Code client validation failed (global: ${globalClaudeCodeOnly}, key: ${keyClaudeCodeOnly}) from ${clientIP}`

@@ -657,6 +657,72 @@ gpt-5                      # Codex使用固定模型ID
 
 ---
 
+## 🤖 Skill Runner & Orchestrator (Lynx/Zeon AI Stack)
+
+This deployment includes two additional Python services that power the Lynx/Zeon chat frontend. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for full details.
+
+### Skill Runner (port 8081)
+
+HTTP wrapper around skill `run.py` entrypoints in `SKILL_ROOT`.
+
+**Start:**
+```bash
+cd /home/hqzn/claude-relay-service/runner
+RUNNER_KEY=<key from .env> \
+SKILL_ROOT=/home/hqzn/grantllama-scrape-skill/.claude/skills \
+PORT=8081 \
+nohup python3 main.py >> runner.log 2>&1 &
+echo $! > runner.pid
+```
+
+**Endpoints:**
+- `GET /health` → `{"status":"ok"}`
+- `GET /skills` → list all skills with `ready` status
+- `POST /run_skill` → `{"name":"web-search","args":{"action":"search","query":"..."}}`
+
+**Auth:** `Authorization: Bearer <RUNNER_KEY>`
+
+### Orchestrator (port 8090)
+
+Runs the full Anthropic tool loop, maintains Redis sessions, and streams SSE responses to the frontend.
+
+**Start:**
+```bash
+cd /home/hqzn/claude-relay-service/orchestrator
+RUNNER_KEY=<key from .env> \
+SKILL_ROOT=/home/hqzn/grantllama-scrape-skill/.claude/skills \
+ORCHESTRATOR_PORT=8090 \
+nohup python3 main.py >> orchestrator.log 2>&1 &
+echo $! > orchestrator.pid
+```
+
+**Endpoints:**
+- `GET /health` → `{"status":"ok"}`
+- `POST /chat` → run AI loop, stream SSE response
+- `DELETE /sessions/{orgId}_{userId}` → clear session
+
+**Auth:** `Authorization: Bearer <RUNNER_KEY>`
+
+### Manage Skills
+
+Use the `manage-skills` Claude Code skill to inspect and manage skill entrypoints:
+
+```bash
+# List all skills and runner status
+python3 .claude/skills/manage-skills/manage.py list
+
+# Inspect Python functions in a skill
+python3 .claude/skills/manage-skills/manage.py inspect <skill-name>
+
+# Reload runner or orchestrator after changes
+python3 .claude/skills/manage-skills/manage.py reload-runner
+python3 .claude/skills/manage-skills/manage.py reload-orchestrator
+```
+
+The shared bearer token (`RUNNER_KEY`) is stored in `.env` and never changes.
+
+---
+
 ## 🔧 日常维护
 
 ### 服务管理

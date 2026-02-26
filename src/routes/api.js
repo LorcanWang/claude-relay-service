@@ -21,6 +21,7 @@ const {
 } = require('../utils/warmupInterceptor')
 const { sanitizeUpstreamError } = require('../utils/errorSanitizer')
 const { dumpAnthropicMessagesRequest } = require('../utils/anthropicRequestDump')
+const ClaudeCodeValidator = require('../validators/clients/claudeCodeValidator')
 const {
   handleAnthropicMessagesToGemini,
   handleAnthropicCountTokensToGemini
@@ -214,6 +215,15 @@ async function handleMessagesRequest(req, res) {
     if (forcedVendor === 'gemini-cli' || forcedVendor === 'antigravity') {
       const baseModel = (req.body.model || '').trim()
       return await handleAnthropicMessagesToGemini(req, res, { vendor: forcedVendor, baseModel })
+    }
+
+    // 为没有 metadata.user_id 的 API 客户端注入稳定的会话 ID
+    if (!req.body.metadata?.user_id) {
+      const clientSessionId = req.headers['x-session-id']
+      if (clientSessionId) {
+        if (!req.body.metadata) req.body.metadata = {}
+        req.body.metadata.user_id = `api_${clientSessionId}`
+      }
     }
 
     // 检查是否为流式请求
@@ -1668,7 +1678,13 @@ router.post('/v1/messages/count_tokens', authenticateApiKey, async (req, res) =>
   }
 
   // 🔗 检测旧会话（污染的会话）- 仅对需要绑定的新会话检查
-  if (sessionValidation.isNewSession && originalSessionId) {
+  // API 客户端（有自定义 system prompt）跳过旧会话检测，因为多轮对话是正常的
+  const isApiClientCountTokens =
+    Array.isArray(req.body?.system) &&
+    req.body.system.length > 0 &&
+    !ClaudeCodeValidator.includesClaudeCodeSystemPrompt(req.body)
+
+  if (sessionValidation.isNewSession && originalSessionId && !isApiClientCountTokens) {
     if (isOldSession(req.body)) {
       const cfg = await claudeRelayConfigService.getConfig()
       logger.warn(
