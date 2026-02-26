@@ -150,10 +150,13 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
 
         session = get_session(session_id) or new_session(session_id)
 
-        # Append new user messages from this request
-        for msg in req.messages:
-            if msg.role == "user":
-                session["messages"].append(ui_to_anthropic(msg))
+        # Only append the LAST user message from this request.
+        # The session already contains full history from Redis;
+        # the frontend (useChat) sends all messages each time,
+        # so appending them all would cause duplicates.
+        user_messages = [msg for msg in req.messages if msg.role == "user"]
+        if user_messages:
+            session["messages"].append(ui_to_anthropic(user_messages[-1]))
 
         # ── build full system prompt ──────────────────────────────────────────
         full_system = build_system_prompt(req.systemPrompt, [s.dict() for s in req.enabledSkills])
