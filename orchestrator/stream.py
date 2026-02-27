@@ -46,8 +46,8 @@ async def stream_text(
     # Emit actions as native AI SDK data events before finish.
     # The 2: prefix populates useChat's `data` array on the frontend.
     if actions:
-        payload = json.dumps(actions, ensure_ascii=False)
-        yield f"data: 2:{payload}\n\n"
+        for action in actions:
+            yield _sse({"type": "data-action", "data": action})
 
     yield _sse({"type": "finish-step"})
     yield _sse({"type": "finish", "finishReason": finish_reason})
