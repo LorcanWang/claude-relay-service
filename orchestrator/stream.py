@@ -23,10 +23,14 @@ def _sse(data) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
-async def stream_text(text: str, finish_reason: str = "stop") -> AsyncIterator[str]:
+async def stream_text(
+    text: str, actions: list[dict] | None = None, finish_reason: str = "stop"
+) -> AsyncIterator[str]:
     """
     Yield SSE events for a complete text response.
     Chunks the text into ~20-char pieces for a streaming feel.
+    If actions are provided they are emitted as AI SDK data events (2: prefix)
+    so useChat's data array receives them natively.
     """
     CHUNK = 20
 
@@ -38,6 +42,13 @@ async def stream_text(text: str, finish_reason: str = "stop") -> AsyncIterator[s
         yield _sse({"type": "text-delta", "id": "0", "delta": text[i : i + CHUNK]})
 
     yield _sse({"type": "text-end", "id": "0"})
+
+    # Emit actions as native AI SDK data events before finish.
+    # The 2: prefix populates useChat's `data` array on the frontend.
+    if actions:
+        payload = json.dumps(actions, ensure_ascii=False)
+        yield f"data: 2:{payload}\n\n"
+
     yield _sse({"type": "finish-step"})
     yield _sse({"type": "finish", "finishReason": finish_reason})
     yield _sse("[DONE]")

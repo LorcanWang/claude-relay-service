@@ -69,4 +69,16 @@ def build_system_prompt(base_prompt: str, enabled_skills: list[dict]) -> str:
             "Always run the command with the exact Python invocation shown (e.g. python3 ads.py ...)."
         )
 
+    parts.append(
+        "## App Actions\n"
+        "You have access to an app_action tool that controls the Zeon webapp directly.\n"
+        "Use it proactively after completing tasks:\n"
+        "- Call app_action(action='navigate', path='/some/path') to send the user to a relevant page "
+        "after creating or updating something (e.g. after creating issue #abc123, navigate to /issues/abc123).\n"
+        "- Call app_action(action='toast', message='...') to show a brief success or error notification "
+        "without navigating away.\n"
+        "Always call app_action as a tool — never describe the action in text alone. "
+        "You may chain it after a run_command in the same loop."
+    )
+
     return "\n\n".join(parts)

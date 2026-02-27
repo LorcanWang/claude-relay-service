@@ -27,6 +27,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
 from anthropic_client import (
+    APP_ACTION_TOOL,
     RUN_COMMAND_TOOL,
     call_anthropic,
     extract_text,
@@ -92,8 +93,9 @@ class ChatRequest(BaseModel):
     systemPrompt: str
     enabledSkills: list[SkillMeta] = []
     anthropicConfig: AnthropicConfig
-    orgId: str
-    userId: str
+    sessionId: Optional[str] = None   # preferred: pre-built by frontend
+    orgId: Optional[str] = None       # fallback: construct session key from these
+    userId: Optional[str] = None
     clearSession: Optional[bool] = False
 
 
@@ -140,7 +142,7 @@ def delete_session(session_id: str, _=Depends(verify_token)):
 @app.post("/chat")
 async def chat(req: ChatRequest, _=Depends(verify_token)):
     async def event_stream():
-        session_id = f"{req.orgId}_{req.userId}"
+        session_id = req.sessionId or f"{req.orgId}_{req.userId}"
         enabled_names = [s.name for s in req.enabledSkills]
         model = req.anthropicConfig.model or DEFAULT_MODEL
 
@@ -160,7 +162,7 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
 
         # ── build full system prompt ──────────────────────────────────────────
         full_system = build_system_prompt(req.systemPrompt, [s.dict() for s in req.enabledSkills])
-        tools = [RUN_COMMAND_TOOL] if req.enabledSkills else []
+        tools = [RUN_COMMAND_TOOL, APP_ACTION_TOOL] if req.enabledSkills else [APP_ACTION_TOOL]
 
         logger.info(
             "Chat [%s] model=%s skills=%s messages=%d",
@@ -170,6 +172,7 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
         # ── AI tool loop ──────────────────────────────────────────────────────
         try:
             final_text = None
+            collected_actions: list[dict] = []
 
             for iteration in range(MAX_LOOP):
                 logger.info("Loop iteration %d/%d for [%s]", iteration + 1, MAX_LOOP, session_id)
@@ -213,13 +216,21 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                     tool_results = []
                     for tool in tool_uses:
                         tool_id = tool["id"]
+                        tool_name = tool.get("name", "")
                         inp = tool.get("input", {})
-                        skill_name = inp.get("skill", "")
-                        command = inp.get("command", "")
 
-                        logger.info("Tool call: skill=%r command=%r", skill_name, command)
-                        result = execute_command(skill_name, command, enabled_names)
-                        logger.info("Tool result ok=%s", result.get("ok"))
+                        if tool_name == "app_action":
+                            # Collect the action — no subprocess, just acknowledge
+                            action = inp.get("action", "")
+                            collected_actions.append(inp)
+                            logger.info("App action collected: %r", inp)
+                            result = {"ok": True, "action": action}
+                        else:
+                            skill_name = inp.get("skill", "")
+                            command = inp.get("command", "")
+                            logger.info("Tool call: skill=%r command=%r", skill_name, command)
+                            result = execute_command(skill_name, command, enabled_names)
+                            logger.info("Tool result ok=%s", result.get("ok"))
 
                         tool_results.append({
                             "type": "tool_result",
@@ -241,7 +252,7 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
             save_session(session_id, session)
 
             text_to_stream = final_text or ""
-            async for chunk in stream_text(text_to_stream):
+            async for chunk in stream_text(text_to_stream, actions=collected_actions or None):
                 yield chunk
 
         except Exception as exc:

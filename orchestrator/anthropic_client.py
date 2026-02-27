@@ -14,6 +14,33 @@ DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_MAX_TOKENS = 8192
 REQUEST_TIMEOUT = 120  # seconds
 
+APP_ACTION_TOOL = {
+    "name": "app_action",
+    "description": (
+        "Perform an action in the Zeon webapp — navigate to a page or show a toast notification. "
+        "Call this after completing a task to send the user to the right place."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["navigate", "toast"],
+                "description": "'navigate' to go to a page, 'toast' to show a notification",
+            },
+            "path": {
+                "type": "string",
+                "description": "URL path for navigate, e.g. '/issues/abc123'",
+            },
+            "message": {
+                "type": "string",
+                "description": "Message text for toast",
+            },
+        },
+        "required": ["action"],
+    },
+}
+
 RUN_COMMAND_TOOL = {
     "name": "run_command",
     "description": (
