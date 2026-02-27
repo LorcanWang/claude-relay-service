@@ -48,6 +48,9 @@ logger = logging.getLogger("orchestrator")
 RUNNER_KEY = os.environ.get("RUNNER_KEY", "")
 DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "claude-sonnet-4-6")
 MAX_LOOP = int(os.environ.get("MAX_LOOP_ITERATIONS", "10"))
+# Compaction: when stored messages exceed this, summarize old ones like Claude Code CLI does.
+COMPACT_THRESHOLD = int(os.environ.get("COMPACT_THRESHOLD", "40"))
+COMPACT_KEEP_RECENT = int(os.environ.get("COMPACT_KEEP_RECENT", "10"))
 
 app = FastAPI(title="Orchestrator", version="1.0.0")
 security = HTTPBearer(auto_error=False)
@@ -113,6 +116,79 @@ def ui_to_anthropic(msg: UIMessage) -> dict:
     return {"role": role, "content": ""}
 
 
+# ── session compaction ────────────────────────────────────────────────────────
+
+def compact_session(session: dict, base_url: str, auth_token: str, model: str) -> bool:
+    """
+    When session exceeds COMPACT_THRESHOLD messages, summarize the older ones
+    and replace them with a compact context block — preserving the last
+    COMPACT_KEEP_RECENT messages verbatim. Returns True if compacted.
+    Mirrors how Claude Code CLI handles long context windows.
+    """
+    messages = session.get("messages", [])
+    if len(messages) <= COMPACT_THRESHOLD:
+        return False
+
+    to_summarize = messages[:-COMPACT_KEEP_RECENT]
+    keep_recent = messages[-COMPACT_KEEP_RECENT:]
+
+    logger.info(
+        "Compacting session [%s]: summarizing %d messages, keeping %d recent",
+        session.get("session_id", "?"), len(to_summarize), len(keep_recent),
+    )
+
+    try:
+        resp = call_anthropic(
+            base_url=base_url,
+            auth_token=auth_token,
+            system=(
+                "You are a conversation summarizer. "
+                "Produce a concise but complete summary of the conversation below. "
+                "Preserve: key facts, decisions made, data retrieved (IDs, names, numbers), "
+                "tasks completed, and any unresolved items. "
+                "Write in third person past tense. Be dense — this replaces the raw history."
+            ),
+            messages=[
+                {"role": "user", "content": (
+                    "Summarize this conversation:\n\n" +
+                    "\n".join(
+                        f"[{m['role'].upper()}]: " + (
+                            m["content"] if isinstance(m["content"], str)
+                            else str([b.get("text", b.get("type", "")) for b in m["content"]])
+                        )
+                        for m in to_summarize
+                    )
+                )}
+            ],
+            model=model,
+        )
+        summary_text = extract_text(resp)
+    except Exception as exc:
+        logger.warning("Compaction summarization failed, skipping: %s", exc)
+        return False
+
+    compact_block = [
+        {
+            "role": "user",
+            "content": (
+                "<conversation_summary>\n"
+                "The following is a summary of the conversation so far:\n\n"
+                f"{summary_text}\n"
+                "</conversation_summary>"
+            ),
+        },
+        {
+            "role": "assistant",
+            "content": "Understood. I have the context from our previous conversation and will continue from here.",
+        },
+    ]
+
+    session["messages"] = compact_block + keep_recent
+    session["compact_count"] = session.get("compact_count", 0) + 1
+    logger.info("Compaction done. Session now has %d messages.", len(session["messages"]))
+    return True
+
+
 # ── endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/health")
@@ -164,9 +240,20 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
         full_system = build_system_prompt(req.systemPrompt, [s.dict() for s in req.enabledSkills])
         tools = [RUN_COMMAND_TOOL, APP_ACTION_TOOL] if req.enabledSkills else [APP_ACTION_TOOL]
 
+        # ── compact if session is getting long ────────────────────────────────
+        compacted = compact_session(
+            session,
+            base_url=req.anthropicConfig.baseURL,
+            auth_token=req.anthropicConfig.authToken,
+            model=model,
+        )
+        if compacted:
+            save_session(session_id, session)
+
         logger.info(
-            "Chat [%s] model=%s skills=%s messages=%d",
+            "Chat [%s] model=%s skills=%s messages=%d%s",
             session_id, model, enabled_names, len(session["messages"]),
+            " (compacted)" if compacted else "",
         )
 
         # ── AI tool loop ──────────────────────────────────────────────────────
@@ -181,7 +268,7 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                     base_url=req.anthropicConfig.baseURL,
                     auth_token=req.anthropicConfig.authToken,
                     system=full_system,
-                    messages=session["messages"],
+                    messages=session["messages"],  # compacted if needed
                     tools=tools,
                     model=model,
                 )
