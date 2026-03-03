@@ -57,7 +57,7 @@ logger = logging.getLogger("orchestrator")
 
 RUNNER_KEY = os.environ.get("RUNNER_KEY", "")
 DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "claude-sonnet-4-6")
-MAX_LOOP = int(os.environ.get("MAX_LOOP_ITERATIONS", "10"))
+MAX_LOOP = int(os.environ.get("MAX_LOOP_ITERATIONS", "50"))
 # Compaction: when stored messages exceed this, summarize old ones like Claude Code CLI does.
 COMPACT_THRESHOLD = int(os.environ.get("COMPACT_THRESHOLD", "40"))
 COMPACT_KEEP_RECENT = int(os.environ.get("COMPACT_KEEP_RECENT", "10"))
