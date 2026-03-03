@@ -167,6 +167,7 @@ class AnthropicStream:
         """Yield text delta strings as they arrive. Populates self.content/stop_reason/tool_uses."""
         current_block: dict | None = None
         current_tool_input_json = ""
+        full_response = ""  # accumulate for JSON fallback
 
         # Connect timeout is short; read timeout is long for streaming
         stream_timeout = httpx.Timeout(connect=30, read=300, write=30, pool=30)
@@ -178,9 +179,14 @@ class AnthropicStream:
                         f"Anthropic API error {resp.status_code}: {body.decode()[:500]}"
                     )
 
+                content_type = resp.headers.get("content-type", "")
+                logger.info("Stream response content-type: %s", content_type)
+
                 buffer = ""
                 async for raw_chunk in resp.aiter_text():
                     buffer += raw_chunk
+                    full_response += raw_chunk
+
                     while "\n" in buffer:
                         line, buffer = buffer.split("\n", 1)
                         line = line.strip()
@@ -241,6 +247,26 @@ class AnthropicStream:
                             delta = event.get("delta", {})
                             if "stop_reason" in delta:
                                 self.stop_reason = delta["stop_reason"]
+
+        # ── Fallback: relay returned non-streaming JSON ──────────────────────
+        if not self.content and full_response.strip():
+            logger.warning(
+                "No SSE content blocks parsed. Attempting JSON fallback. "
+                "Response preview: %s", full_response[:300]
+            )
+            try:
+                response = json.loads(full_response.strip())
+                self.stop_reason = response.get("stop_reason", "end_turn")
+                for block in response.get("content", []):
+                    btype = block.get("type", "")
+                    if btype == "text":
+                        self.content.append(block)
+                        yield block.get("text", "")
+                    elif btype == "tool_use":
+                        self.content.append(block)
+                        self.tool_uses.append(block)
+            except json.JSONDecodeError:
+                logger.error("JSON fallback also failed. Raw response: %s", full_response[:500])
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
