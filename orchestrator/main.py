@@ -307,10 +307,11 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                 stop_reason = stream.stop_reason
                 logger.info("Stop reason: %s (iteration %d)", stop_reason, iteration + 1)
 
-                # Persist assistant message to session
-                session["messages"].append(
-                    {"role": "assistant", "content": stream.content}
-                )
+                # Persist assistant message to session (skip if empty — Anthropic rejects blank content)
+                if stream.content:
+                    session["messages"].append(
+                        {"role": "assistant", "content": stream.content}
+                    )
 
                 if stop_reason != "tool_use":
                     # ── end_turn: emit actions + finish ──────────────────────

@@ -271,6 +271,10 @@ class AnthropicStream:
 
                 async def _lines():
                     nonlocal buffer
+                    # Yield any complete lines already in the initial buffer
+                    while "\n" in buffer:
+                        line, buffer = buffer.split("\n", 1)
+                        yield line
                     async for chunk in resp.content.iter_any():
                         buffer += chunk.decode("utf-8", errors="replace")
                         while "\n" in buffer:
