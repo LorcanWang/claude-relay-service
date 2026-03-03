@@ -156,6 +156,7 @@ class AnthropicStream:
             "Authorization": f"Bearer {auth_token}",
             "anthropic-version": "2023-06-01",
             "x-session-id": "orchestrator",
+            "Accept-Encoding": "identity",  # prevent gzip on SSE stream
         }
 
         # Populated during iteration
