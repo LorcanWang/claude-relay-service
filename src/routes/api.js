@@ -221,7 +221,9 @@ async function handleMessagesRequest(req, res) {
     if (!req.body.metadata?.user_id) {
       const clientSessionId = req.headers['x-session-id']
       if (clientSessionId) {
-        if (!req.body.metadata) req.body.metadata = {}
+        if (!req.body.metadata) {
+          req.body.metadata = {}
+        }
         req.body.metadata.user_id = `api_${clientSessionId}`
       }
     }
@@ -258,14 +260,16 @@ async function handleMessagesRequest(req, res) {
 
       // 流式响应 - 只使用官方真实usage数据
       res.setHeader('Content-Type', 'text/event-stream')
-      res.setHeader('Cache-Control', 'no-cache')
+      res.setHeader('Cache-Control', 'no-cache, no-transform')
       res.setHeader('Connection', 'keep-alive')
       res.setHeader('Access-Control-Allow-Origin', '*')
       res.setHeader('X-Accel-Buffering', 'no') // 禁用 Nginx 缓冲
+      res.setHeader('Content-Encoding', 'identity') // 阻止 Cloudflare/CDN 压缩 SSE 流
       // ⚠️ 检查 headers 是否已发送（可能在排队心跳时已设置）
       if (!res.headersSent) {
         res.setHeader('Content-Type', 'text/event-stream')
-        res.setHeader('Cache-Control', 'no-cache')
+        res.setHeader('Cache-Control', 'no-cache, no-transform')
+        res.setHeader('Content-Encoding', 'identity') // 阻止 Cloudflare/CDN 压缩 SSE 流
         // ⚠️ 关键修复：尊重 auth.js 提前设置的 Connection: close
         // 当并发队列功能启用时，auth.js 会设置 Connection: close 来禁用 Keep-Alive
         // 这里只在没有设置过 Connection 头时才设置 keep-alive
