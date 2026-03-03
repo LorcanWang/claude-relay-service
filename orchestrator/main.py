@@ -19,7 +19,17 @@ import json
 import logging
 import os
 import sys
+from pathlib import Path
 from typing import Optional
+
+# Load .env from orchestrator directory if present
+_env_file = Path(__file__).parent / ".env"
+if _env_file.exists():
+    for _line in _env_file.read_text().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _v = _line.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip())
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
@@ -51,6 +61,9 @@ MAX_LOOP = int(os.environ.get("MAX_LOOP_ITERATIONS", "10"))
 # Compaction: when stored messages exceed this, summarize old ones like Claude Code CLI does.
 COMPACT_THRESHOLD = int(os.environ.get("COMPACT_THRESHOLD", "40"))
 COMPACT_KEEP_RECENT = int(os.environ.get("COMPACT_KEEP_RECENT", "10"))
+# Override relay URL to bypass Cloudflare/CDN gzip compression on SSE streams.
+# If set, this replaces the baseURL sent by the frontend.
+RELAY_BASE_URL = os.environ.get("RELAY_BASE_URL", "")
 
 app = FastAPI(title="Orchestrator", version="1.0.0")
 security = HTTPBearer(auto_error=False)
@@ -243,7 +256,7 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
         # ── compact if session is getting long ────────────────────────────────
         compacted = compact_session(
             session,
-            base_url=req.anthropicConfig.baseURL,
+            base_url=RELAY_BASE_URL or req.anthropicConfig.baseURL,
             auth_token=req.anthropicConfig.authToken,
             model=model,
         )
@@ -262,7 +275,7 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
             step_id = 0
 
             api_kwargs = dict(
-                base_url=req.anthropicConfig.baseURL,
+                base_url=RELAY_BASE_URL or req.anthropicConfig.baseURL,
                 auth_token=req.anthropicConfig.authToken,
                 system=full_system,
                 tools=tools,
