@@ -1514,6 +1514,8 @@ class ClaudeRelayService {
     delete headers['accept']
     headers['User-Agent'] = userAgent
     headers['Accept'] = acceptHeader
+    // Prevent upstream from gzip-compressing SSE streams; chunk.toString() can't handle binary gzip
+    headers['Accept-Encoding'] = 'identity'
 
     logger.debug(`🔗 Request User-Agent: ${headers['User-Agent']}`)
 
