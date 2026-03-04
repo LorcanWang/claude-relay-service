@@ -47,6 +47,7 @@ def build_system_prompt(
     enabled_skills: list[dict],
     org_id: str | None = None,
     user_id: str | None = None,
+    in_platform: bool = False,
 ) -> str:
     """
     Combine the base system prompt from Next.js with SKILL.md content
@@ -54,15 +55,22 @@ def build_system_prompt(
     """
     parts = [base_prompt.strip()]
 
-    if org_id or user_id:
+    if org_id or user_id or in_platform:
         ctx_lines = ["## Current User Context"]
         if org_id:
             ctx_lines.append(f"- **org_id**: `{org_id}`")
         if user_id:
             ctx_lines.append(f"- **user_id**: `{user_id}`")
+        ctx_lines.append(f"- **in_platform**: `{'true' if in_platform else 'false'}`")
         ctx_lines.append(
             "When running skill commands that accept `--org-id`, always pass the org_id above."
         )
+        if in_platform:
+            ctx_lines.append(
+                "The user is inside the platform. Prefer using app_action(navigate) to send them "
+                "to the relevant page rather than printing full data tables. "
+                "Give a brief answer and navigate."
+            )
         parts.append("\n".join(ctx_lines))
 
     skill_docs = []

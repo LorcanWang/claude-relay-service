@@ -112,6 +112,7 @@ class ChatRequest(BaseModel):
     sessionId: Optional[str] = None   # preferred: pre-built by frontend
     orgId: Optional[str] = None       # fallback: construct session key from these
     userId: Optional[str] = None
+    inPlatform: Optional[bool] = False
     clearSession: Optional[bool] = False
 
 
@@ -255,6 +256,7 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
             [s.dict() for s in req.enabledSkills],
             org_id=req.orgId,
             user_id=req.userId,
+            in_platform=req.inPlatform,
         )
         tools = [RUN_COMMAND_TOOL, APP_ACTION_TOOL] if req.enabledSkills else [APP_ACTION_TOOL]
 
