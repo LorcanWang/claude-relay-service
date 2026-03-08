@@ -229,6 +229,21 @@ def delete_session(session_id: str, _=Depends(verify_token)):
     return {"ok": True}
 
 
+class ClearSessionRequest(BaseModel):
+    sessionId: Optional[str] = None
+    orgId: Optional[str] = None
+    userId: Optional[str] = None
+
+
+@app.post("/clear-session")
+def clear_session_endpoint(req: ClearSessionRequest, _=Depends(verify_token)):
+    session_id = req.sessionId or f"{req.orgId}_{req.userId}"
+    if not session_id or session_id == "_":
+        raise HTTPException(status_code=400, detail="Provide sessionId or orgId+userId")
+    clear_session(session_id)
+    return {"ok": True, "session_id": session_id}
+
+
 @app.post("/chat")
 async def chat(req: ChatRequest, _=Depends(verify_token)):
     async def event_stream():
