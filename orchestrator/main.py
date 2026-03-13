@@ -113,6 +113,7 @@ class ChatRequest(BaseModel):
     orgId: Optional[str] = None       # fallback: construct session key from these
     userId: Optional[str] = None
     inPlatform: Optional[bool] = False
+    skillConfigs: Optional[dict] = {}  # per-skill extra config, e.g. login info
     clearSession: Optional[bool] = False
 
 
@@ -272,6 +273,7 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
             org_id=req.orgId,
             user_id=req.userId,
             in_platform=req.inPlatform,
+            skill_configs=req.skillConfigs or {},
         )
         tools = [RUN_COMMAND_TOOL, APP_ACTION_TOOL] if req.enabledSkills else [APP_ACTION_TOOL]
 
