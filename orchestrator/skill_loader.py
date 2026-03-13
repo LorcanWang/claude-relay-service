@@ -48,6 +48,7 @@ def build_system_prompt(
     org_id: str | None = None,
     user_id: str | None = None,
     in_platform: bool = False,
+    skill_configs: dict | None = None,
 ) -> str:
     """
     Combine the base system prompt from Next.js with SKILL.md content
@@ -77,12 +78,16 @@ def build_system_prompt(
     for skill in enabled_skills:
         name = skill.get("name", "")
         doc = load_skill_doc(name)
+        config = (skill_configs or {}).get(name, {})
+        config_block = ""
+        if config:
+            config_lines = "\n".join(f"  {k}: {v}" for k, v in config.items())
+            config_block = f"\n## Skill Config\n{config_lines}"
         if doc:
-            skill_docs.append(f"=== SKILL: {name} ===\n{doc.strip()}\n=== END SKILL ===")
+            skill_docs.append(f"=== SKILL: {name} ===\n{doc.strip()}{config_block}\n=== END SKILL ===")
         else:
-            # Still include it even without docs so the model knows the skill exists
             desc = skill.get("description", "")
-            skill_docs.append(f"=== SKILL: {name} ===\n{desc}\n=== END SKILL ===")
+            skill_docs.append(f"=== SKILL: {name} ===\n{desc}{config_block}\n=== END SKILL ===")
 
     if skill_docs:
         parts.append("\n\n".join(skill_docs))
