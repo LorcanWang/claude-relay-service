@@ -59,7 +59,14 @@ class SSEServerConfig:
     headers: dict[str, str] = field(default_factory=dict)
 
 
-MCPServerConfig = Union[StdioServerConfig, SSEServerConfig]
+@dataclass
+class StreamableHTTPServerConfig:
+    name: str
+    url: str
+    headers: dict[str, str] = field(default_factory=dict)
+
+
+MCPServerConfig = Union[StdioServerConfig, SSEServerConfig, StreamableHTTPServerConfig]
 
 
 def _expand(value: str, config: dict | None = None) -> str:
@@ -101,7 +108,15 @@ def load_skill_mcp_config(
     result = []
     for server_name, conf in servers.items():
         transport = conf.get("transport", "stdio")
-        if transport == "sse":
+        if transport == "streamable-http":
+            result.append(
+                StreamableHTTPServerConfig(
+                    name=server_name,
+                    url=_expand(conf["url"], skill_config),
+                    headers=_expand_dict(conf.get("headers", {}), skill_config),
+                )
+            )
+        elif transport == "sse":
             result.append(
                 SSEServerConfig(
                     name=server_name,

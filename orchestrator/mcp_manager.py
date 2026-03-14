@@ -17,13 +17,19 @@ try:
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
     from mcp.client.sse import sse_client
+    from mcp.client.streamable_http import streamablehttp_client
 
     MCP_AVAILABLE = True
 except ImportError:
     MCP_AVAILABLE = False
     logger.info("mcp package not installed, MCP support disabled")
 
-from mcp_config import MCPServerConfig, SSEServerConfig, StdioServerConfig
+from mcp_config import (
+    MCPServerConfig,
+    SSEServerConfig,
+    StreamableHTTPServerConfig,
+    StdioServerConfig,
+)
 
 TOOL_PREFIX = "mcp"
 SEP = "__"
@@ -97,6 +103,48 @@ class MCPManager:
             transport = await self._exit_stack.enter_async_context(
                 stdio_client(params)
             )
+        elif isinstance(conf, StreamableHTTPServerConfig):
+            # streamablehttp_client yields (read, write, get_session_id)
+            read_stream, write_stream, _ = await self._exit_stack.enter_async_context(
+                streamablehttp_client(
+                    conf.url, headers=conf.headers if conf.headers else None
+                )
+            )
+            session = await self._exit_stack.enter_async_context(
+                ClientSession(read_stream, write_stream)
+            )
+            await asyncio.wait_for(session.initialize(), timeout=CONNECT_TIMEOUT)
+
+            tools_resp = await session.list_tools()
+            conn = MCPConnection(server_name=conf.name, session=session)
+
+            for tool in tools_resp.tools:
+                qname = self.qualify_name(conf.name, tool.name)
+                if len(qname) > 64:
+                    logger.warning(
+                        "MCP tool name too long (%d chars), skipping: %s",
+                        len(qname),
+                        qname,
+                    )
+                    continue
+                info = MCPToolInfo(
+                    server_name=conf.name,
+                    original_name=tool.name,
+                    qualified_name=qname,
+                    description=tool.description or "",
+                    input_schema=tool.inputSchema,
+                )
+                conn.tools.append(info)
+                self._tool_index[qname] = info
+
+            self._connections[conf.name] = conn
+            logger.info(
+                "MCP '%s' connected, %d tools: %s",
+                conf.name,
+                len(conn.tools),
+                [t.original_name for t in conn.tools],
+            )
+            return
         elif isinstance(conf, SSEServerConfig):
             transport = await self._exit_stack.enter_async_context(
                 sse_client(conf.url, headers=conf.headers if conf.headers else None)
