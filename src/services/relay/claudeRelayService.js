@@ -1098,17 +1098,19 @@ class ClaudeRelayService {
         processedBody.system = [{ type: 'text', text: processedBody.system }]
       }
 
+      const claudeCodeBlock = {
+        type: 'text',
+        text: this.claudeCodeSystemPrompt,
+        cache_control: { type: 'ephemeral' }
+      }
+
       if (!Array.isArray(processedBody.system) || processedBody.system.length === 0) {
         // 客户端没有提供 system prompt，注入 Claude Code 默认提示词
-        processedBody.system = [
-          {
-            type: 'text',
-            text: this.claudeCodeSystemPrompt,
-            cache_control: { type: 'ephemeral' }
-          }
-        ]
+        processedBody.system = [claudeCodeBlock]
+      } else {
+        // 客户端提供了自定义 system prompt，在前面注入 Claude Code 默认提示词
+        processedBody.system.unshift(claudeCodeBlock)
       }
-      // 客户端提供了自己的 system prompt，保留不变
     }
 
     // 移除 x-anthropic-billing-header 系统元素，避免将客户端 billing 标识传递给上游 API
