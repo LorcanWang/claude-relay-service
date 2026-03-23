@@ -22,6 +22,7 @@ class SessionHelper {
         return sessionId
       }
       // API 客户端注入的 api_ 前缀 ID：哈希生成稳定会话
+      const userIdString = String(requestBody.metadata.user_id)
       if (userIdString.startsWith('api_')) {
         const hash = crypto.createHash('sha256').update(userIdString).digest('hex').substring(0, 32)
         logger.debug(`📋 Session hash generated from api client metadata.user_id: ${hash}`)

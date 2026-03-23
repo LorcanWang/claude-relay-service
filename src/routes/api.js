@@ -1391,6 +1391,7 @@ async function handleMessagesRequest(req, res) {
       }
     }
 
+    console.error("RELAY_CATCH_STACK:", handledError.stack || handledError.message);
     logger.error('❌ Claude relay error:', handledError.message, {
       code: handledError.code,
       stack: handledError.stack
