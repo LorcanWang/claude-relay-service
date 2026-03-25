@@ -2479,6 +2479,7 @@ class ClaudeRelayService {
         const allUsageData = [] // 收集所有的usage事件
         let currentUsageData = {} // 当前正在收集的usage数据
         let rateLimitDetected = false // 限流检测标志
+        let accumulatedResponseText = '' // 累积响应文本用于对话日志
 
         // 监听数据块，解析SSE并寻找usage信息
         // 🧹 内存优化：在闭包创建前提取需要的值，避免闭包捕获 body 和 requestOptions
@@ -2588,6 +2589,11 @@ class ClaudeRelayService {
                       '📊 Collected input/cache data from message_start:',
                       JSON.stringify(currentUsageData)
                     )
+                  }
+
+                  // 累积响应文本（用于对话日志）
+                  if (data.type === 'content_block_delta' && data.delta?.text) {
+                    accumulatedResponseText += data.delta.text
                   }
 
                   // message_delta包含最终的output tokens
@@ -2722,7 +2728,8 @@ class ClaudeRelayService {
               output_tokens: totalUsage.output_tokens,
               cache_creation_input_tokens: totalUsage.cache_creation_input_tokens,
               cache_read_input_tokens: totalUsage.cache_read_input_tokens,
-              model: allUsageData[allUsageData.length - 1].model || requestedModel // 使用最后一个模型或请求模型
+              model: allUsageData[allUsageData.length - 1].model || requestedModel, // 使用最后一个模型或请求模型
+              responseText: accumulatedResponseText || undefined // 累积的响应文本（供对话日志使用）
             }
 
             // 如果有详细的cache_creation数据，合并它们

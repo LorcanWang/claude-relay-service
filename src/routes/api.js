@@ -26,6 +26,7 @@ const {
   handleAnthropicMessagesToGemini,
   handleAnthropicCountTokensToGemini
 } = require('../services/anthropicGeminiBridgeService')
+const conversationLogService = require('../services/conversationLogService')
 const router = express.Router()
 
 function queueRateLimitUpdate(
@@ -549,6 +550,22 @@ async function handleMessagesRequest(req, res) {
                 })
 
               usageDataCaptured = true
+
+              // 异步记录对话日志（不阻塞响应）
+              conversationLogService
+                .logConversation({
+                  keyId: _apiKeyId,
+                  sessionHash,
+                  model,
+                  accountId: usageAccountId,
+                  accountType,
+                  requestBody: _requestBody,
+                  responseContent: usageData.responseText,
+                  stopReason: undefined,
+                  usage: { inputTokens, outputTokens }
+                })
+                .catch((err) => logger.error('Failed to log conversation:', err.message))
+
               logger.api(
                 `📊 Stream usage recorded (real) - Model: ${model}, Input: ${inputTokens}, Output: ${outputTokens}, Cache Create: ${cacheCreateTokens}, Cache Read: ${cacheReadTokens}, Total: ${inputTokens + outputTokens + cacheCreateTokens + cacheReadTokens} tokens`
               )
@@ -1297,6 +1314,22 @@ async function handleMessagesRequest(req, res) {
           )
 
           usageRecorded = true
+
+          // 异步记录对话日志（不阻塞响应）
+          conversationLogService
+            .logConversation({
+              keyId: _apiKeyIdNonStream,
+              sessionHash,
+              model,
+              accountId: responseAccountId,
+              accountType,
+              requestBody: _requestBodyNonStream,
+              responseContent: jsonData.content,
+              stopReason: jsonData.stop_reason,
+              usage: { inputTokens, outputTokens }
+            })
+            .catch((err) => logger.error('Failed to log conversation:', err.message))
+
           logger.api(
             `📊 Non-stream usage recorded (real) - Model: ${model}, Input: ${inputTokens}, Output: ${outputTokens}, Cache Create: ${cacheCreateTokens} (5m: ${ephemeral5mTokens}, 1h: ${ephemeral1hTokens}), Cache Read: ${cacheReadTokens}, Total: ${inputTokens + outputTokens + cacheCreateTokens + cacheReadTokens} tokens`
           )
@@ -1391,7 +1424,7 @@ async function handleMessagesRequest(req, res) {
       }
     }
 
-    console.error("RELAY_CATCH_STACK:", handledError.stack || handledError.message);
+    console.error('RELAY_CATCH_STACK:', handledError.stack || handledError.message)
     logger.error('❌ Claude relay error:', handledError.message, {
       code: handledError.code,
       stack: handledError.stack

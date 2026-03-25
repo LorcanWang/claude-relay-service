@@ -827,6 +827,14 @@ class Application {
     } else {
       logger.info('🧪 Account test scheduler service disabled')
     }
+
+    // 📝 启动对话日志同步到 Firestore
+    try {
+      const conversationLogSyncService = require('./services/conversationLogSyncService')
+      conversationLogSyncService.start()
+    } catch (error) {
+      logger.error('❌ Failed to start conversation log sync service:', error.message)
+    }
   }
 
   setupGracefulShutdown() {
@@ -888,6 +896,14 @@ class Application {
             logger.info('🧪 Account test scheduler service stopped')
           } catch (error) {
             logger.error('❌ Error stopping account test scheduler service:', error)
+          }
+
+          // 停止对话日志同步服务
+          try {
+            const conversationLogSyncService = require('./services/conversationLogSyncService')
+            conversationLogSyncService.stop()
+          } catch (error) {
+            logger.error('❌ Error stopping conversation log sync service:', error)
           }
 
           // 🔢 清理所有并发计数（Phase 1 修复：防止重启泄漏）
