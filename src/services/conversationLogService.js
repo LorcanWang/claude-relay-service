@@ -23,6 +23,7 @@ class ConversationLogService {
     model,
     accountId,
     accountType,
+    baseUrl,
     requestBody,
     responseContent,
     stopReason,
@@ -34,7 +35,6 @@ class ConversationLogService {
 
     try {
       const messages = this._sanitizeMessages(requestBody?.messages)
-      const systemPrompt = this._extractSystemText(requestBody?.system)
       const responseText = this._extractResponseText(responseContent)
 
       const record = {
@@ -45,8 +45,8 @@ class ConversationLogService {
         model: model || 'unknown',
         accountId: accountId || null,
         accountType: accountType || null,
+        baseUrl: baseUrl || null,
         request: {
-          system: systemPrompt,
           messages,
           messageCount: requestBody?.messages?.length || 0
         },
