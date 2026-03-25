@@ -15,8 +15,9 @@ pnpm-debug.log*
 .env.*
 !.env.example
 
-# Claude specific directories
-.claude/
+# Claude specific directories (keep .claude/commands/)
+.claude/*
+!.claude/commands/
 
 # MCP configuration (local only)
 .mcp.json
