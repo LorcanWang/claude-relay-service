@@ -77,24 +77,33 @@ class ConversationLogService {
   }
 
   /**
-   * 净化 messages 数组，保留完整结构，base64 图片替换为占位符
+   * 净化 messages 数组，只保留有意义的用户输入和模型输出
    */
   _sanitizeMessages(messages) {
     if (!Array.isArray(messages)) {
       return []
     }
 
-    return messages.map((msg) => ({
-      role: msg.role,
-      content: this._sanitizeContent(msg.content)
-    }))
+    return messages
+      .map((msg) => {
+        const content = this._sanitizeContent(msg.content)
+        if (content === null || (Array.isArray(content) && content.length === 0)) {
+          return null
+        }
+        return { role: msg.role, content }
+      })
+      .filter(Boolean)
   }
 
   /**
-   * 净化消息内容，支持字符串和 content blocks 数组
+   * 净化消息内容，过滤系统提示、thinking、tool_use/tool_result 等噪音
    */
   _sanitizeContent(content) {
     if (typeof content === 'string') {
+      if (content.includes('<system-reminder>')) {
+        const cleaned = content.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()
+        return cleaned || null
+      }
       return content
     }
 
@@ -102,27 +111,49 @@ class ConversationLogService {
       return content
     }
 
-    return content.map((block) => {
-      // 图片类型：替换 base64 数据为占位符
-      if (block.type === 'image' && block.source?.type === 'base64') {
-        return {
-          type: 'image',
-          source: {
-            type: 'base64',
-            media_type: block.source.media_type || 'unknown',
-            data: `[image: ${block.source.media_type || 'unknown'}]`
+    const filtered = content
+      .map((block) => {
+        // 文本块：过滤 system-reminder 标签内容
+        if (block.type === 'text') {
+          if (block.text?.includes('<system-reminder>')) {
+            const cleaned = block.text
+              .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
+              .trim()
+            if (!cleaned) {
+              return null
+            }
+            return { type: 'text', text: cleaned }
+          }
+          return { type: 'text', text: block.text }
+        }
+
+        // 图片块：替换 base64 数据为占位符
+        if (block.type === 'image' && block.source?.type === 'base64') {
+          return {
+            type: 'image',
+            source: {
+              type: 'base64',
+              media_type: block.source.media_type || 'unknown',
+              data: `[image: ${block.source.media_type || 'unknown'}]`
+            }
           }
         }
-      }
 
-      // 文本类型：保持原样
-      if (block.type === 'text') {
+        // thinking / redacted_thinking / tool_use / tool_result：丢弃
+        if (
+          block.type === 'thinking' ||
+          block.type === 'redacted_thinking' ||
+          block.type === 'tool_use' ||
+          block.type === 'tool_result'
+        ) {
+          return null
+        }
+
         return block
-      }
+      })
+      .filter(Boolean)
 
-      // tool_use / tool_result 等其他类型：保持原样
-      return block
-    })
+    return filtered.length > 0 ? filtered : null
   }
 
   /**
