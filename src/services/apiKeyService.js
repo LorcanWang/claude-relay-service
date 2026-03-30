@@ -14,7 +14,8 @@ const ACCOUNT_TYPE_CONFIG = {
   'azure-openai': { prefix: 'azure_openai:account:' },
   gemini: { prefix: 'gemini_account:' },
   'gemini-api': { prefix: 'gemini_api_account:' },
-  droid: { prefix: 'droid:account:' }
+  droid: { prefix: 'droid:account:' },
+  minimax: { prefix: 'minimax_account:' }
 }
 
 const ACCOUNT_TYPE_PRIORITY = [
@@ -36,7 +37,8 @@ const ACCOUNT_CATEGORY_MAP = {
   'azure-openai': 'openai',
   gemini: 'gemini',
   'gemini-api': 'gemini',
-  droid: 'droid'
+  droid: 'droid',
+  minimax: 'minimax'
 }
 
 /**
@@ -1683,7 +1685,7 @@ class ApiKeyService {
       }
 
       // 判断是否为 claude-official、claude-console 或 ccr 账户
-      const opusAccountTypes = ['claude-official', 'claude-console', 'ccr']
+      const opusAccountTypes = ['claude-official', 'claude-console', 'ccr', 'minimax']
       if (!accountType || !opusAccountTypes.includes(accountType)) {
         logger.debug(`⚠️ Skipping Opus cost recording for non-Claude account type: ${accountType}`)
         return // 不是 claude 账户，直接返回
@@ -2408,7 +2410,8 @@ class ApiKeyService {
         azure_openai: 'azureOpenaiAccountId',
         bedrock: 'bedrockAccountId',
         droid: 'droidAccountId',
-        ccr: null // CCR 账号没有对应的 API Key 字段
+        ccr: null, // CCR 账号没有对应的 API Key 字段
+        minimax: null // MiniMax 账号没有对应的 API Key 字段
       }
 
       const field = fieldMap[accountType]

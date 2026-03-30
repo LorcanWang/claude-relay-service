@@ -4,6 +4,7 @@ const claudeAccountService = require('../../services/account/claudeAccountServic
 const claudeConsoleAccountService = require('../../services/account/claudeConsoleAccountService')
 const bedrockAccountService = require('../../services/account/bedrockAccountService')
 const ccrAccountService = require('../../services/account/ccrAccountService')
+const minimaxAccountService = require('../../services/account/minimaxAccountService')
 const geminiAccountService = require('../../services/account/geminiAccountService')
 const droidAccountService = require('../../services/account/droidAccountService')
 const openaiResponsesAccountService = require('../../services/account/openaiResponsesAccountService')
@@ -35,6 +36,7 @@ router.get('/dashboard', authenticateAdmin, async (req, res) => {
       bedrockAccountsResult,
       openaiAccounts,
       ccrAccounts,
+      minimaxAccounts,
       openaiResponsesAccounts,
       droidAccounts,
       todayStats,
@@ -47,6 +49,7 @@ router.get('/dashboard', authenticateAdmin, async (req, res) => {
       bedrockAccountService.getAllAccounts(),
       redis.getAllOpenAIAccounts(),
       ccrAccountService.getAllAccounts(),
+      minimaxAccountService.getAllAccounts(),
       openaiResponsesAccountService.getAllAccounts(true),
       droidAccountService.getAllAccounts(),
       redis.getTodayStats(),
@@ -184,6 +187,7 @@ router.get('/dashboard', authenticateAdmin, async (req, res) => {
     const bedrockStats = countAccountStats(bedrockAccounts)
     const openaiStats = countAccountStats(openaiAccounts, { isStringType: true })
     const ccrStats = countAccountStats(ccrAccounts)
+    const minimaxStats = countAccountStats(minimaxAccounts)
     const openaiResponsesStats = countAccountStats(openaiResponsesAccounts, { isStringType: true })
 
     const dashboard = {
@@ -198,7 +202,8 @@ router.get('/dashboard', authenticateAdmin, async (req, res) => {
           bedrockAccounts.length +
           openaiAccounts.length +
           openaiResponsesAccounts.length +
-          ccrAccounts.length,
+          ccrAccounts.length +
+          minimaxAccounts.length,
         normalAccounts:
           claudeStats.normal +
           claudeConsoleStats.normal +
@@ -206,7 +211,8 @@ router.get('/dashboard', authenticateAdmin, async (req, res) => {
           bedrockStats.normal +
           openaiStats.normal +
           openaiResponsesStats.normal +
-          ccrStats.normal,
+          ccrStats.normal +
+          minimaxStats.normal,
         abnormalAccounts:
           claudeStats.abnormal +
           claudeConsoleStats.abnormal +
@@ -215,6 +221,7 @@ router.get('/dashboard', authenticateAdmin, async (req, res) => {
           openaiStats.abnormal +
           openaiResponsesStats.abnormal +
           ccrStats.abnormal +
+          minimaxStats.abnormal +
           abnormalDroidAccounts,
         pausedAccounts:
           claudeStats.paused +
@@ -224,6 +231,7 @@ router.get('/dashboard', authenticateAdmin, async (req, res) => {
           openaiStats.paused +
           openaiResponsesStats.paused +
           ccrStats.paused +
+          minimaxStats.paused +
           pausedDroidAccounts,
         rateLimitedAccounts:
           claudeStats.rateLimited +
@@ -233,6 +241,7 @@ router.get('/dashboard', authenticateAdmin, async (req, res) => {
           openaiStats.rateLimited +
           openaiResponsesStats.rateLimited +
           ccrStats.rateLimited +
+          minimaxStats.rateLimited +
           rateLimitedDroidAccounts,
         // 各平台详细统计
         accountsByPlatform: {
@@ -278,6 +287,13 @@ router.get('/dashboard', authenticateAdmin, async (req, res) => {
             paused: ccrStats.paused,
             rateLimited: ccrStats.rateLimited
           },
+          minimax: {
+            total: minimaxAccounts.length,
+            normal: minimaxStats.normal,
+            abnormal: minimaxStats.abnormal,
+            paused: minimaxStats.paused,
+            rateLimited: minimaxStats.rateLimited
+          },
           'openai-responses': {
             total: openaiResponsesAccounts.length,
             normal: openaiResponsesStats.normal,
@@ -302,6 +318,7 @@ router.get('/dashboard', authenticateAdmin, async (req, res) => {
           openaiStats.normal +
           openaiResponsesStats.normal +
           ccrStats.normal +
+          minimaxStats.normal +
           normalDroidAccounts,
         totalClaudeAccounts: claudeAccounts.length + claudeConsoleAccounts.length,
         activeClaudeAccounts: claudeStats.normal + claudeConsoleStats.normal,

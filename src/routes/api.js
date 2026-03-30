@@ -3,6 +3,7 @@ const claudeRelayService = require('../services/relay/claudeRelayService')
 const claudeConsoleRelayService = require('../services/relay/claudeConsoleRelayService')
 const bedrockRelayService = require('../services/relay/bedrockRelayService')
 const ccrRelayService = require('../services/relay/ccrRelayService')
+const minimaxRelayService = require('../services/relay/minimaxRelayService')
 const bedrockAccountService = require('../services/account/bedrockAccountService')
 const unifiedClaudeScheduler = require('../services/scheduler/unifiedClaudeScheduler')
 const apiKeyService = require('../services/apiKeyService')
@@ -917,6 +918,138 @@ async function handleMessagesRequest(req, res) {
           },
           accountId
         )
+      } else if (accountType === 'minimax') {
+        // MiniMax账号使用MiniMax转发服务（需要传递accountId）
+        // 🧹 内存优化：提取需要的值
+        const _apiKeyIdMinimax = req.apiKey.id
+        const _rateLimitInfoMinimax = req.rateLimitInfo
+        const _requestBodyMinimax = req.body
+        const _apiKeyMinimax = req.apiKey
+        const _headersMinimax = req.headers
+
+        await minimaxRelayService.relayStreamRequestWithUsageCapture(
+          _requestBodyMinimax,
+          _apiKeyMinimax,
+          res,
+          _headersMinimax,
+          (usageData) => {
+            // 回调函数：当检测到完整usage数据时记录真实token使用量
+            logger.info(
+              '🎯 MiniMax usage callback triggered with complete data:',
+              JSON.stringify(usageData, null, 2)
+            )
+
+            if (
+              usageData &&
+              usageData.input_tokens !== undefined &&
+              usageData.output_tokens !== undefined
+            ) {
+              const inputTokens = usageData.input_tokens || 0
+              const outputTokens = usageData.output_tokens || 0
+              // 兼容处理：如果有详细的 cache_creation 对象，使用它；否则使用总的 cache_creation_input_tokens
+              let cacheCreateTokens = usageData.cache_creation_input_tokens || 0
+              let ephemeral5mTokens = 0
+              let ephemeral1hTokens = 0
+
+              if (usageData.cache_creation && typeof usageData.cache_creation === 'object') {
+                ephemeral5mTokens = usageData.cache_creation.ephemeral_5m_input_tokens || 0
+                ephemeral1hTokens = usageData.cache_creation.ephemeral_1h_input_tokens || 0
+                // 总的缓存创建 tokens 是两者之和
+                cacheCreateTokens = ephemeral5mTokens + ephemeral1hTokens
+              }
+
+              const cacheReadTokens = usageData.cache_read_input_tokens || 0
+              const model = usageData.model || 'unknown'
+
+              // 记录真实的token使用量（包含模型信息和所有4种token以及账户ID）
+              const usageAccountId = usageData.accountId
+
+              // 构建 usage 对象以传递给 recordUsage
+              const usageObject = {
+                input_tokens: inputTokens,
+                output_tokens: outputTokens,
+                cache_creation_input_tokens: cacheCreateTokens,
+                cache_read_input_tokens: cacheReadTokens
+              }
+              const requestBetaHeader =
+                _headersMinimax['anthropic-beta'] ||
+                _headersMinimax['Anthropic-Beta'] ||
+                _headersMinimax['ANTHROPIC-BETA']
+              if (requestBetaHeader) {
+                usageObject.request_anthropic_beta = requestBetaHeader
+              }
+              if (
+                typeof _requestBodyMinimax?.speed === 'string' &&
+                _requestBodyMinimax.speed.trim()
+              ) {
+                usageObject.request_speed = _requestBodyMinimax.speed.trim().toLowerCase()
+              }
+              if (typeof usageData.speed === 'string' && usageData.speed.trim()) {
+                usageObject.speed = usageData.speed.trim().toLowerCase()
+              }
+
+              // 如果有详细的缓存创建数据，添加到 usage 对象中
+              if (ephemeral5mTokens > 0 || ephemeral1hTokens > 0) {
+                usageObject.cache_creation = {
+                  ephemeral_5m_input_tokens: ephemeral5mTokens,
+                  ephemeral_1h_input_tokens: ephemeral1hTokens
+                }
+              }
+
+              apiKeyService
+                .recordUsageWithDetails(
+                  _apiKeyIdMinimax,
+                  usageObject,
+                  model,
+                  usageAccountId,
+                  'minimax'
+                )
+                .then((costs) => {
+                  queueRateLimitUpdate(
+                    _rateLimitInfoMinimax,
+                    {
+                      inputTokens,
+                      outputTokens,
+                      cacheCreateTokens,
+                      cacheReadTokens
+                    },
+                    model,
+                    'minimax-stream',
+                    _apiKeyIdMinimax,
+                    'minimax',
+                    costs
+                  )
+                })
+                .catch((error) => {
+                  logger.error('❌ Failed to record MiniMax stream usage:', error)
+                  queueRateLimitUpdate(
+                    _rateLimitInfoMinimax,
+                    {
+                      inputTokens,
+                      outputTokens,
+                      cacheCreateTokens,
+                      cacheReadTokens
+                    },
+                    model,
+                    'minimax-stream',
+                    _apiKeyIdMinimax,
+                    'minimax'
+                  )
+                })
+
+              usageDataCaptured = true
+              logger.api(
+                `📊 MiniMax stream usage recorded (real) - Model: ${model}, Input: ${inputTokens}, Output: ${outputTokens}, Cache Create: ${cacheCreateTokens}, Cache Read: ${cacheReadTokens}, Total: ${inputTokens + outputTokens + cacheCreateTokens + cacheReadTokens} tokens`
+              )
+            } else {
+              logger.warn(
+                '⚠️ MiniMax usage callback triggered but data is incomplete:',
+                JSON.stringify(usageData)
+              )
+            }
+          },
+          accountId
+        )
       }
 
       // 流式请求完成后 - 如果没有捕获到usage数据，记录警告但不进行估算
@@ -1189,6 +1322,19 @@ async function handleMessagesRequest(req, res) {
         // CCR账号使用CCR转发服务
         logger.debug(`[DEBUG] Calling ccrRelayService.relayRequest with accountId: ${accountId}`)
         response = await ccrRelayService.relayRequest(
+          _requestBodyNonStream,
+          _apiKeyNonStream,
+          req, // clientRequest 保留用于断开检测
+          res,
+          _headersNonStream,
+          accountId
+        )
+      } else if (accountType === 'minimax') {
+        // MiniMax账号使用MiniMax转发服务
+        logger.debug(
+          `[DEBUG] Calling minimaxRelayService.relayRequest with accountId: ${accountId}`
+        )
+        response = await minimaxRelayService.relayRequest(
           _requestBodyNonStream,
           _apiKeyNonStream,
           req, // clientRequest 保留用于断开检测

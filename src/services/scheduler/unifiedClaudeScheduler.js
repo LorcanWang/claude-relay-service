@@ -2,6 +2,7 @@ const claudeAccountService = require('../account/claudeAccountService')
 const claudeConsoleAccountService = require('../account/claudeConsoleAccountService')
 const bedrockAccountService = require('../account/bedrockAccountService')
 const ccrAccountService = require('../account/ccrAccountService')
+const minimaxAccountService = require('../account/minimaxAccountService')
 const accountGroupService = require('../accountGroupService')
 const redis = require('../../models/redis')
 const logger = require('../../utils/logger')
@@ -168,6 +169,34 @@ class UnifiedClaudeScheduler {
       }
     }
 
+    // MiniMax 账户的模型支持检查
+    if (accountType === 'minimax' && account.supportedModels) {
+      // 兼容旧格式（数组）和新格式（对象）
+      if (Array.isArray(account.supportedModels)) {
+        // 旧格式：数组
+        if (
+          account.supportedModels.length > 0 &&
+          !account.supportedModels.includes(requestedModel)
+        ) {
+          logger.info(
+            `🚫 MiniMax account ${account.name} does not support model ${requestedModel}${context ? ` ${context}` : ''}`
+          )
+          return false
+        }
+      } else if (typeof account.supportedModels === 'object') {
+        // 新格式：映射表
+        if (
+          Object.keys(account.supportedModels).length > 0 &&
+          !minimaxAccountService.isModelSupported(account.supportedModels, requestedModel)
+        ) {
+          logger.info(
+            `🚫 MiniMax account ${account.name} does not support model ${requestedModel}${context ? ` ${context}` : ''}`
+          )
+          return false
+        }
+      }
+    }
+
     return true
   }
 
@@ -238,6 +267,11 @@ class UnifiedClaudeScheduler {
       if (vendor === 'ccr') {
         logger.info(`🎯 CCR vendor prefix detected, routing to CCR accounts only`)
         return await this._selectCcrAccount(apiKeyData, sessionHash, effectiveModel)
+      }
+      // 如果是 MiniMax 前缀，只在 MiniMax 账户池中选择
+      if (vendor === 'minimax') {
+        logger.info(`🎯 MiniMax vendor prefix detected, routing to MiniMax accounts only`)
+        return await this._selectMinimaxAccount(apiKeyData, sessionHash, effectiveModel)
       }
       // 如果API Key绑定了专属账户或分组，优先使用
       if (apiKeyData.claudeAccountId) {
@@ -460,7 +494,12 @@ class UnifiedClaudeScheduler {
   }
 
   // 📋 获取所有可用账户（合并官方和Console）
-  async _getAllAvailableAccounts(apiKeyData, requestedModel = null, includeCcr = false) {
+  async _getAllAvailableAccounts(
+    apiKeyData,
+    requestedModel = null,
+    includeCcr = false,
+    includeMinimax = false
+  ) {
     const availableAccounts = []
     const isOpusRequest =
       requestedModel && typeof requestedModel === 'string'
@@ -952,8 +991,78 @@ class UnifiedClaudeScheduler {
       }
     }
 
+    // 获取MiniMax账户（共享池）- 仅当明确要求包含时
+    if (includeMinimax) {
+      const minimaxAccounts = await minimaxAccountService.getAllAccounts()
+      logger.info(`📋 Found ${minimaxAccounts.length} total MiniMax accounts`)
+
+      for (const account of minimaxAccounts) {
+        logger.info(
+          `🔍 Checking MiniMax account: ${account.name} - isActive: ${account.isActive}, status: ${account.status}, accountType: ${account.accountType}, schedulable: ${account.schedulable}`
+        )
+
+        if (
+          account.isActive === true &&
+          account.status === 'active' &&
+          account.accountType === 'shared' &&
+          isSchedulable(account.schedulable)
+        ) {
+          // 检查模型支持
+          if (!this._isModelSupportedByAccount(account, 'minimax', requestedModel)) {
+            continue
+          }
+
+          // 检查订阅是否过期
+          if (minimaxAccountService.isSubscriptionExpired(account)) {
+            logger.debug(
+              `⏰ MiniMax account ${account.name} (${account.id}) expired at ${account.subscriptionExpiresAt}`
+            )
+            continue
+          }
+
+          // 检查是否临时不可用
+          const isTempUnavailable = await this.isAccountTemporarilyUnavailable(
+            account.id,
+            'minimax'
+          )
+          if (isTempUnavailable) {
+            logger.debug(`⏭️ Skipping MiniMax account ${account.name} - temporarily unavailable`)
+            continue
+          }
+
+          // 检查是否被限流
+          const isRateLimited = await minimaxAccountService.isAccountRateLimited(account.id)
+          const isQuotaExceeded = await minimaxAccountService.isAccountQuotaExceeded(account.id)
+
+          if (!isRateLimited && !isQuotaExceeded) {
+            availableAccounts.push({
+              ...account,
+              accountId: account.id,
+              accountType: 'minimax',
+              priority: parseInt(account.priority) || 50,
+              lastUsedAt: account.lastUsedAt || '0'
+            })
+            logger.info(
+              `✅ Added MiniMax account to available pool: ${account.name} (priority: ${account.priority})`
+            )
+          } else {
+            if (isRateLimited) {
+              logger.warn(`⚠️ MiniMax account ${account.name} is rate limited`)
+            }
+            if (isQuotaExceeded) {
+              logger.warn(`💰 MiniMax account ${account.name} quota exceeded`)
+            }
+          }
+        } else {
+          logger.info(
+            `❌ MiniMax account ${account.name} not eligible - isActive: ${account.isActive}, status: ${account.status}, accountType: ${account.accountType}, schedulable: ${account.schedulable}`
+          )
+        }
+      }
+    }
+
     logger.info(
-      `📊 Total available accounts: ${availableAccounts.length} (Claude: ${availableAccounts.filter((a) => a.accountType === 'claude-official').length}, Console: ${availableAccounts.filter((a) => a.accountType === 'claude-console').length}, Bedrock: ${availableAccounts.filter((a) => a.accountType === 'bedrock').length}, CCR: ${availableAccounts.filter((a) => a.accountType === 'ccr').length})`
+      `📊 Total available accounts: ${availableAccounts.length} (Claude: ${availableAccounts.filter((a) => a.accountType === 'claude-official').length}, Console: ${availableAccounts.filter((a) => a.accountType === 'claude-console').length}, Bedrock: ${availableAccounts.filter((a) => a.accountType === 'bedrock').length}, CCR: ${availableAccounts.filter((a) => a.accountType === 'ccr').length}, MiniMax: ${availableAccounts.filter((a) => a.accountType === 'minimax').length})`
     )
 
     // 🚨 最终检查：只有在没有任何可用账户时，才根据Console并发排除情况抛出专用错误码
@@ -1186,6 +1295,66 @@ class UnifiedClaudeScheduler {
           return false
         }
         return true
+      } else if (accountType === 'minimax') {
+        const account = await minimaxAccountService.getAccount(accountId)
+        if (!account || !account.isActive) {
+          return false
+        }
+        // 检查账户状态
+        if (
+          account.status !== 'active' &&
+          account.status !== 'unauthorized' &&
+          account.status !== 'overloaded'
+        ) {
+          return false
+        }
+        // 检查是否可调度
+        if (!isSchedulable(account.schedulable)) {
+          logger.info(`🚫 MiniMax account ${accountId} is not schedulable`)
+          return false
+        }
+        // 检查模型支持
+        if (
+          !this._isModelSupportedByAccount(account, 'minimax', requestedModel, 'in session check')
+        ) {
+          return false
+        }
+        // 检查订阅是否过期
+        if (minimaxAccountService.isSubscriptionExpired(account)) {
+          logger.debug(
+            `⏰ MiniMax account ${account.name} (${accountId}) expired at ${account.subscriptionExpiresAt} (session check)`
+          )
+          return false
+        }
+        // 检查是否超额
+        try {
+          await minimaxAccountService.checkQuotaUsage(accountId)
+        } catch (e) {
+          logger.warn(`Failed to check quota for MiniMax account ${accountId}: ${e.message}`)
+          // 继续处理
+        }
+
+        // 检查是否临时不可用
+        if (await this.isAccountTemporarilyUnavailable(accountId, 'minimax')) {
+          return false
+        }
+
+        // 检查是否被限流
+        if (await minimaxAccountService.isAccountRateLimited(accountId)) {
+          return false
+        }
+        if (await minimaxAccountService.isAccountQuotaExceeded(accountId)) {
+          return false
+        }
+        // 检查是否未授权（401错误）
+        if (account.status === 'unauthorized') {
+          return false
+        }
+        // 检查是否过载（529错误）
+        if (await minimaxAccountService.isAccountOverloaded(accountId)) {
+          return false
+        }
+        return true
       }
       return false
     } catch (error) {
@@ -1337,6 +1506,8 @@ class UnifiedClaudeScheduler {
         await claudeConsoleAccountService.markAccountRateLimited(accountId)
       } else if (accountType === 'ccr') {
         await ccrAccountService.markAccountRateLimited(accountId)
+      } else if (accountType === 'minimax') {
+        await minimaxAccountService.markAccountRateLimited(accountId)
       }
 
       // 删除会话映射
@@ -1363,6 +1534,8 @@ class UnifiedClaudeScheduler {
         await claudeConsoleAccountService.removeAccountRateLimit(accountId)
       } else if (accountType === 'ccr') {
         await ccrAccountService.removeAccountRateLimit(accountId)
+      } else if (accountType === 'minimax') {
+        await minimaxAccountService.removeAccountRateLimit(accountId)
       }
 
       return { success: true }
@@ -1384,6 +1557,8 @@ class UnifiedClaudeScheduler {
         return await claudeConsoleAccountService.isAccountRateLimited(accountId)
       } else if (accountType === 'ccr') {
         return await ccrAccountService.isAccountRateLimited(accountId)
+      } else if (accountType === 'minimax') {
+        return await minimaxAccountService.isAccountRateLimited(accountId)
       }
       return false
     } catch (error) {
@@ -1463,7 +1638,8 @@ class UnifiedClaudeScheduler {
     groupId,
     sessionHash = null,
     requestedModel = null,
-    allowCcr = false
+    allowCcr = false,
+    allowMinimax = false
   ) {
     try {
       // 获取分组信息
@@ -1481,8 +1657,10 @@ class UnifiedClaudeScheduler {
           // 验证映射的账户是否属于这个分组
           const memberIds = await accountGroupService.getGroupMembers(groupId)
           if (memberIds.includes(mappedAccount.accountId)) {
-            // 非 CCR 请求时不允许 CCR 粘性映射
+            // 非 CCR/MiniMax 请求时不允许相应粘性映射
             if (!allowCcr && mappedAccount.accountType === 'ccr') {
+              await this._deleteSessionMapping(sessionHash)
+            } else if (!allowMinimax && mappedAccount.accountType === 'minimax') {
               await this._deleteSessionMapping(sessionHash)
             } else {
               const isAvailable = await this._isAccountAvailable(
@@ -1539,6 +1717,13 @@ class UnifiedClaudeScheduler {
                 account = await ccrAccountService.getAccount(memberId)
                 if (account) {
                   accountType = 'ccr'
+                }
+              }
+              // 尝试MiniMax账户（仅允许在 allowMinimax 为 true 时）
+              if (!account && allowMinimax) {
+                account = await minimaxAccountService.getAccount(memberId)
+                if (account) {
+                  accountType = 'minimax'
                 }
               }
             }
@@ -1789,6 +1974,148 @@ class UnifiedClaudeScheduler {
       return availableAccounts
     } catch (error) {
       logger.error('❌ Failed to get available CCR accounts:', error)
+      return []
+    }
+  }
+
+  // 🎯 专门选择MiniMax账户（仅限MiniMax前缀路由使用）
+  async _selectMinimaxAccount(apiKeyData, sessionHash = null, effectiveModel = null) {
+    try {
+      // 1. 检查会话粘性
+      if (sessionHash) {
+        const mappedAccount = await this._getSessionMapping(sessionHash)
+        if (mappedAccount && mappedAccount.accountType === 'minimax') {
+          // 验证映射的MiniMax账户是否仍然可用
+          const isAvailable = await this._isAccountAvailable(
+            mappedAccount.accountId,
+            mappedAccount.accountType,
+            effectiveModel
+          )
+          if (isAvailable) {
+            // 🚀 智能会话续期：续期 unified 映射键
+            await this._extendSessionMappingTTL(sessionHash)
+            logger.info(
+              `🎯 Using sticky MiniMax session account: ${mappedAccount.accountId} for session ${sessionHash}`
+            )
+            return mappedAccount
+          } else {
+            logger.warn(
+              `⚠️ Mapped MiniMax account ${mappedAccount.accountId} is no longer available, selecting new account`
+            )
+            await this._deleteSessionMapping(sessionHash)
+          }
+        }
+      }
+
+      // 2. 获取所有可用的MiniMax账户
+      const availableMinimaxAccounts = await this._getAvailableMinimaxAccounts(effectiveModel)
+
+      if (availableMinimaxAccounts.length === 0) {
+        throw new Error(
+          `No available MiniMax accounts support the requested model: ${effectiveModel || 'unspecified'}`
+        )
+      }
+
+      // 3. 按优先级和最后使用时间排序
+      const sortedAccounts = sortAccountsByPriority(availableMinimaxAccounts)
+      const selectedAccount = sortedAccounts[0]
+
+      // 4. 建立会话映射
+      if (sessionHash) {
+        await this._setSessionMapping(
+          sessionHash,
+          selectedAccount.accountId,
+          selectedAccount.accountType
+        )
+        logger.info(
+          `🎯 Created new sticky MiniMax session mapping: ${selectedAccount.name} (${selectedAccount.accountId}) for session ${sessionHash}`
+        )
+      }
+
+      logger.info(
+        `🎯 Selected MiniMax account: ${selectedAccount.name} (${selectedAccount.accountId}) with priority ${selectedAccount.priority} for API key ${apiKeyData.name}`
+      )
+
+      return {
+        accountId: selectedAccount.accountId,
+        accountType: selectedAccount.accountType
+      }
+    } catch (error) {
+      logger.error('❌ Failed to select MiniMax account:', error)
+      throw error
+    }
+  }
+
+  // 📋 获取所有可用的MiniMax账户
+  async _getAvailableMinimaxAccounts(requestedModel = null) {
+    const availableAccounts = []
+
+    try {
+      const minimaxAccounts = await minimaxAccountService.getAllAccounts()
+      logger.info(
+        `📋 Found ${minimaxAccounts.length} total MiniMax accounts for MiniMax-only selection`
+      )
+
+      for (const account of minimaxAccounts) {
+        logger.debug(
+          `🔍 Checking MiniMax account: ${account.name} - isActive: ${account.isActive}, status: ${account.status}, accountType: ${account.accountType}, schedulable: ${account.schedulable}`
+        )
+
+        if (
+          account.isActive === true &&
+          account.status === 'active' &&
+          account.accountType === 'shared' &&
+          isSchedulable(account.schedulable)
+        ) {
+          // 检查模型支持
+          if (!this._isModelSupportedByAccount(account, 'minimax', requestedModel)) {
+            logger.debug(`MiniMax account ${account.name} does not support model ${requestedModel}`)
+            continue
+          }
+
+          // 检查订阅是否过期
+          if (minimaxAccountService.isSubscriptionExpired(account)) {
+            logger.debug(
+              `⏰ MiniMax account ${account.name} (${account.id}) expired at ${account.subscriptionExpiresAt}`
+            )
+            continue
+          }
+
+          // 检查是否临时不可用
+          if (await this.isAccountTemporarilyUnavailable(account.id, 'minimax')) {
+            continue
+          }
+
+          // 检查是否被限流或超额
+          const isRateLimited = await minimaxAccountService.isAccountRateLimited(account.id)
+          const isQuotaExceeded = await minimaxAccountService.isAccountQuotaExceeded(account.id)
+          const isOverloaded = await minimaxAccountService.isAccountOverloaded(account.id)
+
+          if (!isRateLimited && !isQuotaExceeded && !isOverloaded) {
+            availableAccounts.push({
+              ...account,
+              accountId: account.id,
+              accountType: 'minimax',
+              priority: parseInt(account.priority) || 50,
+              lastUsedAt: account.lastUsedAt || '0'
+            })
+            logger.debug(`✅ Added MiniMax account to available pool: ${account.name}`)
+          } else {
+            logger.debug(
+              `❌ MiniMax account ${account.name} not available - rateLimited: ${isRateLimited}, quotaExceeded: ${isQuotaExceeded}, overloaded: ${isOverloaded}`
+            )
+          }
+        } else {
+          logger.debug(
+            `❌ MiniMax account ${account.name} not eligible - isActive: ${account.isActive}, status: ${account.status}, accountType: ${account.accountType}, schedulable: ${account.schedulable}`
+          )
+        }
+      }
+
+      logger.info(`📊 Total available MiniMax accounts: ${availableAccounts.length}`)
+      return availableAccounts
+    } catch (error) {
+      logger.error('❌ Failed to get available MiniMax accounts:', error)
       return []
     }
   }
