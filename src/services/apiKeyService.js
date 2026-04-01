@@ -145,6 +145,7 @@ class ApiKeyService {
       azureOpenaiAccountId = null,
       bedrockAccountId = null, // 添加 Bedrock 账号ID支持
       droidAccountId = null,
+      ccrAccountId = null,
       permissions = [], // 数组格式，空数组表示全部服务，如 ['claude', 'gemini']
       isActive = true,
       concurrencyLimit = 0,
@@ -194,6 +195,7 @@ class ApiKeyService {
       azureOpenaiAccountId: azureOpenaiAccountId || '',
       bedrockAccountId: bedrockAccountId || '', // 添加 Bedrock 账号ID
       droidAccountId: droidAccountId || '',
+      ccrAccountId: ccrAccountId || '',
       permissions: JSON.stringify(normalizePermissions(permissions)),
       enableModelRestriction: String(enableModelRestriction),
       restrictedModels: JSON.stringify(restrictedModels || []),
@@ -443,6 +445,7 @@ class ApiKeyService {
           azureOpenaiAccountId: keyData.azureOpenaiAccountId,
           bedrockAccountId: keyData.bedrockAccountId, // 添加 Bedrock 账号ID
           droidAccountId: keyData.droidAccountId,
+          ccrAccountId: keyData.ccrAccountId,
           permissions: normalizePermissions(keyData.permissions),
           tokenLimit: parseInt(keyData.tokenLimit),
           concurrencyLimit: parseInt(keyData.concurrencyLimit || 0),
@@ -876,11 +879,6 @@ class ApiKeyService {
         } catch (e) {
           key.tags = []
         }
-        // 不暴露已弃用字段
-        if (Object.prototype.hasOwnProperty.call(key, 'ccrAccountId')) {
-          delete key.ccrAccountId
-        }
-
         let lastUsageRecord = null
         try {
           const usageRecords = await redis.getUsageRecords(key.id, 1)
@@ -1132,7 +1130,6 @@ class ApiKeyService {
           key.maskedKey = `${this.prefix}****${key.apiKey.slice(-4)}`
         }
         delete key.apiKey
-        delete key.ccrAccountId
 
         // 不获取 lastUsage（太慢），设为 null
         key.lastUsage = null
@@ -1219,6 +1216,7 @@ class ApiKeyService {
         'azureOpenaiAccountId',
         'bedrockAccountId', // 添加 Bedrock 账号ID
         'droidAccountId',
+        'ccrAccountId',
         'permissions',
         'expiresAt',
         'activationDays', // 新增：激活后有效天数
