@@ -428,7 +428,7 @@ class UnifiedClaudeScheduler {
         if (
           boundCcrAccount &&
           String(boundCcrAccount.isActive) === 'true' &&
-          boundCcrAccount.status === 'active' &&
+          (!boundCcrAccount.status || boundCcrAccount.status === 'active') &&
           isSchedulable(boundCcrAccount.schedulable)
         ) {
           const isTempUnavailable = await this.isAccountTemporarilyUnavailable(

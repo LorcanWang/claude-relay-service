@@ -2593,7 +2593,7 @@ const loadAccounts = async (forceRefresh = false) => {
       accounts.value.geminiGroups = allGroups.filter((g) => g.platform === 'gemini')
       accounts.value.openaiGroups = allGroups.filter((g) => g.platform === 'openai')
       accounts.value.droidGroups = allGroups.filter((g) => g.platform === 'droid')
-      accounts.value.ccrGroups = allGroups.filter((g) => g.platform === 'ccr')
+      accounts.value.ccrGroups = allGroups.filter((g) => g.platform === 'claude')
     }
 
     // 标记账号数据已加载

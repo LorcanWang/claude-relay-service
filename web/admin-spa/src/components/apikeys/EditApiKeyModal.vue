@@ -1313,7 +1313,7 @@ const refreshAccounts = async () => {
       localAccounts.value.geminiGroups = allGroups.filter((g) => g.platform === 'gemini')
       localAccounts.value.openaiGroups = allGroups.filter((g) => g.platform === 'openai')
       localAccounts.value.droidGroups = allGroups.filter((g) => g.platform === 'droid')
-      localAccounts.value.ccrGroups = allGroups.filter((g) => g.platform === 'ccr')
+      localAccounts.value.ccrGroups = allGroups.filter((g) => g.platform === 'claude')
     }
 
     showToast('账号列表已刷新', 'success')
