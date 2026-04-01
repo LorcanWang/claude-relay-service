@@ -1787,15 +1787,15 @@ class UnifiedClaudeScheduler {
 
         // 检查账户是否可用
         const isActive =
-          accountType === 'claude-official'
-            ? account.isActive === 'true'
+          accountType === 'claude-official' || accountType === 'ccr'
+            ? String(account.isActive) === 'true'
             : account.isActive === true
 
         const status =
           accountType === 'claude-official'
             ? account.status !== 'error' && account.status !== 'blocked'
             : accountType === 'ccr'
-              ? account.status === 'active'
+              ? !account.status || account.status === 'active'
               : account.status === 'active'
 
         if (isActive && status && isSchedulable(account.schedulable)) {
