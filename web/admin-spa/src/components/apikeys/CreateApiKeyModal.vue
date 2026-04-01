@@ -799,6 +799,20 @@
                   platform="droid"
                 />
               </div>
+              <div>
+                <label class="mb-1 block text-sm font-medium text-gray-600 dark:text-gray-400"
+                  >CCR 专属账号</label
+                >
+                <AccountSelector
+                  v-model="form.ccrAccountId"
+                  :accounts="localAccounts.ccr"
+                  default-option-text="使用共享账号池"
+                  :disabled="form.permissions.length > 0 && !form.permissions.includes('claude')"
+                  :groups="localAccounts.ccrGroups"
+                  placeholder="请选择CCR账号"
+                  platform="ccr"
+                />
+              </div>
             </div>
             <p class="mt-2 text-xs text-gray-500 dark:text-gray-400">
               选择专属账号后，此API Key将只使用该账号，不选择则使用共享账号池
@@ -1046,10 +1060,12 @@ const localAccounts = ref({
   openai: [],
   bedrock: [],
   droid: [],
+  ccr: [],
   claudeGroups: [],
   geminiGroups: [],
   openaiGroups: [],
-  droidGroups: []
+  droidGroups: [],
+  ccrGroups: []
 })
 
 // 表单验证状态
@@ -1109,6 +1125,7 @@ const form = reactive({
   openaiAccountId: '',
   bedrockAccountId: '',
   droidAccountId: '',
+  ccrAccountId: '',
   enableModelRestriction: false,
   restrictedModels: [],
   modelInput: '',
@@ -1163,10 +1180,15 @@ onMounted(async () => {
         ...account,
         platform: account.platform || 'droid'
       })),
+      ccr: (props.accounts.ccr || []).map((account) => ({
+        ...account,
+        platform: account.platform || 'ccr'
+      })),
       claudeGroups: props.accounts.claudeGroups || [],
       geminiGroups: props.accounts.geminiGroups || [],
       openaiGroups: props.accounts.openaiGroups || [],
-      droidGroups: props.accounts.droidGroups || []
+      droidGroups: props.accounts.droidGroups || [],
+      ccrGroups: props.accounts.ccrGroups || []
     }
   }
 
@@ -1186,6 +1208,7 @@ const refreshAccounts = async () => {
       openaiResponsesData,
       bedrockData,
       droidData,
+      ccrData,
       groupsData
     ] = await Promise.all([
       httpApis.getClaudeAccountsApi(),
@@ -1196,6 +1219,7 @@ const refreshAccounts = async () => {
       httpApis.getOpenAIResponsesAccountsApi(), // 获取 OpenAI-Responses 账号
       httpApis.getBedrockAccountsApi(),
       httpApis.getDroidAccountsApi(),
+      httpApis.getCcrAccountsApi(),
       httpApis.getAccountGroupsApi()
     ])
 
@@ -1289,6 +1313,14 @@ const refreshAccounts = async () => {
       }))
     }
 
+    if (ccrData.success) {
+      localAccounts.value.ccr = (ccrData.data || []).map((account) => ({
+        ...account,
+        platform: 'ccr',
+        isDedicated: account.accountType === 'dedicated'
+      }))
+    }
+
     // 处理分组数据
     if (groupsData.success) {
       const allGroups = groupsData.data || []
@@ -1296,6 +1328,7 @@ const refreshAccounts = async () => {
       localAccounts.value.geminiGroups = allGroups.filter((g) => g.platform === 'gemini')
       localAccounts.value.openaiGroups = allGroups.filter((g) => g.platform === 'openai')
       localAccounts.value.droidGroups = allGroups.filter((g) => g.platform === 'droid')
+      localAccounts.value.ccrGroups = allGroups.filter((g) => g.platform === 'ccr')
     }
 
     showToast('账号列表已刷新', 'success')
@@ -1576,6 +1609,11 @@ const createApiKey = async () => {
     }
     if (form.droidAccountId) {
       baseData.droidAccountId = form.droidAccountId
+    }
+
+    // CCR账户绑定
+    if (form.ccrAccountId) {
+      baseData.ccrAccountId = form.ccrAccountId
     }
 
     if (form.createType === 'single') {

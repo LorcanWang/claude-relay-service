@@ -632,6 +632,20 @@
                   platform="droid"
                 />
               </div>
+              <div>
+                <label class="mb-1 block text-sm font-medium text-gray-600 dark:text-gray-400"
+                  >CCR 专属账号</label
+                >
+                <AccountSelector
+                  v-model="form.ccrAccountId"
+                  :accounts="localAccounts.ccr"
+                  default-option-text="使用共享账号池"
+                  :disabled="form.permissions.length > 0 && !form.permissions.includes('claude')"
+                  :groups="localAccounts.ccrGroups"
+                  placeholder="请选择CCR账号"
+                  platform="ccr"
+                />
+              </div>
             </div>
             <p class="mt-2 text-xs text-gray-500 dark:text-gray-400">
               修改绑定账号将影响此API Key的请求路由
@@ -838,6 +852,8 @@ const props = defineProps({
       geminiGroups: [],
       openaiGroups: [],
       droidGroups: [],
+      ccr: [],
+      ccrGroups: [],
       openaiResponses: []
     })
   }
@@ -890,10 +906,12 @@ const localAccounts = ref({
   openai: [],
   bedrock: [],
   droid: [],
+  ccr: [],
   claudeGroups: [],
   geminiGroups: [],
   openaiGroups: [],
-  droidGroups: []
+  droidGroups: [],
+  ccrGroups: []
 })
 
 // 支持的客户端列表
@@ -943,6 +961,7 @@ const form = reactive({
   openaiAccountId: '',
   bedrockAccountId: '',
   droidAccountId: '',
+  ccrAccountId: '',
   enableModelRestriction: false,
   restrictedModels: [],
   modelInput: '',
@@ -1123,6 +1142,13 @@ const updateApiKey = async () => {
       data.droidAccountId = null
     }
 
+    // CCR账户绑定
+    if (form.ccrAccountId) {
+      data.ccrAccountId = form.ccrAccountId
+    } else {
+      data.ccrAccountId = null
+    }
+
     // 模型限制 - 始终提交这些字段
     data.enableModelRestriction = form.enableModelRestriction
     data.restrictedModels = form.restrictedModels
@@ -1167,6 +1193,7 @@ const refreshAccounts = async () => {
       openaiResponsesData,
       bedrockData,
       droidData,
+      ccrData,
       groupsData
     ] = await Promise.all([
       httpApis.getClaudeAccountsApi(),
@@ -1177,6 +1204,7 @@ const refreshAccounts = async () => {
       httpApis.getOpenAIResponsesAccountsApi(),
       httpApis.getBedrockAccountsApi(),
       httpApis.getDroidAccountsApi(),
+      httpApis.getCcrAccountsApi(),
       httpApis.getAccountGroupsApi()
     ])
 
@@ -1270,6 +1298,14 @@ const refreshAccounts = async () => {
       }))
     }
 
+    if (ccrData.success) {
+      localAccounts.value.ccr = (ccrData.data || []).map((account) => ({
+        ...account,
+        platform: 'ccr',
+        isDedicated: account.accountType === 'dedicated'
+      }))
+    }
+
     // 处理分组数据
     if (groupsData.success) {
       const allGroups = groupsData.data || []
@@ -1277,6 +1313,7 @@ const refreshAccounts = async () => {
       localAccounts.value.geminiGroups = allGroups.filter((g) => g.platform === 'gemini')
       localAccounts.value.openaiGroups = allGroups.filter((g) => g.platform === 'openai')
       localAccounts.value.droidGroups = allGroups.filter((g) => g.platform === 'droid')
+      localAccounts.value.ccrGroups = allGroups.filter((g) => g.platform === 'ccr')
     }
 
     showToast('账号列表已刷新', 'success')
@@ -1364,10 +1401,15 @@ onMounted(async () => {
         ...account,
         platform: account.platform || 'droid'
       })),
+      ccr: (props.accounts.ccr || []).map((account) => ({
+        ...account,
+        platform: account.platform || 'ccr'
+      })),
       claudeGroups: props.accounts.claudeGroups || [],
       geminiGroups: props.accounts.geminiGroups || [],
       openaiGroups: props.accounts.openaiGroups || [],
-      droidGroups: props.accounts.droidGroups || []
+      droidGroups: props.accounts.droidGroups || [],
+      ccrGroups: props.accounts.ccrGroups || []
     }
   }
 
@@ -1440,6 +1482,7 @@ onMounted(async () => {
 
   form.bedrockAccountId = props.apiKey.bedrockAccountId || ''
   form.droidAccountId = props.apiKey.droidAccountId || ''
+  form.ccrAccountId = props.apiKey.ccrAccountId || ''
   form.restrictedModels = props.apiKey.restrictedModels || []
   form.allowedClients = props.apiKey.allowedClients || []
   form.tags = props.apiKey.tags || []
