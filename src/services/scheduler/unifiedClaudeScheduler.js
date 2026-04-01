@@ -285,7 +285,7 @@ class UnifiedClaudeScheduler {
             groupId,
             sessionHash,
             effectiveModel,
-            vendor === 'ccr'
+            true // API Key 显式绑定分组时，始终允许选择 CCR 账户
           )
         }
 
