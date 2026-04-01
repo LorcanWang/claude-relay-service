@@ -274,9 +274,11 @@ class AccountGroupService {
         throw new Error('分组不存在')
       }
 
-      // 验证平台一致性 (Claude和Claude Console视为同一平台)
+      // 验证平台一致性 (Claude/Claude Console/CCR 视为同一平台)
       const normalizedAccountPlatform =
-        accountPlatform === 'claude-console' ? 'claude' : accountPlatform
+        accountPlatform === 'claude-console' || accountPlatform === 'ccr'
+          ? 'claude'
+          : accountPlatform
       if (normalizedAccountPlatform !== group.platform) {
         throw new Error('账户平台与分组平台不匹配')
       }
