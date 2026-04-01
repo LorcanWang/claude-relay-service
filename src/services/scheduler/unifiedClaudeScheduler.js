@@ -407,7 +407,53 @@ class UnifiedClaudeScheduler {
         }
       }
 
-      // CCR 账户不支持绑定（仅通过 ccr, 前缀进行 CCR 路由）
+      // 4. 检查CCR账户绑定（专属账号或分组）
+      if (apiKeyData.ccrAccountId) {
+        // 分组模式
+        if (apiKeyData.ccrAccountId.startsWith('group:')) {
+          const groupId = apiKeyData.ccrAccountId.replace('group:', '')
+          logger.info(
+            `🎯 API key ${apiKeyData.name} is bound to CCR group ${groupId}, selecting from group`
+          )
+          return await this.selectAccountFromGroup(
+            groupId,
+            sessionHash,
+            effectiveModel,
+            true // allowCcr
+          )
+        }
+
+        // 专属账号模式
+        const boundCcrAccount = await ccrAccountService.getAccount(apiKeyData.ccrAccountId)
+        if (
+          boundCcrAccount &&
+          String(boundCcrAccount.isActive) === 'true' &&
+          boundCcrAccount.status === 'active' &&
+          isSchedulable(boundCcrAccount.schedulable)
+        ) {
+          const isTempUnavailable = await this.isAccountTemporarilyUnavailable(
+            boundCcrAccount.id,
+            'ccr'
+          )
+          if (isTempUnavailable) {
+            logger.warn(
+              `⏱️ Bound CCR account ${boundCcrAccount.id} is temporarily unavailable, falling back to pool`
+            )
+          } else {
+            logger.info(
+              `🎯 Using bound dedicated CCR account: ${boundCcrAccount.name} (${apiKeyData.ccrAccountId}) for API key ${apiKeyData.name}`
+            )
+            return {
+              accountId: apiKeyData.ccrAccountId,
+              accountType: 'ccr'
+            }
+          }
+        } else {
+          logger.warn(
+            `⚠️ Bound CCR account ${apiKeyData.ccrAccountId} is not available (isActive: ${boundCcrAccount?.isActive}, status: ${boundCcrAccount?.status}, schedulable: ${boundCcrAccount?.schedulable}), falling back to pool`
+          )
+        }
+      }
 
       // 如果有会话哈希，检查是否有已映射的账户
       if (sessionHash) {
