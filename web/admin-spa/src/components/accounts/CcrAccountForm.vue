@@ -495,7 +495,10 @@ const populateFromAccount = () => {
   form.value.quotaResetTime = a.quotaResetTime || '00:00'
   form.value.proxy = a.proxy || null
   form.value.accountType = a.accountType || 'shared'
-  form.value.groupIds = a.groupIds || (a.groupId ? [a.groupId] : [])
+  form.value.groupIds =
+    a.groupIds ||
+    (a.groupInfos ? a.groupInfos.map((g) => g.id) : []) ||
+    (a.groupId ? [a.groupId] : [])
   enableRateLimit.value = form.value.rateLimitDuration > 0
 
   // supportedModels 对象转为数组
