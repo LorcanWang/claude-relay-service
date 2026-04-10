@@ -255,3 +255,6 @@ web/apiStats/
 web/admin-spa/dist/
 
 .serena/
+
+# Obsidian local config
+docs/.obsidian/

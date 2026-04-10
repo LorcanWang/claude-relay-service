@@ -1,5 +1,10 @@
 # CLAUDE.md
 
+## Knowledge Base
+
+- Before working on any feature, check `docs/MOC.md` and read the relevant doc.
+- After implementing a new feature or making architectural changes, update or create a doc in `docs/` following the Obsidian conventions (YAML frontmatter, wikilinks, tags). See `.claude/skills/docs-agent/SKILL.md` for the full guide.
+
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## 项目概述

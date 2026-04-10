@@ -1,3 +1,11 @@
+---
+title: "VPS Architecture — Lynx / GrantLlama AI Stack"
+aliases: ["ARCHITECTURE"]
+tags: [api-key, auth, claude, concurrency, docker, middleware, proxy, rate-limiting, redis, sticky-session, streaming]
+created: 2026-02-26
+updated: 2026-02-26
+status: active
+---
 # VPS Architecture — Lynx / GrantLlama AI Stack
 
 ## Overview
@@ -57,7 +65,7 @@ Also running:
 
 ### 1. Claude Relay Service (port 3000)
 
-**What it does:** Acts as a proxy between clients and the Anthropic API. Manages a pool of Claude accounts, handles auth via API keys (`cr_` prefix), enforces rate limits, and maintains sticky sessions.
+**What it does:** Acts as a proxy between clients and the Anthropic API. Manages a pool of Claude accounts, handles auth via API keys (`cr_` prefix), enforces rate limits, and maintains [[sticky-sessions|sticky sessions]].
 
 **Key modifications made to support Lynx/Zeon:**
 

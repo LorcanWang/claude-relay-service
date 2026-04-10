@@ -1,3 +1,11 @@
+---
+title: "Claude Code 调用 Gemini 3 模型指南"
+aliases: ["README"]
+tags: [api-key, auth, ccr, claude, gemini, oauth]
+created: 2025-11-23
+updated: 2025-11-23
+status: active
+---
 # Claude Code 调用 Gemini 3 模型指南
 
 本文档介绍如何通过 **claude-code-router (CCR)** 在 Claude Code 中调用 Gemini 3 模型，其他模型也可以参照此教程尝试。
