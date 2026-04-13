@@ -180,12 +180,6 @@ class AccountGroupService {
         throw new Error('分组不存在')
       }
 
-      // 检查分组是否为空
-      const members = await this.getGroupMembers(groupId)
-      if (members.length > 0) {
-        throw new Error('分组内还有账户，无法删除')
-      }
-
       // 检查是否有API Key绑定此分组
       const boundApiKeys = await this.getApiKeysUsingGroup(groupId)
       if (boundApiKeys.length > 0) {
@@ -280,9 +274,11 @@ class AccountGroupService {
         throw new Error('分组不存在')
       }
 
-      // 验证平台一致性 (Claude和Claude Console视为同一平台)
+      // 验证平台一致性 (Claude/Claude Console/CCR 视为同一平台)
       const normalizedAccountPlatform =
-        accountPlatform === 'claude-console' ? 'claude' : accountPlatform
+        accountPlatform === 'claude-console' || accountPlatform === 'ccr'
+          ? 'claude'
+          : accountPlatform
       if (normalizedAccountPlatform !== group.platform) {
         throw new Error('账户平台与分组平台不匹配')
       }

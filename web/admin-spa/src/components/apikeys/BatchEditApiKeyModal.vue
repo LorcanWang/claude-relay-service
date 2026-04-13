@@ -454,6 +454,21 @@
                   :special-options="accountSpecialOptions"
                 />
               </div>
+              <div>
+                <label class="mb-1 block text-sm font-medium text-gray-600 dark:text-gray-400"
+                  >CCR 专属账号</label
+                >
+                <AccountSelector
+                  v-model="ccrAccountSelectorValue"
+                  :accounts="localAccounts.ccr"
+                  default-option-text="请选择CCR账号"
+                  :disabled="!isServiceSelectable('claude')"
+                  :groups="localAccounts.ccrGroups"
+                  placeholder="请选择CCR账号"
+                  platform="ccr"
+                  :special-options="accountSpecialOptions"
+                />
+              </div>
             </div>
           </div>
 
@@ -502,10 +517,12 @@ const props = defineProps({
       openaiResponses: [],
       bedrock: [],
       droid: [],
+      ccr: [],
       claudeGroups: [],
       geminiGroups: [],
       openaiGroups: [],
-      droidGroups: []
+      droidGroups: [],
+      ccrGroups: []
     })
   }
 })
@@ -521,10 +538,12 @@ const localAccounts = ref({
   openai: [],
   bedrock: [],
   droid: [],
+  ccr: [],
   claudeGroups: [],
   geminiGroups: [],
   openaiGroups: [],
-  droidGroups: []
+  droidGroups: [],
+  ccrGroups: []
 })
 
 // 标签相关
@@ -556,6 +575,7 @@ const form = reactive({
   openaiAccountId: '',
   bedrockAccountId: '',
   droidAccountId: '',
+  ccrAccountId: '',
   tags: [],
   isActive: null // null表示不修改
 })
@@ -584,6 +604,7 @@ const geminiAccountSelectorValue = createAccountSelectorModel('geminiAccountId')
 const openaiAccountSelectorValue = createAccountSelectorModel('openaiAccountId')
 const bedrockAccountSelectorValue = createAccountSelectorModel('bedrockAccountId')
 const droidAccountSelectorValue = createAccountSelectorModel('droidAccountId')
+const ccrAccountSelectorValue = createAccountSelectorModel('ccrAccountId')
 
 const isServiceSelectable = (service) => {
   if (!form.permissions) return true
@@ -627,6 +648,7 @@ const refreshAccounts = async () => {
       openaiResponsesData,
       bedrockData,
       droidData,
+      ccrData,
       groupsData
     ] = await Promise.all([
       httpApis.getClaudeAccountsApi(),
@@ -637,6 +659,7 @@ const refreshAccounts = async () => {
       httpApis.getOpenAIResponsesAccountsApi(),
       httpApis.getBedrockAccountsApi(),
       httpApis.getDroidAccountsApi(),
+      httpApis.getCcrAccountsApi(),
       httpApis.getAccountGroupsApi()
     ])
 
@@ -729,6 +752,14 @@ const refreshAccounts = async () => {
       }))
     }
 
+    if (ccrData.success) {
+      localAccounts.value.ccr = (ccrData.data || []).map((account) => ({
+        ...account,
+        platform: 'ccr',
+        isDedicated: account.accountType === 'dedicated'
+      }))
+    }
+
     // 处理分组数据
     if (groupsData.success) {
       const allGroups = groupsData.data || []
@@ -736,6 +767,7 @@ const refreshAccounts = async () => {
       localAccounts.value.geminiGroups = allGroups.filter((g) => g.platform === 'gemini')
       localAccounts.value.openaiGroups = allGroups.filter((g) => g.platform === 'openai')
       localAccounts.value.droidGroups = allGroups.filter((g) => g.platform === 'droid')
+      localAccounts.value.ccrGroups = allGroups.filter((g) => g.platform === 'claude')
     }
 
     showToast('账号列表已刷新', 'success')
@@ -837,6 +869,15 @@ const batchUpdateApiKeys = async () => {
       }
     }
 
+    // CCR账户绑定
+    if (form.ccrAccountId !== '') {
+      if (form.ccrAccountId === 'SHARED_POOL') {
+        updates.ccrAccountId = null
+      } else {
+        updates.ccrAccountId = form.ccrAccountId
+      }
+    }
+
     // 激活状态
     if (form.isActive !== null) {
       updates.isActive = form.isActive
@@ -921,10 +962,15 @@ onMounted(async () => {
         ...account,
         platform: account.platform || 'droid'
       })),
+      ccr: (props.accounts.ccr || []).map((account) => ({
+        ...account,
+        platform: account.platform || 'ccr'
+      })),
       claudeGroups: props.accounts.claudeGroups || [],
       geminiGroups: props.accounts.geminiGroups || [],
       openaiGroups: props.accounts.openaiGroups || [],
-      droidGroups: props.accounts.droidGroups || []
+      droidGroups: props.accounts.droidGroups || [],
+      ccrGroups: props.accounts.ccrGroups || []
     }
   }
 })

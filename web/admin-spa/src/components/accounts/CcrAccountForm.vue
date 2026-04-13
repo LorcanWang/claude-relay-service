@@ -52,6 +52,78 @@
             />
           </div>
 
+          <!-- 账户类型 -->
+          <div>
+            <label class="mb-2 block text-sm font-semibold text-gray-700 dark:text-gray-300"
+              >账户类型</label
+            >
+            <div class="flex gap-4">
+              <label class="flex cursor-pointer items-center">
+                <input
+                  v-model="form.accountType"
+                  class="mr-2 text-blue-600 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-700"
+                  type="radio"
+                  value="shared"
+                />
+                <span class="text-sm text-gray-700 dark:text-gray-300">共享账户</span>
+              </label>
+              <label class="flex cursor-pointer items-center">
+                <input
+                  v-model="form.accountType"
+                  class="mr-2 text-blue-600 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-700"
+                  type="radio"
+                  value="dedicated"
+                />
+                <span class="text-sm text-gray-700 dark:text-gray-300">专属账户</span>
+              </label>
+              <label class="flex cursor-pointer items-center">
+                <input
+                  v-model="form.accountType"
+                  class="mr-2 text-blue-600 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-700"
+                  type="radio"
+                  value="group"
+                />
+                <span class="text-sm text-gray-700 dark:text-gray-300">分组调度</span>
+              </label>
+            </div>
+            <p class="mt-2 text-xs text-gray-500 dark:text-gray-400">
+              共享账户：供所有API Key使用；专属账户：仅供特定API
+              Key使用；分组调度：加入分组供分组内调度
+            </p>
+          </div>
+
+          <!-- 分组选择器 -->
+          <div v-if="form.accountType === 'group'">
+            <label class="mb-3 block text-sm font-semibold text-gray-700 dark:text-gray-300"
+              >选择分组 *</label
+            >
+            <div
+              class="max-h-48 space-y-2 overflow-y-auto rounded-md border p-3 dark:border-gray-600 dark:bg-gray-700"
+            >
+              <div
+                v-if="filteredGroups.length === 0"
+                class="text-sm text-gray-500 dark:text-gray-400"
+              >
+                暂无可用 Claude 分组，请先在分组管理中创建
+              </div>
+              <label
+                v-for="group in filteredGroups"
+                :key="group.id"
+                class="flex cursor-pointer items-center gap-2 rounded-md p-2 hover:bg-gray-50 dark:hover:bg-gray-600"
+              >
+                <input
+                  v-model="form.groupIds"
+                  class="rounded border-gray-300 text-blue-600 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-700"
+                  type="checkbox"
+                  :value="group.id"
+                />
+                <span class="text-sm text-gray-700 dark:text-gray-200">
+                  {{ group.name }} ({{ group.memberCount || 0 }} 个成员)
+                </span>
+              </label>
+            </div>
+          </div>
+
           <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <div>
               <label class="mb-3 block text-sm font-semibold text-gray-700 dark:text-gray-300"
@@ -259,7 +331,7 @@
 
 <script setup>
 import { ref, computed, watch, onMounted } from 'vue'
-import { updateCcrAccountApi, createCcrAccountApi } from '@/utils/http_apis'
+import { updateCcrAccountApi, createCcrAccountApi, getAccountGroupsApi } from '@/utils/http_apis'
 import { showToast } from '@/utils/tools'
 import ProxyConfig from '@/components/accounts/ProxyConfig.vue'
 
@@ -287,11 +359,29 @@ const form = ref({
   dailyQuota: 0,
   quotaResetTime: '00:00',
   proxy: null,
-  supportedModels: {}
+  supportedModels: {},
+  accountType: 'shared',
+  groupId: '',
+  groupIds: []
 })
 
 const enableRateLimit = ref(true)
 const errors = ref({})
+const groups = ref([])
+
+// CCR 使用 Claude 分组
+const filteredGroups = computed(() => {
+  return groups.value.filter((g) => g.platform === 'claude')
+})
+
+const loadGroups = async () => {
+  try {
+    const response = await getAccountGroupsApi()
+    groups.value = response.data || []
+  } catch (_error) {
+    // 静默处理
+  }
+}
 
 const modelMappings = ref([]) // [{from,to}]
 
@@ -319,6 +409,11 @@ const validate = () => {
   if (!form.value.apiUrl || form.value.apiUrl.trim().length === 0) e.apiUrl = 'API URL 不能为空'
   if (!isEdit.value && (!form.value.apiKey || form.value.apiKey.trim().length === 0))
     e.apiKey = 'API Key 不能为空'
+  if (
+    form.value.accountType === 'group' &&
+    (!form.value.groupIds || form.value.groupIds.length === 0)
+  )
+    e.group = '请至少选择一个分组'
   errors.value = e
   return Object.keys(e).length === 0
 }
@@ -339,7 +434,10 @@ const submit = async () => {
         dailyQuota: Number(form.value.dailyQuota || 0),
         quotaResetTime: form.value.quotaResetTime || '00:00',
         proxy: form.value.proxy || null,
-        supportedModels: buildSupportedModels()
+        supportedModels: buildSupportedModels(),
+        accountType: form.value.accountType,
+        groupId: form.value.accountType === 'group' ? form.value.groupIds[0] || '' : undefined,
+        groupIds: form.value.accountType === 'group' ? form.value.groupIds : undefined
       }
       if (form.value.apiKey && form.value.apiKey.trim().length > 0) {
         updates.apiKey = form.value.apiKey
@@ -363,7 +461,9 @@ const submit = async () => {
         userAgent: form.value.userAgent,
         rateLimitDuration: enableRateLimit.value ? Number(form.value.rateLimitDuration || 60) : 0,
         proxy: form.value.proxy,
-        accountType: 'shared',
+        accountType: form.value.accountType,
+        groupId: form.value.accountType === 'group' ? form.value.groupIds[0] || '' : undefined,
+        groupIds: form.value.accountType === 'group' ? form.value.groupIds : undefined,
         dailyQuota: Number(form.value.dailyQuota || 0),
         quotaResetTime: form.value.quotaResetTime || '00:00'
       }
@@ -394,6 +494,11 @@ const populateFromAccount = () => {
   form.value.dailyQuota = Number(a.dailyQuota || 0)
   form.value.quotaResetTime = a.quotaResetTime || '00:00'
   form.value.proxy = a.proxy || null
+  form.value.accountType = a.accountType || 'shared'
+  form.value.groupIds =
+    a.groupIds ||
+    (a.groupInfos ? a.groupInfos.map((g) => g.id) : []) ||
+    (a.groupId ? [a.groupId] : [])
   enableRateLimit.value = form.value.rateLimitDuration > 0
 
   // supportedModels 对象转为数组
@@ -407,6 +512,7 @@ const populateFromAccount = () => {
 }
 
 onMounted(() => {
+  loadGroups()
   if (isEdit.value) populateFromAccount()
 })
 

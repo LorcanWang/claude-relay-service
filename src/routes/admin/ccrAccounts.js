@@ -258,17 +258,11 @@ router.delete('/:accountId', authenticateAdmin, async (req, res) => {
   try {
     const { accountId } = req.params
 
-    // 尝试自动解绑（CCR账户实际上不会绑定API Key，但保持代码一致性）
+    // 自动解绑 API Key
     const unboundCount = await apiKeyService.unbindAccountFromAllKeys(accountId, 'ccr')
 
-    // 获取账户信息以检查是否在分组中
-    const account = await ccrAccountService.getAccount(accountId)
-    if (account && account.accountType === 'group') {
-      const groups = await accountGroupService.getAccountGroups(accountId)
-      for (const group of groups) {
-        await accountGroupService.removeAccountFromGroup(accountId, group.id)
-      }
-    }
+    // 从所有分组中移除（CCR 账户加入的是 Claude 分组）
+    await accountGroupService.removeAccountFromAllGroups(accountId)
 
     await ccrAccountService.deleteAccount(accountId)
 

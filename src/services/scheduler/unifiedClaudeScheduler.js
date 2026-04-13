@@ -286,7 +286,7 @@ class UnifiedClaudeScheduler {
             groupId,
             sessionHash,
             effectiveModel,
-            vendor === 'ccr'
+            true // API Key 显式绑定分组时，始终允许选择 CCR 账户
           )
         }
 
@@ -416,7 +416,53 @@ class UnifiedClaudeScheduler {
         }
       }
 
-      // CCR 账户不支持绑定（仅通过 ccr, 前缀进行 CCR 路由）
+      // 4. 检查CCR账户绑定（专属账号或分组）
+      if (apiKeyData.ccrAccountId) {
+        // 分组模式
+        if (apiKeyData.ccrAccountId.startsWith('group:')) {
+          const groupId = apiKeyData.ccrAccountId.replace('group:', '')
+          logger.info(
+            `🎯 API key ${apiKeyData.name} is bound to CCR group ${groupId}, selecting from group`
+          )
+          return await this.selectAccountFromGroup(
+            groupId,
+            sessionHash,
+            effectiveModel,
+            true // allowCcr
+          )
+        }
+
+        // 专属账号模式
+        const boundCcrAccount = await ccrAccountService.getAccount(apiKeyData.ccrAccountId)
+        if (
+          boundCcrAccount &&
+          String(boundCcrAccount.isActive) === 'true' &&
+          (!boundCcrAccount.status || boundCcrAccount.status === 'active') &&
+          isSchedulable(boundCcrAccount.schedulable)
+        ) {
+          const isTempUnavailable = await this.isAccountTemporarilyUnavailable(
+            boundCcrAccount.id,
+            'ccr'
+          )
+          if (isTempUnavailable) {
+            logger.warn(
+              `⏱️ Bound CCR account ${boundCcrAccount.id} is temporarily unavailable, falling back to pool`
+            )
+          } else {
+            logger.info(
+              `🎯 Using bound dedicated CCR account: ${boundCcrAccount.name} (${apiKeyData.ccrAccountId}) for API key ${apiKeyData.name}`
+            )
+            return {
+              accountId: apiKeyData.ccrAccountId,
+              accountType: 'ccr'
+            }
+          }
+        } else {
+          logger.warn(
+            `⚠️ Bound CCR account ${apiKeyData.ccrAccountId} is not available (isActive: ${boundCcrAccount?.isActive}, status: ${boundCcrAccount?.status}, schedulable: ${boundCcrAccount?.schedulable}), falling back to pool`
+          )
+        }
+      }
 
       // 如果有会话哈希，检查是否有已映射的账户
       if (sessionHash) {
@@ -1774,15 +1820,15 @@ class UnifiedClaudeScheduler {
 
         // 检查账户是否可用
         const isActive =
-          accountType === 'claude-official'
-            ? account.isActive === 'true'
+          accountType === 'claude-official' || accountType === 'ccr'
+            ? String(account.isActive) === 'true'
             : account.isActive === true
 
         const status =
           accountType === 'claude-official'
             ? account.status !== 'error' && account.status !== 'blocked'
             : accountType === 'ccr'
-              ? account.status === 'active'
+              ? account.status !== 'error' && account.status !== 'blocked'
               : account.status === 'active'
 
         if (isActive && status && isSchedulable(account.schedulable)) {
@@ -1800,6 +1846,33 @@ class UnifiedClaudeScheduler {
           const isRateLimited = await this.isAccountRateLimited(account.id, accountType)
           if (isRateLimited) {
             continue
+          }
+
+          // 检查 CCR/MiniMax 账户的配额和过载状态
+          if (accountType === 'ccr') {
+            const isQuotaExceeded = await ccrAccountService.isAccountQuotaExceeded(account.id)
+            if (isQuotaExceeded) {
+              logger.info(`🚫 Skipping group member ${account.name} (${account.id}) due to CCR quota exceeded`)
+              continue
+            }
+            const isOverloaded = await ccrAccountService.isAccountOverloaded(account.id)
+            if (isOverloaded) {
+              logger.info(`🚫 Skipping group member ${account.name} (${account.id}) due to CCR overloaded`)
+              continue
+            }
+          }
+
+          if (accountType === 'minimax') {
+            const isQuotaExceeded = await minimaxAccountService.isAccountQuotaExceeded(account.id)
+            if (isQuotaExceeded) {
+              logger.info(`🚫 Skipping group member ${account.name} (${account.id}) due to MiniMax quota exceeded`)
+              continue
+            }
+            const isOverloaded = await minimaxAccountService.isAccountOverloaded(account.id)
+            if (isOverloaded) {
+              logger.info(`🚫 Skipping group member ${account.name} (${account.id}) due to MiniMax overloaded`)
+              continue
+            }
           }
 
           if (accountType === 'claude-official' && isOpusRequest) {

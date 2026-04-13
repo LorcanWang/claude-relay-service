@@ -132,7 +132,6 @@
                   </button>
                   <button
                     class="text-red-600 transition-colors hover:text-red-800"
-                    :disabled="group.memberCount > 0"
                     title="删除"
                     @click="deleteGroup(group)"
                   >
@@ -178,7 +177,9 @@
                   ? 'Claude'
                   : editForm.platform === 'gemini'
                     ? 'Gemini'
-                    : 'OpenAI'
+                    : editForm.platform === 'openai'
+                      ? 'OpenAI'
+                      : 'Droid'
               }}
               <span class="ml-2 text-xs text-gray-500">(不可修改)</span>
             </div>
@@ -293,7 +294,7 @@
     <ConfirmModal
       cancel-text="取消"
       confirm-text="确认删除"
-      :message="`确定要删除分组 &quot;${deletingGroup?.name}&quot; 吗？此操作不可撤销。`"
+      :message="`确定要删除分组 &quot;${deletingGroup?.name}&quot; 吗？${deletingGroup?.memberCount > 0 ? '分组内的成员将被自动移除。' : ''}此操作不可撤销。`"
       :show="showDeleteConfirm"
       title="确认删除"
       type="danger"
@@ -470,10 +471,6 @@ const cancelEdit = () => {
 
 // 删除分组 - 打开确认对话框
 const deleteGroup = (group) => {
-  if (group.memberCount > 0) {
-    showToast('分组内还有成员，无法删除', 'error')
-    return
-  }
   deletingGroup.value = group
   showDeleteConfirm.value = true
 }
