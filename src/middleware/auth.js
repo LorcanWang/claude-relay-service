@@ -8,6 +8,7 @@ const redis = require('../models/redis')
 const ClientValidator = require('../validators/clientValidator')
 const ClaudeCodeValidator = require('../validators/clients/claudeCodeValidator')
 const claudeRelayConfigService = require('../services/claudeRelayConfigService')
+const operationalInsights = require('../services/operationalInsightsService')
 const { calculateWaitTimeStats } = require('../utils/statsHelper')
 const { isClaudeFamilyModel } = require('../utils/modelHelper')
 
@@ -439,6 +440,7 @@ async function waitForConcurrencySlot(req, res, apiKeyId, queueOptions) {
 // 🔑 API Key验证中间件（优化版）
 const authenticateApiKey = async (req, res, next) => {
   const startTime = Date.now()
+  req.requestStartTime = Date.now()
   let authErrored = false
   let concurrencyCleanup = null
   let hasConcurrencySlot = false
@@ -1328,6 +1330,13 @@ const authenticateApiKey = async (req, res, next) => {
     logger.api(
       `🔓 Authenticated request from key: ${validation.keyData.name} (${validation.keyData.id}) in ${authDuration}ms`
     )
+    operationalInsights
+      .recordRequest(
+        req.requestId || req.headers['x-request-id'],
+        validation.keyData.id,
+        validation.keyData.name
+      )
+      .catch(() => {})
     logger.api(`   User-Agent: "${userAgent}"`)
 
     return next()

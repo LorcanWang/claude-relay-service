@@ -9,6 +9,7 @@ const logger = require('../../utils/logger')
 const { parseVendorPrefixedModel, isOpus45OrNewer } = require('../../utils/modelHelper')
 const { isSchedulable, sortAccountsByPriority } = require('../../utils/commonHelper')
 const upstreamErrorHelper = require('../../utils/upstreamErrorHelper')
+const operationalInsights = require('../../services/operationalInsightsService')
 
 /**
  * Check if account is Pro (not Max)
@@ -323,6 +324,14 @@ class UnifiedClaudeScheduler {
               logger.info(
                 `🎯 Using bound dedicated Claude OAuth account: ${boundAccount.name} (${apiKeyData.claudeAccountId}) for API key ${apiKeyData.name}`
               )
+              operationalInsights
+                .recordSchedulerDecision(null, {
+                  accountId: apiKeyData.claudeAccountId,
+                  accountType: 'claude-official',
+                  selectionMethod: 'dedicated',
+                  stickyHit: false
+                })
+                .catch(() => {})
               return {
                 accountId: apiKeyData.claudeAccountId,
                 accountType: 'claude-official'
@@ -432,6 +441,14 @@ class UnifiedClaudeScheduler {
               logger.info(
                 `🎯 Using sticky session account: ${mappedAccount.accountId} (${mappedAccount.accountType}) for session ${sessionHash}`
               )
+              operationalInsights
+                .recordSchedulerDecision(null, {
+                  accountId: mappedAccount.accountId,
+                  accountType: mappedAccount.accountType,
+                  selectionMethod: 'sticky',
+                  stickyHit: true
+                })
+                .catch(() => {})
               return mappedAccount
             } else {
               logger.warn(
@@ -482,6 +499,14 @@ class UnifiedClaudeScheduler {
       logger.info(
         `🎯 Selected account: ${selectedAccount.name} (${selectedAccount.accountId}, ${selectedAccount.accountType}) with priority ${selectedAccount.priority} for API key ${apiKeyData.name}`
       )
+      operationalInsights
+        .recordSchedulerDecision(null, {
+          accountId: selectedAccount.accountId,
+          accountType: selectedAccount.accountType,
+          selectionMethod: 'pool',
+          stickyHit: false
+        })
+        .catch(() => {})
 
       return {
         accountId: selectedAccount.accountId,
@@ -1674,6 +1699,14 @@ class UnifiedClaudeScheduler {
                 logger.info(
                   `🎯 Using sticky session account from group: ${mappedAccount.accountId} (${mappedAccount.accountType}) for session ${sessionHash}`
                 )
+                operationalInsights
+                  .recordSchedulerDecision(null, {
+                    accountId: mappedAccount.accountId,
+                    accountType: mappedAccount.accountType,
+                    selectionMethod: 'sticky',
+                    stickyHit: true
+                  })
+                  .catch(() => {})
                 return mappedAccount
               }
             }
@@ -1827,6 +1860,14 @@ class UnifiedClaudeScheduler {
       logger.info(
         `🎯 Selected account from group ${group.name}: ${selectedAccount.name} (${selectedAccount.accountId}, ${selectedAccount.accountType}) with priority ${selectedAccount.priority}`
       )
+      operationalInsights
+        .recordSchedulerDecision(null, {
+          accountId: selectedAccount.accountId,
+          accountType: selectedAccount.accountType,
+          selectionMethod: 'group',
+          stickyHit: false
+        })
+        .catch(() => {})
 
       return {
         accountId: selectedAccount.accountId,

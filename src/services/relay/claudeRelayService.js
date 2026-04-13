@@ -18,6 +18,7 @@ const userMessageQueueService = require('../userMessageQueueService')
 const { isStreamWritable } = require('../../utils/streamHelper')
 const upstreamErrorHelper = require('../../utils/upstreamErrorHelper')
 const metadataUserIdHelper = require('../../utils/metadataUserIdHelper')
+const operationalInsights = require('../../services/operationalInsightsService')
 const {
   getHttpsAgentForStream,
   getHttpsAgentForNonStream,
@@ -2025,6 +2026,7 @@ class ClaudeRelayService {
     )
 
     return new Promise((resolve, reject) => {
+      let wasDisconnected = false
       const url = new URL(this.claudeApiUrl)
       const options = {
         hostname: url.hostname,
@@ -2092,6 +2094,14 @@ class ClaudeRelayService {
                 }
                 responseStream.end()
               }
+              operationalInsights
+                .recordError(null, {
+                  accountId,
+                  accountType,
+                  errorCode: 429,
+                  errorType: 'rate_limit'
+                })
+                .catch(() => {})
               reject(new Error(`Claude API error: 429`))
               return
             }
@@ -2206,6 +2216,14 @@ class ClaudeRelayService {
               }
               responseStream.end()
             }
+            operationalInsights
+              .recordError(null, {
+                accountId,
+                accountType,
+                errorCode: 429,
+                errorType: 'rate_limit'
+              })
+              .catch(() => {})
             reject(new Error(`Claude API error: 429`))
             return
           }
@@ -2272,6 +2290,14 @@ class ClaudeRelayService {
           // 将错误处理逻辑封装在一个异步函数中
           const handleErrorResponse = async () => {
             if (res.statusCode === 401) {
+              operationalInsights
+                .recordError(null, {
+                  accountId,
+                  accountType,
+                  errorCode: 401,
+                  errorType: 'auth'
+                })
+                .catch(() => {})
               logger.warn(`🔐 [Stream] Unauthorized error (401) detected for account ${accountId}`)
 
               await this.recordUnauthorizedError(accountId)
@@ -2294,6 +2320,14 @@ class ClaudeRelayService {
                 await unifiedClaudeScheduler.clearSessionMapping(sessionHash).catch(() => {})
               }
             } else if (res.statusCode === 403) {
+              operationalInsights
+                .recordError(null, {
+                  accountId,
+                  accountType,
+                  errorCode: 403,
+                  errorType: 'auth'
+                })
+                .catch(() => {})
               // 403 处理：先检查是否为封禁性质的 403（组织被禁用/OAuth 被禁止）
               // 注意：重试逻辑已在 handleErrorResponse 外部提前处理
               if (this._isOrganizationDisabledError(res.statusCode, errorData)) {
@@ -2321,6 +2355,14 @@ class ClaudeRelayService {
                 await unifiedClaudeScheduler.clearSessionMapping(sessionHash).catch(() => {})
               }
             } else if (res.statusCode === 529) {
+              operationalInsights
+                .recordError(null, {
+                  accountId,
+                  accountType,
+                  errorCode: 529,
+                  errorType: 'overloaded'
+                })
+                .catch(() => {})
               logger.warn(`🚫 [Stream] Overload error (529) detected for account ${accountId}`)
 
               // 检查是否启用了529错误处理
@@ -2345,6 +2387,14 @@ class ClaudeRelayService {
                 .markTempUnavailable(accountId, accountType, 529)
                 .catch(() => {})
             } else if (res.statusCode >= 500 && res.statusCode < 600) {
+              operationalInsights
+                .recordError(null, {
+                  accountId,
+                  accountType,
+                  errorCode: res.statusCode,
+                  errorType: 'server'
+                })
+                .catch(() => {})
               logger.warn(
                 `🔥 [Stream] Server error (${res.statusCode}) detected for account ${accountId}`
               )
@@ -2855,6 +2905,25 @@ class ClaudeRelayService {
           if (requestOptions.bodyStoreId) {
             this.bodyStore.delete(requestOptions.bodyStoreId)
           }
+          operationalInsights
+            .recordCompletion(null, {
+              accountId,
+              accountType,
+              latencyMs: responseStream.req?.requestStartTime
+                ? Date.now() - responseStream.req.requestStartTime
+                : null,
+              inputTokens:
+                allUsageData.length > 0
+                  ? allUsageData.reduce((sum, usage) => sum + (usage.input_tokens || 0), 0)
+                  : null,
+              outputTokens:
+                allUsageData.length > 0
+                  ? allUsageData.reduce((sum, usage) => sum + (usage.output_tokens || 0), 0)
+                  : null,
+              isStreaming: true,
+              wasDisconnected
+            })
+            .catch(() => {})
           logger.debug('🌊 Claude stream response with usage capture completed')
           resolve()
         })
@@ -2953,6 +3022,7 @@ class ClaudeRelayService {
 
       // 处理客户端断开连接
       responseStream.on('close', () => {
+        wasDisconnected = true
         logger.debug('🔌 Client disconnected, cleaning up stream')
         if (!req.destroyed) {
           req.destroy(new Error('Client disconnected'))
