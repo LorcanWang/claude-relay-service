@@ -2,13 +2,13 @@
 title: "Map of Content"
 aliases: ["MOC", "index"]
 tags: [moc]
-updated: 2026-04-10
+updated: 2026-04-13
 status: active
 ---
 
 # Map of Content
 
-> Knowledge base for Claude Relay Service — 9 documents
+> Knowledge base for Claude Relay Service — 10 documents
 
 ## Architecture
 
@@ -30,7 +30,8 @@ status: active
 ## Other
 
 - [[README|Claude Code 调用 Gemini 3 模型指南]] `api-key` `auth` `ccr`
+- [[hermes-improvements|Hermes Agent Improvement Plan]] `account-groups` `claude` `middleware`
 
 ## Tags
 
-`claude` (9) · `api-key` (8) · `auth` (6) · `account-groups` (6) · `ccr` (6) · `scheduler` (6) · `rate-limiting` (5) · `sticky-session` (5) · `concurrency` (4) · `redis` (4) · `streaming` (4) · `gemini` (4) · `oauth` (4) · `middleware` (3) · `openai` (3) · `proxy` (2) · `bedrock` (2) · `droid` (2) · `docker` (1) · `azure` (1) · `findings` (1) · `pricing` (1) · `encryption` (1) · `jwt` (1)
+`claude` (11) · `api-key` (9) · `account-groups` (8) · `scheduler` (8) · `auth` (7) · `ccr` (7) · `redis` (6) · `sticky-session` (6) · `streaming` (6) · `concurrency` (5) · `middleware` (5) · `rate-limiting` (5) · `gemini` (5) · `oauth` (5) · `openai` (4) · `proxy` (3) · `bedrock` (3) · `droid` (3) · `docker` (2) · `azure` (2) · `encryption` (2) · `jwt` (2) · `pricing` (2) · `findings` (1)

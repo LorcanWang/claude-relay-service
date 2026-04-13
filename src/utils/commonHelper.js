@@ -214,12 +214,19 @@ const getMappedModelName = (modelMapping, requestedModel) => {
 // ============================================
 
 // 按优先级和最后使用时间排序账户
-const sortAccountsByPriority = (accounts) =>
+const sortAccountsByPriority = (accounts, performanceScores = null) =>
   [...accounts].sort((a, b) => {
     const priorityA = parseInt(a.priority, 10) || 50
     const priorityB = parseInt(b.priority, 10) || 50
     if (priorityA !== priorityB) {
       return priorityA - priorityB
+    }
+    if (performanceScores) {
+      const performanceA = performanceScores.get(a.accountId || a.id) ?? 50
+      const performanceB = performanceScores.get(b.accountId || b.id) ?? 50
+      if (performanceA !== performanceB) {
+        return performanceB - performanceA
+      }
     }
     const lastUsedA = a.lastUsedAt ? new Date(a.lastUsedAt).getTime() : 0
     const lastUsedB = b.lastUsedAt ? new Date(b.lastUsedAt).getTime() : 0
