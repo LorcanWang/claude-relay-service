@@ -98,6 +98,10 @@ def execute_command(
         return {"ok": True, "data": None, "stderr": stderr.strip() or None}
 
     try:
-        return {"ok": True, "data": json.loads(stdout)}
+        parsed = json.loads(stdout)
+        # If skill returns standard envelope (has "ok" field), pass through directly
+        if isinstance(parsed, dict) and "ok" in parsed:
+            return parsed
+        return {"ok": True, "data": parsed}
     except json.JSONDecodeError:
         return {"ok": True, "data": stdout.strip()}

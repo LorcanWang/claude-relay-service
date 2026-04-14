@@ -616,10 +616,15 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                             "in_platform": req.inPlatform,
                             "skill_configs": req.skillConfigs or {},
                         })
-                        logger.info("Tool result ok=%s", result.get("ok"))
+                        is_ok = result.get("ok", True) if isinstance(result, dict) else True
+                        logger.info("Tool result ok=%s", is_ok)
                         try:
-                            note = result.get("agentNote", "Done") if isinstance(result, dict) else "Done"
-                            yield sse_agent_status(skill_name, "completed", note)
+                            if is_ok:
+                                note = result.get("agentNote", "Done") if isinstance(result, dict) else "Done"
+                                yield sse_agent_status(skill_name, "completed", note)
+                            else:
+                                err = result.get("error", "Failed") if isinstance(result, dict) else "Failed"
+                                yield sse_agent_status(skill_name, "idle", f"Error: {str(err)[:60]}")
                             yield sse_agent_switch(skill_name, "lynx", "Returning to Lynx")
                         except Exception:
                             pass
