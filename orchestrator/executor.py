@@ -49,6 +49,12 @@ def execute_command(
     ctx = context or {}
     env = {**os.environ, "SKILL_DIR": str(skill_dir)}
 
+    # Prepend skill repo venv to PATH so python3/pip3 resolve correctly
+    venv_bin = SKILL_ROOT.parent.parent / ".venv" / "bin"
+    if venv_bin.is_dir():
+        env["PATH"] = str(venv_bin) + os.pathsep + env.get("PATH", "")
+        env["VIRTUAL_ENV"] = str(venv_bin.parent)
+
     # Standard context vars — every skill gets these
     if ctx.get("org_id"):
         env["LYNX_ORG_ID"] = str(ctx["org_id"])
