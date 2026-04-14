@@ -15,6 +15,7 @@ Environment:
   MAX_LOOP_ITERATIONS  Max tool loop cycles (default 10)
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -32,7 +33,8 @@ if _env_file.exists():
             _k, _v = _line.split("=", 1)
             os.environ.setdefault(_k.strip(), _v.strip())
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
@@ -50,6 +52,7 @@ from skill_loader import build_system_prompt
 from stream import sse, sse_agent_status, sse_agent_switch, stream_error
 from mcp_config import collect_mcp_configs
 from mcp_manager import MCPManager
+from status_hub import status_hub
 
 logging.basicConfig(
     level=logging.INFO,
@@ -69,6 +72,12 @@ COMPACT_KEEP_RECENT = int(os.environ.get("COMPACT_KEEP_RECENT", "10"))
 RELAY_BASE_URL = os.environ.get("RELAY_BASE_URL", "")
 
 app = FastAPI(title="Orchestrator", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
 security = HTTPBearer(auto_error=False)
 
 
@@ -80,6 +89,22 @@ def verify_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(s
     if credentials is None or credentials.credentials != RUNNER_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing Bearer token")
     return credentials.credentials
+
+
+def _verify_status_stream_token(token: Optional[str], authorization: Optional[str]):
+    if not RUNNER_KEY:
+        return
+
+    bearer_token = None
+    if authorization:
+        match = re.match(r"^Bearer\s+(.+)$", authorization, re.IGNORECASE)
+        if match:
+            bearer_token = match.group(1)
+
+    if token == RUNNER_KEY or bearer_token == RUNNER_KEY:
+        return
+
+    raise HTTPException(status_code=401, detail="Invalid or missing Bearer token")
 
 
 # ── request models ────────────────────────────────────────────────────────────
@@ -132,6 +157,52 @@ def ui_to_anthropic(msg: UIMessage) -> dict:
         text = " ".join(p.text for p in msg.parts if p.type == "text" and p.text)
         return {"role": role, "content": text}
     return {"role": role, "content": ""}
+
+
+def _slugify_agent_id(name: str) -> str:
+    slug = re.sub(r"\s+", "-", (name or "").strip().lower())
+    slug = re.sub(r"[^a-z0-9_-]", "-", slug)
+    slug = re.sub(r"-{2,}", "-", slug).strip("-")
+    return slug or "specialist"
+
+
+def _status_sse(event: dict) -> str:
+    event_type = event.get("type", "message")
+    return f"event: {event_type}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+
+def _publish_agent_roster(session_id: str, enabled_skills: list[SkillMeta]):
+    agents = [{"id": "lynx", "name": "Lynx", "type": "team_lead", "seed": "lynx"}]
+    for skill in enabled_skills:
+        slug = _slugify_agent_id(skill.name)
+        agents.append(
+            {
+                "id": slug,
+                "name": skill.name,
+                "type": "specialist",
+                "seed": slug,
+            }
+        )
+    status_hub.publish(session_id, {"type": "agent-roster", "agents": agents})
+
+
+def _publish_agent_status(session_id: str, agent_id: str, status: str, label: str = ""):
+    status_hub.publish(
+        session_id,
+        {"type": "agent-status", "agentId": agent_id, "status": status, "label": label},
+    )
+
+
+def _publish_agent_switch(session_id: str, from_agent_id: str, to_agent_id: str, reason: str = ""):
+    status_hub.publish(
+        session_id,
+        {
+            "type": "agent-switch",
+            "fromAgentId": from_agent_id,
+            "toAgentId": to_agent_id,
+            "reason": reason,
+        },
+    )
 
 
 # ── session compaction ────────────────────────────────────────────────────────
@@ -414,6 +485,38 @@ def clear_session_endpoint(req: ClearSessionRequest, _=Depends(verify_token)):
     return {"ok": True, "session_id": session_id}
 
 
+@app.get("/status/stream")
+async def status_stream(
+    session_id: str = Query(...),
+    token: Optional[str] = Query(None),
+    authorization: Optional[str] = Header(None),
+):
+    _verify_status_stream_token(token, authorization)
+
+    async def event_stream():
+        q = status_hub.subscribe(session_id)
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(q.get(), timeout=15)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
+                yield _status_sse(event)
+        finally:
+            status_hub.unsubscribe(session_id, q)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
+
+
 @app.post("/chat")
 async def chat(req: ChatRequest, _=Depends(verify_token)):
     async def event_stream():
@@ -494,6 +597,8 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
             )
 
             yield sse({"type": "start"})
+            _publish_agent_roster(session_id, req.enabledSkills)
+            _publish_agent_status(session_id, "lynx", "thinking", "Planning")
 
             for iteration in range(MAX_LOOP):
                 logger.info("Loop iteration %d/%d for [%s]", iteration + 1, MAX_LOOP, session_id)
@@ -531,6 +636,7 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                             yield sse({"type": "data-action", "data": action})
                     yield sse({"type": "finish-step"})
                     yield sse({"type": "finish", "finishReason": "stop"})
+                    _publish_agent_status(session_id, "lynx", "completed", "Done")
                     yield sse("[DONE]")
                     break
 
@@ -543,6 +649,7 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                             yield sse({"type": "data-action", "data": action})
                     yield sse({"type": "finish-step"})
                     yield sse({"type": "finish", "finishReason": "stop"})
+                    _publish_agent_status(session_id, "lynx", "completed", "Done")
                     yield sse("[DONE]")
                     break
 
@@ -560,12 +667,26 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                         logger.info("App action collected: %r", inp)
                         result = {"ok": True, "action": inp.get("action", "")}
                     elif mcp_mgr and mcp_mgr.is_mcp_tool(tool_name):
+                        _publish_agent_switch(session_id, "lynx", tool_name, f"Calling {tool_name}")
+                        _publish_agent_status(session_id, tool_name, "working", f"Calling {tool_name}")
                         logger.info("MCP tool call: %s", tool_name)
                         result = await mcp_mgr.call_tool(tool_name, inp)
                         logger.info("MCP tool result ok=%s", result.get("ok"))
+                        note = result.get("agentNote") if isinstance(result, dict) else ""
+                        _publish_agent_status(
+                            session_id,
+                            tool_name,
+                            "completed",
+                            note or "Done",
+                        )
+                        _publish_agent_switch(session_id, tool_name, "lynx", "Returned to Lynx")
                     else:
                         skill_name = inp.get("skill", "")
                         command = inp.get("command", "")
+                        skill_id = _slugify_agent_id(skill_name)
+                        preview = command.strip()[:120] if isinstance(command, str) else ""
+                        _publish_agent_switch(session_id, "lynx", skill_id, f"Delegating to {skill_name}")
+                        _publish_agent_status(session_id, skill_id, "working", preview or "Running command")
                         logger.info("Tool call: skill=%r command=%r", skill_name, command)
                         result = execute_command(skill_name, command, enabled_names, context={
                             "org_id": req.orgId,
@@ -575,6 +696,14 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                             "skill_configs": req.skillConfigs or {},
                         })
                         logger.info("Tool result ok=%s", result.get("ok", True) if isinstance(result, dict) else True)
+                        note = result.get("agentNote") if isinstance(result, dict) else ""
+                        _publish_agent_status(
+                            session_id,
+                            skill_id,
+                            "completed",
+                            note or "Done",
+                        )
+                        _publish_agent_switch(session_id, skill_id, "lynx", "Returned to Lynx")
 
                     # Send only the data payload to Claude, not the executor envelope
                     tool_payload = result.get("data") if isinstance(result, dict) else result
@@ -596,6 +725,7 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                 yield sse({"type": "text-end", "id": text_id})
                 yield sse({"type": "finish-step"})
                 yield sse({"type": "finish", "finishReason": "stop"})
+                _publish_agent_status(session_id, "lynx", "completed", "Done")
                 yield sse("[DONE]")
                 logger.warning("Max loop iterations reached for [%s]", session_id)
 
