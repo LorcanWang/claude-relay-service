@@ -18,9 +18,17 @@ STDOUT_CAP = 1_000_000   # 1 MB
 STDERR_CAP = 100_000
 
 
-def execute_command(skill_name: str, command: str, enabled_skill_names: list[str]) -> dict:
+def execute_command(
+    skill_name: str,
+    command: str,
+    enabled_skill_names: list[str],
+    context: dict | None = None,
+) -> dict:
     """
     Run `command` in SKILL_ROOT/{skill_name}/.
+
+    context (optional): dict with org_id, user_id, session_id, skill_configs, in_platform.
+    These are injected as LYNX_* env vars so skills have a standard way to access caller context.
 
     Returns {"ok": True, "data": ...} or {"ok": False, "error": ..., "stderr": ...}.
     """
@@ -37,8 +45,28 @@ def execute_command(skill_name: str, command: str, enabled_skill_names: list[str
 
     logger.info("Executing in %s: %s", skill_dir, command)
 
-    # ── run ───────────────────────────────────────────────────────────────────
+    # ── build env with standard LYNX_* context vars ──────────────────────────
+    ctx = context or {}
     env = {**os.environ, "SKILL_DIR": str(skill_dir)}
+
+    # Standard context vars — every skill gets these
+    if ctx.get("org_id"):
+        env["LYNX_ORG_ID"] = str(ctx["org_id"])
+    if ctx.get("user_id"):
+        env["LYNX_USER_ID"] = str(ctx["user_id"])
+    if ctx.get("session_id"):
+        env["LYNX_SESSION_ID"] = str(ctx["session_id"])
+    env["LYNX_AGENT_ID"] = skill_name
+    env["LYNX_IN_PLATFORM"] = "true" if ctx.get("in_platform") else "false"
+
+    # Per-skill config values as LYNX_CONFIG_* env vars
+    skill_configs = ctx.get("skill_configs") or {}
+    skill_config = skill_configs.get(skill_name) or {}
+    for key, value in skill_config.items():
+        env_key = "LYNX_CONFIG_" + key.upper().replace("-", "_")
+        env[env_key] = str(value)
+    if skill_config:
+        env["LYNX_CONFIG_JSON"] = json.dumps(skill_config, ensure_ascii=False, default=str)
 
     try:
         result = subprocess.run(

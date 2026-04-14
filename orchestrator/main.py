@@ -609,10 +609,17 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                             )
                         except Exception:
                             pass
-                        result = execute_command(skill_name, command, enabled_names)
+                        result = execute_command(skill_name, command, enabled_names, context={
+                            "org_id": req.orgId,
+                            "user_id": req.userId,
+                            "session_id": session_id,
+                            "in_platform": req.inPlatform,
+                            "skill_configs": req.skillConfigs or {},
+                        })
                         logger.info("Tool result ok=%s", result.get("ok"))
                         try:
-                            yield sse_agent_status(skill_name, "completed", "Done")
+                            note = result.get("agentNote", "Done") if isinstance(result, dict) else "Done"
+                            yield sse_agent_status(skill_name, "completed", note)
                             yield sse_agent_switch(skill_name, "lynx", "Returning to Lynx")
                         except Exception:
                             pass

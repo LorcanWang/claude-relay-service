@@ -1,7 +1,9 @@
 """
 Reads SKILL.md (or skill.md) from SKILL_ROOT/{name}/ and builds the full system prompt.
+Also reads agent.json manifests for standardized skill metadata.
 """
 
+import json
 import logging
 import os
 from pathlib import Path
@@ -42,6 +44,20 @@ def load_skill_doc(skill_name: str) -> str | None:
     return None
 
 
+def load_agent_manifest(skill_name: str) -> dict | None:
+    """Return parsed agent.json for a skill, or None if not found."""
+    if ".." in skill_name or "/" in skill_name or "\\" in skill_name:
+        return None
+    manifest_path = SKILL_ROOT / skill_name / "agent.json"
+    if not manifest_path.exists():
+        return None
+    try:
+        return json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("Failed to read agent.json for %s: %s", skill_name, exc)
+        return None
+
+
 def build_system_prompt(
     base_prompt: str,
     enabled_skills: list[dict],
@@ -64,7 +80,9 @@ def build_system_prompt(
             ctx_lines.append(f"- **user_id**: `{user_id}`")
         ctx_lines.append(f"- **in_platform**: `{'true' if in_platform else 'false'}`")
         ctx_lines.append(
-            "When running skill commands that accept `--org-id`, always pass the org_id above."
+            "When running skill commands that accept `--org-id`, always pass the org_id above. "
+            "Note: LYNX_ORG_ID, LYNX_USER_ID, and skill config values are also injected as "
+            "environment variables automatically — skills that read env vars will get them."
         )
         if in_platform:
             ctx_lines.append(
