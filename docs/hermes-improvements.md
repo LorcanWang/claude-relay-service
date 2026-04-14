@@ -44,6 +44,31 @@ Performance scoring for scheduling decisions:
 - Integrated into `sortAccountsByPriority` as optional secondary signal
 - Backward compatible — existing callers unaffected
 
+### Wired: Insights Hooks in Request Path
+
+Fire-and-forget hooks inserted at three points:
+- `src/middleware/auth.js` — `recordRequest()` after API key validation
+- `src/services/scheduler/unifiedClaudeScheduler.js` — `recordSchedulerDecision()` on dedicated/sticky/group/pool paths
+- `src/services/relay/claudeRelayService.js` — `recordCompletion()` on stream end, `recordError()` on 401/403/429/529/5xx
+
+### Frontend: Relay Health Dashboard (zeonsolutions)
+
+New admin page at `/admin/relay-insights` with:
+- Summary stat cards (requests, latency, error rate, sticky hit rate, completions, accounts)
+- Hourly area chart (completions vs errors)
+- Latency trend line chart
+- Sticky session heatmap (24h color-coded grid)
+- Scheduler method pie chart (pool/group/dedicated/sticky)
+- Account performance table with color-coded success rate badges
+
+### Merged: PR #4 CCR Scheduling Fix
+
+PR #4 merged 2026-04-13. Author addressed all review feedback:
+- Status gate narrowed to `!= error && != blocked` (not blanket `true`)
+- `isAccountQuotaExceeded` and `isAccountOverloaded` added to group path (commit `cd8681b`)
+- CCR API Key binding, group deletion relaxation, and validator change included
+- PRs #1 and #3 closed as superseded
+
 ## Hermes Patterns Adopted
 
 1. **Frozen snapshot pattern** — system prompt uses state captured at session start

@@ -2,7 +2,7 @@
 title: "Map of Content"
 aliases: ["MOC", "index"]
 tags: [moc]
-updated: 2026-04-13
+updated: 2026-04-14
 status: active
 ---
 
@@ -30,8 +30,8 @@ status: active
 ## Other
 
 - [[README|Claude Code 调用 Gemini 3 模型指南]] `api-key` `auth` `ccr`
-- [[hermes-improvements|Hermes Agent Improvement Plan]] `account-groups` `claude` `middleware`
+- [[hermes-improvements|Hermes Agent Improvement Plan]] `account-groups` `api-key` `auth`
 
 ## Tags
 
-`claude` (11) · `api-key` (9) · `account-groups` (8) · `scheduler` (8) · `auth` (7) · `ccr` (7) · `redis` (6) · `sticky-session` (6) · `streaming` (6) · `concurrency` (5) · `middleware` (5) · `rate-limiting` (5) · `gemini` (5) · `oauth` (5) · `openai` (4) · `proxy` (3) · `bedrock` (3) · `droid` (3) · `docker` (2) · `azure` (2) · `encryption` (2) · `jwt` (2) · `pricing` (2) · `findings` (1)
+`claude` (11) · `api-key` (10) · `auth` (8) · `account-groups` (8) · `ccr` (8) · `scheduler` (8) · `redis` (7) · `sticky-session` (7) · `streaming` (7) · `concurrency` (5) · `middleware` (5) · `rate-limiting` (5) · `gemini` (5) · `oauth` (5) · `openai` (4) · `proxy` (3) · `bedrock` (3) · `droid` (3) · `docker` (2) · `azure` (2) · `encryption` (2) · `jwt` (2) · `pricing` (2) · `findings` (1)

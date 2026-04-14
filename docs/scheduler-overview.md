@@ -3,7 +3,7 @@ title: "Scheduler Overview"
 aliases: ["scheduler-overview", "unified-scheduler"]
 tags: [scheduler, architecture, account-groups, sticky-session]
 created: 2026-04-10
-updated: 2026-04-10
+updated: 2026-04-13
 status: active
 ---
 
@@ -28,7 +28,7 @@ Claude platform groups can contain mixed account types:
 |------|-------------------|--------------|
 | `claude-official` | `'true'` (string) | `!= 'error' && != 'blocked'` |
 | `claude-console` | `true` (boolean) | `== 'active'` |
-| `ccr` | `'true'` (string) | See [[ccr-scheduling-findings]] |
+| `ccr` | `'true'` (string) | `!= 'error' && != 'blocked'` (see [[ccr-scheduling-findings]]) |
 
 ## Availability Checks
 
@@ -38,7 +38,25 @@ After passing the status gate, accounts go through:
 2. `_isModelSupportedByAccount` — model compatibility
 3. `isAccountTemporarilyUnavailable` — temporary 529/error cooldown
 4. `isAccountRateLimited` — rate limit check
-5. (Claude-official only) `isAccountOpusRateLimited` — Opus-specific limit
-6. (Console only) concurrency limit check
+5. (CCR only) `isAccountQuotaExceeded` + `isAccountOverloaded` — added in PR #4
+6. (Claude-official only) `isAccountOpusRateLimited` — Opus-specific limit
+7. (Console only) concurrency limit check
 
-See [[ccr-scheduling-findings]] for gaps in CCR-specific checks within the group path.
+## Performance Scoring
+
+`src/services/scheduler/accountPerformanceService.js` provides an optional soft score (0-100) for each account based on operational insights data:
+
+- Success rate (50% weight): from `ops:account:{id}:perf` Redis hash
+- Latency tiers (30% weight): <2s = 30, <5s = 20, <10s = 10, >10s = 0
+- Error recency (20% weight): no errors = 20, >1h ago = 15, >10min = 10, <10min = 0
+
+Integrated into `sortAccountsByPriority` as an optional secondary signal after static priority but before lastUsedAt round-robin. Neutral score (50) when no data exists.
+
+## Operational Insights
+
+Every scheduler decision is recorded via `operationalInsightsService.recordSchedulerDecision()`:
+- Selection method (dedicated, group, sticky, pool)
+- Sticky hit/miss
+- Account and type selected
+
+Data feeds into hourly Redis rollups at `ops:hourly:{YYYY-MM-DD-HH}` with 72h TTL, queryable via `/admin/insights/scheduler`.
