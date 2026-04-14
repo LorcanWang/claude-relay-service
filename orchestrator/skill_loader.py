@@ -14,6 +14,22 @@ SKILL_ROOT = Path(
     os.environ.get("SKILL_ROOT", "/home/hqzn/grantllama-scrape-skill/.claude/skills")
 )
 
+# Skills to ignore on this server (loaded from .skillignore in SKILL_ROOT)
+_IGNORED_SKILLS: set[str] | None = None
+
+def _load_ignored_skills() -> set[str]:
+    global _IGNORED_SKILLS
+    if _IGNORED_SKILLS is not None:
+        return _IGNORED_SKILLS
+    ignore_path = SKILL_ROOT / ".skillignore"
+    if ignore_path.exists():
+        lines = ignore_path.read_text(encoding="utf-8").splitlines()
+        _IGNORED_SKILLS = {l.strip() for l in lines if l.strip() and not l.startswith("#")}
+        logger.info("Loaded .skillignore: %s", _IGNORED_SKILLS)
+    else:
+        _IGNORED_SKILLS = set()
+    return _IGNORED_SKILLS
+
 # Filenames to search for, in priority order
 _DOC_NAMES = ["SKILL.md", "skill.md", "SKILL.yaml", "skill.yaml", "README.md"]
 
@@ -23,6 +39,11 @@ def load_skill_doc(skill_name: str) -> str | None:
     # Reject path traversal
     if ".." in skill_name or "/" in skill_name or "\\" in skill_name:
         logger.warning("Rejected unsafe skill name: %r", skill_name)
+        return None
+
+    # Check .skillignore
+    if skill_name in _load_ignored_skills():
+        logger.debug("Skill %s is in .skillignore, skipping", skill_name)
         return None
 
     skill_dir = SKILL_ROOT / skill_name

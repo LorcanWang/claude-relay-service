@@ -568,7 +568,8 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
 
         # ── MCP tools ─────────────────────────────────────────────────────────
         mcp_mgr = None
-        if effective_skills and MCPManager.available():
+        mcp_enabled = os.environ.get("MCP_ENABLED", "false").lower() == "true"
+        if mcp_enabled and effective_skills and MCPManager.available():
             mcp_configs = collect_mcp_configs(enabled_names, req.skillConfigs)
             if mcp_configs:
                 try:
