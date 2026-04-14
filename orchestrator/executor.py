@@ -105,9 +105,10 @@ def execute_command(
 
     try:
         parsed = json.loads(stdout)
-        # If skill returns standard envelope (has "ok" field), pass through directly
-        if isinstance(parsed, dict) and "ok" in parsed:
-            return parsed
-        return {"ok": True, "data": parsed}
+        result = {"ok": True, "data": parsed}
+        # Extract agentNote from skill's standard envelope if present
+        if isinstance(parsed, dict) and parsed.get("agentNote"):
+            result["agentNote"] = parsed["agentNote"]
+        return result
     except json.JSONDecodeError:
         return {"ok": True, "data": stdout.strip()}
