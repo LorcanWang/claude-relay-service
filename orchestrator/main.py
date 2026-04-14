@@ -47,7 +47,7 @@ from anthropic_client import (
 from executor import execute_command
 from session import clear_session, get_session, new_session, save_session
 from skill_loader import build_system_prompt
-from stream import sse, stream_error
+from stream import sse, sse_agent_status, sse_agent_switch, stream_error
 from mcp_config import collect_mcp_configs
 from mcp_manager import MCPManager
 
@@ -494,6 +494,23 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
             )
 
             yield sse({"type": "start"})
+            try:
+                agent_roster = [
+                    {"id": "lynx", "name": "Lynx", "type": "team_lead", "seed": "lynx"}
+                ]
+                for skill in req.enabledSkills:
+                    slug = skill.name.lower().replace(" ", "-")
+                    agent_roster.append(
+                        {
+                            "id": slug,
+                            "name": skill.name,
+                            "type": "specialist",
+                            "seed": slug,
+                        }
+                    )
+                yield sse({"type": "agent-roster", "agents": agent_roster})
+            except Exception:
+                pass
 
             for iteration in range(MAX_LOOP):
                 logger.info("Loop iteration %d/%d for [%s]", iteration + 1, MAX_LOOP, session_id)
@@ -501,6 +518,10 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                 # Every iteration streams from Anthropic in real-time
                 stream = AnthropicStream(messages=session["messages"], **api_kwargs)
 
+                try:
+                    yield sse_agent_status("lynx", "thinking", "Planning next step...")
+                except Exception:
+                    pass
                 yield sse({"type": "start-step"})
                 text_id = str(step_id)
                 has_text = False
@@ -561,14 +582,40 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                         result = {"ok": True, "action": inp.get("action", "")}
                     elif mcp_mgr and mcp_mgr.is_mcp_tool(tool_name):
                         logger.info("MCP tool call: %s", tool_name)
+                        try:
+                            yield sse_agent_switch("lynx", tool_name, f"Running {tool_name}")
+                            yield sse_agent_status(
+                                tool_name,
+                                "working",
+                                f"Executing: {json.dumps(inp, ensure_ascii=False, default=str)[:50]}",
+                            )
+                        except Exception:
+                            pass
                         result = await mcp_mgr.call_tool(tool_name, inp)
                         logger.info("MCP tool result ok=%s", result.get("ok"))
+                        try:
+                            yield sse_agent_status(tool_name, "completed", "Done")
+                            yield sse_agent_switch(tool_name, "lynx", "Returning to Lynx")
+                        except Exception:
+                            pass
                     else:
                         skill_name = inp.get("skill", "")
                         command = inp.get("command", "")
                         logger.info("Tool call: skill=%r command=%r", skill_name, command)
+                        try:
+                            yield sse_agent_switch("lynx", skill_name, f"Running {skill_name}")
+                            yield sse_agent_status(
+                                skill_name, "working", f"Executing: {command[:50]}"
+                            )
+                        except Exception:
+                            pass
                         result = execute_command(skill_name, command, enabled_names)
                         logger.info("Tool result ok=%s", result.get("ok"))
+                        try:
+                            yield sse_agent_status(skill_name, "completed", "Done")
+                            yield sse_agent_switch(skill_name, "lynx", "Returning to Lynx")
+                        except Exception:
+                            pass
 
                     tool_results.append({
                         "type": "tool_result",

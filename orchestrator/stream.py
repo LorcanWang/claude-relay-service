@@ -24,6 +24,28 @@ def sse(data) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def sse_agent_switch(from_agent_id: str, to_agent_id: str, reason: str = "") -> str:
+    return sse(
+        {
+            "type": "agent-switch",
+            "fromAgentId": from_agent_id,
+            "toAgentId": to_agent_id,
+            "reason": reason,
+        }
+    )
+
+
+def sse_agent_status(agent_id: str, status: str, label: str = "") -> str:
+    return sse(
+        {
+            "type": "agent-status",
+            "agentId": agent_id,
+            "status": status,
+            "label": label,
+        }
+    )
+
+
 async def stream_text(
     text: str, actions: list[dict] | None = None, finish_reason: str = "stop"
 ) -> AsyncIterator[str]:
