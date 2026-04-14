@@ -629,10 +629,13 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                         except Exception:
                             pass
 
+                    # Send only the data payload to Claude, not the executor envelope
+                    tool_payload = result.get("data") if isinstance(result, dict) else result
+                    tool_content = json.dumps(tool_payload, ensure_ascii=False, default=str) if not isinstance(tool_payload, str) else tool_payload
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": tool_id,
-                        "content": json.dumps(result, ensure_ascii=False, default=str),
+                        "content": tool_content[:20000],
                     })
 
                 session["messages"].append({"role": "user", "content": tool_results})
