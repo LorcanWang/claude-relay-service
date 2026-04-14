@@ -494,23 +494,6 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
             )
 
             yield sse({"type": "start"})
-            try:
-                agent_roster = [
-                    {"id": "lynx", "name": "Lynx", "type": "team_lead", "seed": "lynx"}
-                ]
-                for skill in req.enabledSkills:
-                    slug = skill.name.lower().replace(" ", "-")
-                    agent_roster.append(
-                        {
-                            "id": slug,
-                            "name": skill.name,
-                            "type": "specialist",
-                            "seed": slug,
-                        }
-                    )
-                yield sse({"type": "agent-roster", "agents": agent_roster})
-            except Exception:
-                pass
 
             for iteration in range(MAX_LOOP):
                 logger.info("Loop iteration %d/%d for [%s]", iteration + 1, MAX_LOOP, session_id)
@@ -518,10 +501,6 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                 # Every iteration streams from Anthropic in real-time
                 stream = AnthropicStream(messages=session["messages"], **api_kwargs)
 
-                try:
-                    yield sse_agent_status("lynx", "thinking", "Planning next step...")
-                except Exception:
-                    pass
                 yield sse({"type": "start-step"})
                 text_id = str(step_id)
                 has_text = False
@@ -582,33 +561,12 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                         result = {"ok": True, "action": inp.get("action", "")}
                     elif mcp_mgr and mcp_mgr.is_mcp_tool(tool_name):
                         logger.info("MCP tool call: %s", tool_name)
-                        try:
-                            yield sse_agent_switch("lynx", tool_name, f"Running {tool_name}")
-                            yield sse_agent_status(
-                                tool_name,
-                                "working",
-                                f"Executing: {json.dumps(inp, ensure_ascii=False, default=str)[:50]}",
-                            )
-                        except Exception:
-                            pass
                         result = await mcp_mgr.call_tool(tool_name, inp)
                         logger.info("MCP tool result ok=%s", result.get("ok"))
-                        try:
-                            yield sse_agent_status(tool_name, "completed", "Done")
-                            yield sse_agent_switch(tool_name, "lynx", "Returning to Lynx")
-                        except Exception:
-                            pass
                     else:
                         skill_name = inp.get("skill", "")
                         command = inp.get("command", "")
                         logger.info("Tool call: skill=%r command=%r", skill_name, command)
-                        try:
-                            yield sse_agent_switch("lynx", skill_name, f"Running {skill_name}")
-                            yield sse_agent_status(
-                                skill_name, "working", f"Executing: {command[:50]}"
-                            )
-                        except Exception:
-                            pass
                         result = execute_command(skill_name, command, enabled_names, context={
                             "org_id": req.orgId,
                             "user_id": req.userId,
@@ -616,18 +574,7 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                             "in_platform": req.inPlatform,
                             "skill_configs": req.skillConfigs or {},
                         })
-                        is_ok = result.get("ok", True) if isinstance(result, dict) else True
-                        logger.info("Tool result ok=%s", is_ok)
-                        try:
-                            if is_ok:
-                                note = result.get("agentNote", "Done") if isinstance(result, dict) else "Done"
-                                yield sse_agent_status(skill_name, "completed", note)
-                            else:
-                                err = result.get("error", "Failed") if isinstance(result, dict) else "Failed"
-                                yield sse_agent_status(skill_name, "idle", f"Error: {str(err)[:60]}")
-                            yield sse_agent_switch(skill_name, "lynx", "Returning to Lynx")
-                        except Exception:
-                            pass
+                        logger.info("Tool result ok=%s", result.get("ok", True) if isinstance(result, dict) else True)
 
                     # Send only the data payload to Claude, not the executor envelope
                     tool_payload = result.get("data") if isinstance(result, dict) else result
