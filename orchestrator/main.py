@@ -143,6 +143,10 @@ class ChatRequest(BaseModel):
     inPlatform: Optional[bool] = False
     skillConfigs: Optional[dict] = {}  # per-skill extra config, e.g. login info
     clearSession: Optional[bool] = False
+    roomId: Optional[str] = None      # meeting room ID — scopes session + agent roster
+    roomAgentIds: Optional[list[str]] = None  # agent slugs for this room
+    senderUserId: Optional[str] = None        # who sent this message (for multi-user rooms)
+    senderDisplayName: Optional[str] = None   # display name for attribution
 
 
 # ── message conversion ────────────────────────────────────────────────────────
@@ -520,8 +524,19 @@ async def status_stream(
 @app.post("/chat")
 async def chat(req: ChatRequest, _=Depends(verify_token)):
     async def event_stream():
-        session_id = req.sessionId or f"{req.orgId}_{req.userId}"
-        enabled_names = [s.name for s in req.enabledSkills]
+        # Session key: room mode uses room:{roomId}, personal mode uses orgId_userId
+        if req.roomId:
+            session_id = f"room:{req.roomId}"
+        else:
+            session_id = req.sessionId or f"{req.orgId}_{req.userId}"
+
+        # Scope agent roster to room's agents if specified
+        effective_skills = req.enabledSkills
+        if req.roomAgentIds is not None:
+            room_set = set(req.roomAgentIds)
+            effective_skills = [s for s in req.enabledSkills if _slugify_agent_id(s.name) in room_set]
+
+        enabled_names = [s.name for s in effective_skills]
         model = req.anthropicConfig.model or DEFAULT_MODEL
 
         # ── session ───────────────────────────────────────────────────────────
@@ -531,27 +546,29 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
         session = get_session(session_id) or new_session(session_id)
 
         # Only append the LAST user message from this request.
-        # The session already contains full history from Redis;
-        # the frontend (useChat) sends all messages each time,
-        # so appending them all would cause duplicates.
         user_messages = [msg for msg in req.messages if msg.role == "user"]
         if user_messages:
-            session["messages"].append(ui_to_anthropic(user_messages[-1]))
+            last_user = ui_to_anthropic(user_messages[-1])
+            # In room mode, prefix with sender name so Claude knows who is talking
+            if req.roomId and req.senderDisplayName and isinstance(last_user.get("content"), str):
+                last_user["content"] = f"[{req.senderDisplayName}]: {last_user['content']}"
+            session["messages"].append(last_user)
 
         # ── build full system prompt ──────────────────────────────────────────
         full_system = build_system_prompt(
             req.systemPrompt,
-            [s.dict() for s in req.enabledSkills],
+            [s.dict() for s in effective_skills],
             org_id=req.orgId,
             user_id=req.userId,
             in_platform=req.inPlatform,
             skill_configs=req.skillConfigs or {},
+            room_id=req.roomId,
         )
-        tools = [RUN_COMMAND_TOOL, APP_ACTION_TOOL] if req.enabledSkills else [APP_ACTION_TOOL]
+        tools = [RUN_COMMAND_TOOL, APP_ACTION_TOOL] if effective_skills else [APP_ACTION_TOOL]
 
         # ── MCP tools ─────────────────────────────────────────────────────────
         mcp_mgr = None
-        if req.enabledSkills and MCPManager.available():
+        if effective_skills and MCPManager.available():
             mcp_configs = collect_mcp_configs(enabled_names, req.skillConfigs)
             if mcp_configs:
                 try:
@@ -597,7 +614,7 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
             )
 
             yield sse({"type": "start"})
-            _publish_agent_roster(session_id, req.enabledSkills)
+            _publish_agent_roster(session_id, effective_skills)
             _publish_agent_status(session_id, "lynx", "thinking", "Planning")
 
             for iteration in range(MAX_LOOP):
@@ -694,6 +711,7 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                             "session_id": session_id,
                             "in_platform": req.inPlatform,
                             "skill_configs": req.skillConfigs or {},
+                            "room_id": req.roomId,
                         })
                         logger.info("Tool result ok=%s", result.get("ok", True) if isinstance(result, dict) else True)
                         note = result.get("agentNote") if isinstance(result, dict) else ""

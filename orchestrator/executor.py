@@ -64,6 +64,8 @@ def execute_command(
         env["LYNX_SESSION_ID"] = str(ctx["session_id"])
     env["LYNX_AGENT_ID"] = skill_name
     env["LYNX_IN_PLATFORM"] = "true" if ctx.get("in_platform") else "false"
+    if ctx.get("room_id"):
+        env["LYNX_ROOM_ID"] = str(ctx["room_id"])
 
     # Per-skill config values as LYNX_CONFIG_* env vars
     skill_configs = ctx.get("skill_configs") or {}

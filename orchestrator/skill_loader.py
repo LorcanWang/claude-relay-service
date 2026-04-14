@@ -65,6 +65,7 @@ def build_system_prompt(
     user_id: str | None = None,
     in_platform: bool = False,
     skill_configs: dict | None = None,
+    room_id: str | None = None,
 ) -> str:
     """
     Combine the base system prompt from Next.js with SKILL.md content
@@ -89,6 +90,12 @@ def build_system_prompt(
                 "The user is inside the platform. Prefer using app_action(navigate) to send them "
                 "to the relevant page rather than printing full data tables. "
                 "Give a brief answer and navigate."
+            )
+        if room_id:
+            ctx_lines.append(f"- **room_id**: `{room_id}`")
+            ctx_lines.append(
+                "You are in a multi-user meeting room. Messages may be prefixed with "
+                "[Username]: to identify the sender. Address users by name when relevant."
             )
         parts.append("\n".join(ctx_lines))
 
