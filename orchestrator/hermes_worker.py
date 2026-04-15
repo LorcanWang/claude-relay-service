@@ -98,7 +98,7 @@ def process_turn_batch(event: dict):
     _update_session_record(session_id, org_id, user_id, room_id, turns, extracted)
     _update_user_profile(org_id, user_id, extracted)
 
-    customer_id = _detect_customer_id(turns)
+    customer_id = event.get("customer_id") or _detect_customer_id(turns)
     if customer_id:
         crm_actions = memories_to_crm_actions(memories, org_id, customer_id)
         if crm_actions:

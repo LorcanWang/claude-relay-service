@@ -719,6 +719,7 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                         if user_messages:
                             _last = user_messages[-1]
                             _user_text = _last.content if hasattr(_last, "content") else str(_last)
+                        _crm_customer_id = (req.skillConfigs or {}).get("crm-notes", {}).get("customer_id")
                         emit_turn_completed(
                             org_id=req.orgId,
                             user_id=req.userId,
@@ -729,6 +730,7 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                             assistant_text=_assistant_text[:2000],
                             tool_names=_hermes_tool_names,
                             message_index=len(session["messages"]),
+                            customer_id=_crm_customer_id,
                         )
                     except Exception as _hermes_exc:
                         logger.debug("Hermes emit failed: %s", _hermes_exc)

@@ -53,6 +53,7 @@ def emit_turn_completed(
     assistant_text: str,
     tool_names: list[str],
     message_index: int,
+    customer_id: Optional[str] = None,
 ):
     if not HERMES_ENABLED:
         return
@@ -81,6 +82,7 @@ def emit_turn_completed(
             "assistant": assistant_cls.to_dict(),
         },
         "importance": combined_importance,
+        "customer_id": customer_id,
     }
 
     buffer_key = session_id
@@ -106,12 +108,14 @@ def _flush_buffer(buffer_key: str):
     if not turns:
         return
 
+    customer_ids = [t.get("customer_id") for t in turns if t.get("customer_id")]
     batch_event = {
         "type": "turn_batch_ready",
         "session_id": turns[0]["session_id"],
         "org_id": turns[0]["org_id"],
         "user_id": turns[0]["user_id"],
         "room_id": turns[0].get("room_id"),
+        "customer_id": customer_ids[0] if customer_ids else None,
         "turns": turns,
         "turn_count": len(turns),
     }
