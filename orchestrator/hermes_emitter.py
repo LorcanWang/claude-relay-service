@@ -156,7 +156,9 @@ def emit_session_closed(
     if not HERMES_ENABLED:
         return
 
-    _flush_buffer(session_id)
+    # Grab remaining buffered turns and bundle them into the close event
+    # so the worker can do a final extraction (buffer is process-local)
+    remaining_turns = _turn_buffer.pop(session_id, [])
 
     _push_event({
         "type": "session_closed",
@@ -166,6 +168,7 @@ def emit_session_closed(
         "room_id": room_id,
         "message_count": message_count,
         "participant_names": participant_names,
+        "final_turns": remaining_turns,
     })
 
 

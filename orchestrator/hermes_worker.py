@@ -33,7 +33,7 @@ if _env_file.exists():
 
 from hermes_emitter import get_pending_events, get_queue_length
 from hermes_extractor import extract_memories, extraction_to_memories
-from hermes_store import write_memories_batch, upsert_session, upsert_profile
+from hermes_store import write_memories_batch, upsert_session, upsert_profile, get_profile
 from hermes_crm_bridge import memories_to_crm_actions, write_crm_actions
 
 logging.basicConfig(
@@ -111,7 +111,7 @@ def process_tool_executed(event: dict):
 
 
 def process_session_closed(event: dict):
-    """Handle session close — write final summary."""
+    """Handle session close — final summary extraction + mark session closed."""
     session_id = event.get("session_id", "")
     org_id = event.get("org_id", "")
     user_id = event.get("user_id", "")
@@ -119,6 +119,36 @@ def process_session_closed(event: dict):
     message_count = event.get("message_count", 0)
 
     logger.info("Session closed: %s (%d messages)", session_id, message_count)
+
+    # Final extraction using the close event's bundled turns (if any)
+    bundled_turns = event.get("final_turns", [])
+    if bundled_turns and RELAY_URL and AUTH_TOKEN:
+        logger.info("Final extraction for %d bundled turns", len(bundled_turns))
+        extracted = extract_memories(
+            turns=bundled_turns,
+            org_id=org_id,
+            session_id=session_id,
+            room_id=room_id,
+            base_url=RELAY_URL,
+            auth_token=AUTH_TOKEN,
+        )
+        if extracted:
+            memories = extraction_to_memories(
+                extracted=extracted,
+                org_id=org_id,
+                user_id=user_id,
+                session_id=session_id,
+                room_id=room_id,
+            )
+            if memories:
+                write_memories_batch(memories)
+            _update_user_profile(org_id, user_id, extracted)
+
+    # Mark stale action_items from this session/room scope
+    from hermes_store import mark_stale
+    scope_type = "room" if room_id else "session"
+    scope_id = room_id or session_id
+    mark_stale(org_id, "action_item", scope_type, scope_id, max_age_days=14)
 
     upsert_session(session_id, {
         "orgId": org_id,
@@ -169,16 +199,48 @@ def _update_user_profile(org_id: str, user_id: str, extracted: dict):
     if not preferences:
         return
 
-    pref_lines = [p["summary"] for p in preferences if p.get("confidence", 0) >= 0.5]
-    if not pref_lines:
+    confirmed_prefs = [p for p in preferences if p.get("confidence", 0) >= 0.5]
+    if not confirmed_prefs:
         return
 
     profile_key = f"user:{org_id}:{user_id}"
+    existing = get_profile(profile_key)
+    existing_prefs = existing.get("preferences", []) if existing else []
+
+    existing_titles = {p.get("title", "").strip().lower() for p in existing_prefs}
+
+    merged_prefs = list(existing_prefs)
+    for pref in confirmed_prefs:
+        title_lower = pref.get("title", "").strip().lower()
+        if title_lower in existing_titles:
+            for i, ep in enumerate(merged_prefs):
+                if ep.get("title", "").strip().lower() == title_lower:
+                    merged_prefs[i] = {
+                        **ep,
+                        "summary": pref["summary"],
+                        "confidence": max(ep.get("confidence", 0.5), pref.get("confidence", 0.5)),
+                        "observationCount": ep.get("observationCount", 1) + 1,
+                    }
+                    break
+        else:
+            merged_prefs.append({
+                "title": pref.get("title", ""),
+                "summary": pref["summary"],
+                "confidence": pref.get("confidence", 0.5),
+                "observationCount": 1,
+            })
+
+    pref_summary = "; ".join(
+        p["summary"] for p in merged_prefs
+        if p.get("observationCount", 1) >= 2 or p.get("confidence", 0) >= 0.7
+    )
+
     upsert_profile(profile_key, {
         "orgId": org_id,
         "userId": user_id,
         "scopeType": "user",
-        "preferencesSummary": "; ".join(pref_lines),
+        "preferences": merged_prefs,
+        "preferencesSummary": pref_summary or "",
     })
 
 
