@@ -8,7 +8,7 @@ status: active
 
 # Map of Content
 
-> Knowledge base for Claude Relay Service — 10 documents
+> Knowledge base for Claude Relay Service — 11 documents
 
 ## Architecture
 
@@ -27,10 +27,14 @@ status: active
 - [[api-key-binding|API Key Account Binding]] `account-groups` `api-key` `bedrock`
 - [[security-model|Security Model]] `api-key` `auth` `claude`
 
+## Memory & Intelligence
+
+- [[hermes-memory-system|Hermes Memory System]] `architecture` `memory` `crm` `orchestrator` `firestore` `redis`
+- [[hermes-improvements|Hermes Agent Improvement Plan]] `architecture` `scheduler` `review` `findings`
+
 ## Other
 
 - [[README|Claude Code 调用 Gemini 3 模型指南]] `api-key` `auth` `ccr`
-- [[hermes-improvements|Hermes Agent Improvement Plan]] `account-groups` `api-key` `auth`
 
 ## Tags
 

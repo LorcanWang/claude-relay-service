@@ -53,6 +53,8 @@ from stream import sse, sse_agent_status, sse_agent_switch, stream_error
 from mcp_config import collect_mcp_configs
 from mcp_manager import MCPManager
 from status_hub import status_hub
+from hermes_emitter import emit_turn_completed, emit_tool_executed, emit_session_closed
+from hermes_retrieval import build_memory_bundle
 
 logging.basicConfig(
     level=logging.INFO,
@@ -452,7 +454,14 @@ def compact_session(session: dict, base_url: str, auth_token: str, model: str) -
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    from hermes_emitter import get_queue_length, HERMES_ENABLED
+    return {
+        "status": "ok",
+        "hermes": {
+            "enabled": HERMES_ENABLED,
+            "queue_length": get_queue_length(),
+        },
+    }
 
 
 @app.get("/sessions/{session_id}")
@@ -470,6 +479,15 @@ def get_session_info(session_id: str, _=Depends(verify_token)):
 
 @app.delete("/sessions/{session_id}")
 def delete_session(session_id: str, _=Depends(verify_token)):
+    try:
+        old = get_session(session_id)
+        if old:
+            emit_session_closed(
+                org_id="", user_id="", session_id=session_id,
+                room_id=None, message_count=len(old.get("messages", [])),
+            )
+    except Exception:
+        pass
     clear_session(session_id)
     return {"ok": True}
 
@@ -485,6 +503,19 @@ def clear_session_endpoint(req: ClearSessionRequest, _=Depends(verify_token)):
     session_id = req.sessionId or f"{req.orgId}_{req.userId}"
     if not session_id or session_id == "_":
         raise HTTPException(status_code=400, detail="Provide sessionId or orgId+userId")
+    # Emit session close to Hermes before clearing
+    existing = get_session(session_id)
+    if existing:
+        try:
+            emit_session_closed(
+                org_id=req.orgId or "",
+                user_id=req.userId or "",
+                session_id=session_id,
+                room_id=None,
+                message_count=len(existing.get("messages", [])),
+            )
+        except Exception:
+            pass
     clear_session(session_id)
     return {"ok": True, "session_id": session_id}
 
@@ -541,6 +572,16 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
 
         # ── session ───────────────────────────────────────────────────────────
         if req.clearSession:
+            try:
+                old = get_session(session_id)
+                if old:
+                    emit_session_closed(
+                        org_id=req.orgId, user_id=req.userId,
+                        session_id=session_id, room_id=req.roomId,
+                        message_count=len(old.get("messages", [])),
+                    )
+            except Exception:
+                pass
             clear_session(session_id)
 
         session = get_session(session_id) or new_session(session_id)
@@ -601,10 +642,25 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
             " (compacted)" if compacted else "",
         )
 
+        # ── Hermes memory retrieval (off main thread) ────────────────────────
+        try:
+            memory_bundle = await asyncio.to_thread(
+                build_memory_bundle,
+                req.orgId,
+                req.userId,
+                req.roomId,
+            )
+            if memory_bundle:
+                full_system = f"{full_system}\n\n{memory_bundle}"
+                logger.info("Hermes memory injected (%d chars)", len(memory_bundle))
+        except Exception as exc:
+            logger.warning("Hermes retrieval failed, continuing without: %s", exc)
+
         # ── AI tool loop (all iterations stream live) ─────────────────────────
         try:
             collected_actions: list[dict] = []
             step_id = 0
+            _hermes_tool_names: list[str] = []
 
             api_kwargs = dict(
                 base_url=RELAY_BASE_URL or req.anthropicConfig.baseURL,
@@ -655,6 +711,28 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                     yield sse({"type": "finish-step"})
                     yield sse({"type": "finish", "finishReason": "stop"})
                     _publish_agent_status(session_id, "lynx", "completed", "Done")
+
+                    # ── Hermes: emit turn completed ─────────────────────────
+                    try:
+                        _assistant_text = extract_text(stream.content) if stream.content else ""
+                        _user_text = ""
+                        if user_messages:
+                            _last = user_messages[-1]
+                            _user_text = _last.content if hasattr(_last, "content") else str(_last)
+                        emit_turn_completed(
+                            org_id=req.orgId,
+                            user_id=req.userId,
+                            session_id=session_id,
+                            room_id=req.roomId,
+                            sender_name=req.senderDisplayName,
+                            user_text=str(_user_text)[:1000],
+                            assistant_text=_assistant_text[:2000],
+                            tool_names=_hermes_tool_names,
+                            message_index=len(session["messages"]),
+                        )
+                    except Exception as _hermes_exc:
+                        logger.debug("Hermes emit failed: %s", _hermes_exc)
+
                     yield sse("[DONE]")
                     break
 
@@ -723,6 +801,21 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                             note or "Done",
                         )
                         _publish_agent_switch(session_id, skill_id, "lynx", "Returned to Lynx")
+
+                    # ── Hermes: track tool execution ────────────────────
+                    _hermes_tool_names.append(tool_name)
+                    try:
+                        _tool_ok = result.get("ok", True) if isinstance(result, dict) else True
+                        emit_tool_executed(
+                            org_id=req.orgId,
+                            session_id=session_id,
+                            tool_name=tool_name,
+                            skill_name=inp.get("skill", tool_name),
+                            result_ok=bool(_tool_ok),
+                            result_summary=str(result)[:200] if result else "",
+                        )
+                    except Exception:
+                        pass
 
                     # Send only the data payload to Claude, not the executor envelope
                     tool_payload = result.get("data") if isinstance(result, dict) else result
