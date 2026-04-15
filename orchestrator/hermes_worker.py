@@ -35,6 +35,7 @@ from hermes_emitter import get_pending_events, get_queue_length
 from hermes_extractor import extract_memories, extraction_to_memories
 from hermes_store import write_memories_batch, upsert_session, upsert_profile, get_profile
 from hermes_crm_bridge import memories_to_crm_actions, write_crm_actions
+from hermes_campaign import normalize_snapshot, detect_anomalies, anomalies_to_memories
 
 logging.basicConfig(
     level=logging.INFO,
@@ -359,10 +360,58 @@ def _detect_customer_id(turns: list[dict]) -> str | None:
     return None
 
 
+def process_campaign_snapshot(event: dict):
+    """Ingest and analyze a campaign performance snapshot."""
+    org_id = event.get("org_id", "")
+    platform = event.get("platform", "")
+    raw_snapshot = event.get("snapshot", {})
+    customer_id = event.get("customer_id", "")
+
+    if not raw_snapshot or not org_id:
+        return
+
+    normalized = normalize_snapshot(raw_snapshot, platform)
+    if not normalized:
+        logger.warning("Could not normalize snapshot for %s", platform)
+        return
+
+    normalized["orgId"] = org_id
+    normalized["customerId"] = customer_id
+
+    try:
+        from hermes_store import _get_db
+        db = _get_db()
+        if db:
+            doc_id = f"{org_id}_{platform}_{normalized.get('campaignId', '')}_{normalized.get('date', '')}"
+            db.collection("hermesCampaignSnapshots").document(doc_id).set(normalized)
+            logger.info("Campaign snapshot saved: %s", doc_id)
+
+            # Check for anomalies against last snapshot as baseline
+            prev_docs = (
+                db.collection("hermesCampaignSnapshots")
+                .where("orgId", "==", org_id)
+                .where("platform", "==", platform)
+                .where("campaignId", "==", normalized.get("campaignId", ""))
+                .order_by("capturedAt", direction="DESCENDING")
+                .limit(2)
+                .stream()
+            )
+            prev_list = [d.to_dict() for d in prev_docs]
+            if len(prev_list) >= 2:
+                anomalies = detect_anomalies(prev_list[0], prev_list[1])
+                if anomalies:
+                    memories = anomalies_to_memories(anomalies, org_id, customer_id)
+                    write_memories_batch(memories)
+                    logger.info("Detected %d campaign anomalies", len(anomalies))
+    except Exception as exc:
+        logger.error("Campaign snapshot processing failed: %s", exc)
+
+
 EVENT_HANDLERS = {
     "turn_batch_ready": process_turn_batch,
     "tool_executed": process_tool_executed,
     "session_closed": process_session_closed,
+    "campaign_snapshot_ingested": process_campaign_snapshot,
 }
 
 

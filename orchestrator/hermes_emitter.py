@@ -172,6 +172,24 @@ def emit_session_closed(
     })
 
 
+def emit_campaign_snapshot(
+    org_id: str,
+    platform: str,
+    snapshot: dict,
+    customer_id: str = "",
+):
+    if not HERMES_ENABLED:
+        return
+
+    _push_event({
+        "type": "campaign_snapshot_ingested",
+        "org_id": org_id,
+        "platform": platform,
+        "snapshot": snapshot,
+        "customer_id": customer_id,
+    })
+
+
 def get_pending_events(max_count: int = 50) -> list[dict]:
     """Pop events from the queue. Used by hermes_worker."""
     r = get_redis()
