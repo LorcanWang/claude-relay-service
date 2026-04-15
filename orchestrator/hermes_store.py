@@ -20,6 +20,14 @@ _db = None
 _init_attempted = False
 
 
+_CREDENTIALS_SEARCH_PATHS = [
+    Path(__file__).parent / "firestore-credentials.json",
+    Path(__file__).parent.parent / "firestore-credentials.json",
+    Path(os.environ.get("SKILL_ROOT", "")) / "amazon-insights" / "firestore-credentials.json",
+    Path(os.environ.get("SKILL_ROOT", "")) / "grantllama" / "firestore-credentials.json",
+]
+
+
 def _get_db():
     global _db, _init_attempted
     if _init_attempted:
@@ -30,13 +38,20 @@ def _get_db():
         import firebase_admin
         from firebase_admin import credentials, firestore
 
-        cred_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
         if not firebase_admin._apps:
-            if cred_path:
+            cred_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
+            if cred_path and Path(cred_path).exists():
                 cred = credentials.Certificate(cred_path)
                 firebase_admin.initialize_app(cred)
             else:
-                firebase_admin.initialize_app()
+                for p in _CREDENTIALS_SEARCH_PATHS:
+                    if p.exists():
+                        cred = credentials.Certificate(str(p))
+                        firebase_admin.initialize_app(cred)
+                        logger.info("Firestore credentials found: %s", p)
+                        break
+                else:
+                    firebase_admin.initialize_app()
         _db = firestore.client()
         logger.info("Hermes Firestore connected")
     except Exception as exc:
