@@ -125,9 +125,9 @@ def build_memory_bundle(
         org_id,
         scope_type=scope_type,
         scope_id=scope_id,
-        memory_types=["insight", "strategy_memory", "campaign_insight"],
-        limit=3,
-        min_importance=40,
+        memory_types=["insight", "strategy_memory", "campaign_insight", "workflow_pattern"],
+        limit=5,
+        min_importance=30,
     )
     if insights:
         lines = ["### Relevant Patterns"]

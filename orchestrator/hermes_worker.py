@@ -105,9 +105,34 @@ def process_turn_batch(event: dict):
             logger.info("Created %d CRM actions for customer %s", written, customer_id)
 
 
+_skill_usage_buffer: dict[str, list[dict]] = {}
+
+
 def process_tool_executed(event: dict):
-    """Track tool execution patterns for skill learning."""
-    logger.debug("Tool executed: %s/%s", event.get("skill_name"), event.get("tool_name"))
+    """Track tool execution for skill co-usage and workflow patterns."""
+    session_id = event.get("session_id", "")
+    org_id = event.get("org_id", "")
+    skill_name = event.get("skill_name", "")
+    tool_name = event.get("tool_name", "")
+    result_ok = event.get("result_ok", True)
+
+    if not skill_name or not session_id:
+        return
+
+    if session_id not in _skill_usage_buffer:
+        _skill_usage_buffer[session_id] = []
+
+    _skill_usage_buffer[session_id].append({
+        "skill": skill_name,
+        "tool": tool_name,
+        "ok": result_ok,
+        "org_id": org_id,
+        "ts": event.get("emitted_at", ""),
+    })
+
+    logger.debug("Skill tracked: %s/%s (session %s, total=%d)",
+                 skill_name, tool_name, session_id,
+                 len(_skill_usage_buffer[session_id]))
 
 
 def process_session_closed(event: dict):
@@ -144,8 +169,11 @@ def process_session_closed(event: dict):
                 write_memories_batch(memories)
             _update_user_profile(org_id, user_id, extracted)
 
+    # Analyze skill usage patterns from this session
+    _analyze_skill_patterns(session_id, org_id, user_id, room_id)
+
     # Mark stale action_items from this session/room scope
-    from hermes_store import mark_stale
+    from hermes_store import mark_stale, write_memory
     scope_type = "room" if room_id else "session"
     scope_id = room_id or session_id
     mark_stale(org_id, "action_item", scope_type, scope_id, max_age_days=14)
@@ -241,6 +269,84 @@ def _update_user_profile(org_id: str, user_id: str, extracted: dict):
         "scopeType": "user",
         "preferences": merged_prefs,
         "preferencesSummary": pref_summary or "",
+    })
+
+
+def _analyze_skill_patterns(
+    session_id: str,
+    org_id: str,
+    user_id: str,
+    room_id: str | None,
+):
+    """Analyze skill co-usage and workflow sequences from a completed session."""
+    usage = _skill_usage_buffer.pop(session_id, [])
+    if len(usage) < 2:
+        return
+
+    from hermes_store import write_memory
+
+    skills_used = []
+    skill_counts: dict[str, int] = {}
+    skill_success: dict[str, list[bool]] = {}
+
+    for entry in usage:
+        skill = entry["skill"]
+        skills_used.append(skill)
+        skill_counts[skill] = skill_counts.get(skill, 0) + 1
+        if skill not in skill_success:
+            skill_success[skill] = []
+        skill_success[skill].append(entry.get("ok", True))
+
+    unique_skills = list(dict.fromkeys(skills_used))
+
+    if len(unique_skills) >= 2:
+        workflow_seq = " → ".join(unique_skills)
+        write_memory({
+            "orgId": org_id,
+            "scopeType": "user",
+            "scopeId": user_id,
+            "memoryType": "workflow_pattern",
+            "title": f"Workflow: {' + '.join(unique_skills[:4])}",
+            "summary": f"Used skills in sequence: {workflow_seq}",
+            "importance": min(20 + len(unique_skills) * 10, 60),
+            "confidence": 0.5,
+            "relevanceTags": ["workflow"] + unique_skills,
+            "skillIds": unique_skills,
+            "source": {"kind": "skill_tracking", "sessionId": session_id},
+        })
+        logger.info("Workflow pattern saved: %s", workflow_seq)
+
+    for skill, count in skill_counts.items():
+        if count >= 3:
+            success_rate = sum(1 for ok in skill_success[skill] if ok) / len(skill_success[skill])
+            write_memory({
+                "orgId": org_id,
+                "scopeType": "user",
+                "scopeId": user_id,
+                "memoryType": "skill_pattern",
+                "title": f"Heavy use: {skill}",
+                "summary": f"{skill} called {count} times (success rate: {success_rate:.0%})",
+                "importance": 30,
+                "confidence": 0.6,
+                "relevanceTags": ["skill_usage", skill],
+                "skillIds": [skill],
+                "source": {"kind": "skill_tracking", "sessionId": session_id},
+            })
+
+    profile_key = f"user:{org_id}:{user_id}"
+    existing = get_profile(profile_key)
+    existing_skills = existing.get("frequentSkills", []) if existing else []
+
+    skill_set = set(existing_skills)
+    for skill in unique_skills:
+        skill_set.add(skill)
+
+    upsert_profile(profile_key, {
+        "orgId": org_id,
+        "userId": user_id,
+        "scopeType": "user",
+        "frequentSkills": sorted(skill_set),
+        "lastWorkflow": " → ".join(unique_skills),
     })
 
 
