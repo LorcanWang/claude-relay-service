@@ -43,6 +43,16 @@ Browser (Next.js frontend)
 
 Also running:
 ┌─────────────────────────────────────┐
+│  Hermes Worker                      │
+│  orchestrator/hermes_worker.py      │
+│  • Polls Redis event queue          │
+│  • Extracts memories via Haiku      │
+│  • Writes to Firestore              │
+│  • Detects campaign anomalies       │
+│  • Bridges to CRM                   │
+└─────────────────────────────────────┘
+
+┌─────────────────────────────────────┐
 │  Skill Runner  :8081                │
 │  runner/main.py                     │
 │  • Simple HTTP wrapper around       │
@@ -56,6 +66,18 @@ Also running:
 │  • Relay: accounts, API keys,       │
 │    concurrency, session binding     │
 │  • Orchestrator: chat sessions      │
+│  • Hermes: event queue, cache       │
+└─────────────────────────────────────┘
+
+┌─────────────────────────────────────┐
+│  Firestore (zeon-solutions)         │
+│  • hermesMemories — decisions,      │
+│    preferences, insights            │
+│  • hermesProfiles — user/customer   │
+│    summaries for prompt injection   │
+│  • hermesSessions — session rollups │
+│  • hermesCampaignSnapshots          │
+│  • crmActions — AI-generated CRM    │
 └─────────────────────────────────────┘
 ```
 
