@@ -464,6 +464,50 @@ def health():
     }
 
 
+@app.get("/lookups/{source}")
+def lookups(source: str, _=Depends(verify_token)):
+    """Return option lists for Hive space config dropdowns (VPS-local skill data)."""
+    skill_root = os.environ.get("SKILL_ROOT", "/home/hqzn/grantllama-scrape-skill/.claude/skills")
+
+    if source == "google_ads_accounts":
+        try:
+            creds_path = Path(skill_root) / "google-ad-campaign" / "credentials.json"
+            if not creds_path.exists():
+                return {"options": []}
+            creds = json.loads(creds_path.read_text())
+            managed = creds.get("managed_accounts", {})
+            options = []
+            for cid, info in managed.items():
+                if isinstance(info, dict):
+                    name = info.get("name", cid)
+                    display = info.get("display_id", cid)
+                    options.append({"label": f"{name} ({display})", "value": cid})
+                else:
+                    options.append({"label": str(info), "value": cid})
+            return {"options": options}
+        except Exception as exc:
+            logger.warning("lookups google_ads_accounts failed: %s", exc)
+            return {"options": [], "error": str(exc)}
+
+    if source == "ga4_accounts":
+        try:
+            config_path = Path(skill_root) / "ga4" / "config.json"
+            if not config_path.exists():
+                return {"options": []}
+            config = json.loads(config_path.read_text())
+            accounts = config.get("accounts", {})
+            options = []
+            for key, info in accounts.items():
+                name = info.get("name", key) if isinstance(info, dict) else key
+                options.append({"label": name, "value": key})
+            return {"options": options}
+        except Exception as exc:
+            logger.warning("lookups ga4_accounts failed: %s", exc)
+            return {"options": [], "error": str(exc)}
+
+    return {"options": [], "error": f"Unknown source: {source}"}
+
+
 @app.get("/sessions/{session_id}")
 def get_session_info(session_id: str, _=Depends(verify_token)):
     data = get_session(session_id)
