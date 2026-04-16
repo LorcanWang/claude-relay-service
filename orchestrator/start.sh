@@ -10,6 +10,13 @@ WORKER_PID_FILE="$DIR/hermes_worker.pid"
 LOG_DIR="$DIR/../logs"
 mkdir -p "$LOG_DIR"
 
+# Prefer orchestrator venv python; fall back to system python3
+if [ -x "$DIR/venv/bin/python3" ]; then
+    PYTHON="$DIR/venv/bin/python3"
+else
+    PYTHON="python3"
+fi
+
 stop_process() {
     local pid_file="$1"
     local name="$2"
@@ -31,7 +38,7 @@ start_orchestrator() {
     stop_process "$ORCHESTRATOR_PID_FILE" "orchestrator"
 
     echo "Starting orchestrator..."
-    nohup python3 main.py > "$LOG_DIR/orchestrator.log" 2>&1 &
+    nohup "$PYTHON" main.py > "$LOG_DIR/orchestrator.log" 2>&1 &
     local pid=$!
     echo "$pid" > "$ORCHESTRATOR_PID_FILE"
     echo "  Orchestrator started (PID $pid)"
@@ -42,7 +49,7 @@ start_worker() {
     stop_process "$WORKER_PID_FILE" "hermes_worker"
 
     echo "Starting Hermes worker..."
-    nohup python3 hermes_worker.py > "$LOG_DIR/hermes_worker.log" 2>&1 &
+    nohup "$PYTHON" hermes_worker.py > "$LOG_DIR/hermes_worker.log" 2>&1 &
     local pid=$!
     echo "$pid" > "$WORKER_PID_FILE"
     echo "  Hermes worker started (PID $pid)"
