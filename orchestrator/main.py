@@ -599,11 +599,36 @@ async def status_stream(
 @app.post("/chat")
 async def chat(req: ChatRequest, _=Depends(verify_token)):
     async def event_stream():
+        import secrets
         # Session key: room mode uses room:{roomId}, personal mode uses orgId_userId
         if req.roomId:
             session_id = f"room:{req.roomId}"
         else:
             session_id = req.sessionId or f"{req.orgId}_{req.userId}"
+
+        # ── Redis lock for rooms — prevents concurrent turns corrupting session ─
+        lock_token = secrets.token_hex(16)
+        lock_key = f"hermes:lock:room:{req.roomId}" if req.roomId else None
+        lock_acquired = False
+        if lock_key:
+            try:
+                from hermes_redis import get_redis
+                r = get_redis()
+                if r:
+                    acquired = r.set(lock_key, lock_token, nx=True, ex=180)
+                    if not acquired:
+                        holder = r.get(lock_key)
+                        holder_str = holder.decode() if isinstance(holder, bytes) else str(holder or "")
+                        yield sse({
+                            "type": "error",
+                            "error": "Room is busy — another user is asking a question. Please wait.",
+                            "code": "ROOM_BUSY",
+                            "holder": holder_str[:8],
+                        })
+                        return
+                    lock_acquired = True
+            except Exception as exc:
+                logger.warning("Redis lock failed, continuing without lock: %s", exc)
 
         # Scope agent roster to room's agents if specified
         effective_skills = req.enabledSkills
@@ -909,6 +934,18 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
         finally:
             if mcp_mgr:
                 await mcp_mgr.shutdown()
+            # Release Redis lock only if we still own it (compare-and-delete)
+            if lock_acquired and lock_key:
+                try:
+                    from hermes_redis import get_redis
+                    r = get_redis()
+                    if r:
+                        current = r.get(lock_key)
+                        current_str = current.decode() if isinstance(current, bytes) else str(current or "")
+                        if current_str == lock_token:
+                            r.delete(lock_key)
+                except Exception:
+                    pass
 
     return StreamingResponse(
         event_stream(),
