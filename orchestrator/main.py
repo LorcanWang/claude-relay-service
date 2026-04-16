@@ -505,6 +505,22 @@ def lookups(source: str, _=Depends(verify_token)):
             logger.warning("lookups ga4_accounts failed: %s", exc)
             return {"options": [], "error": str(exc)}
 
+    if source == "bigcommerce_accounts":
+        try:
+            config_path = Path(skill_root) / "bigcommerce" / "config.json"
+            if not config_path.exists():
+                return {"options": []}
+            config = json.loads(config_path.read_text())
+            accounts = config.get("accounts", {})
+            options = []
+            for key, info in accounts.items():
+                name = info.get("name", key) if isinstance(info, dict) else key
+                options.append({"label": name, "value": key})
+            return {"options": options}
+        except Exception as exc:
+            logger.warning("lookups bigcommerce_accounts failed: %s", exc)
+            return {"options": [], "error": str(exc)}
+
     return {"options": [], "error": f"Unknown source: {source}"}
 
 
