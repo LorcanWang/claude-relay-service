@@ -521,6 +521,22 @@ def lookups(source: str, _=Depends(verify_token)):
             logger.warning("lookups bigcommerce_accounts failed: %s", exc)
             return {"options": [], "error": str(exc)}
 
+    if source == "meta_accounts":
+        try:
+            creds_path = Path(skill_root) / "meta-ad-campaign" / "credentials.json"
+            if not creds_path.exists():
+                return {"options": []}
+            creds = json.loads(creds_path.read_text())
+            accounts = creds.get("accounts", {})
+            options = []
+            for key, info in accounts.items():
+                name = info.get("name", key) if isinstance(info, dict) else key
+                options.append({"label": name, "value": key})
+            return {"options": options}
+        except Exception as exc:
+            logger.warning("lookups meta_accounts failed: %s", exc)
+            return {"options": [], "error": str(exc)}
+
     return {"options": [], "error": f"Unknown source: {source}"}
 
 
