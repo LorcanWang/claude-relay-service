@@ -863,8 +863,17 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                     except Exception:
                         pass
 
-                    # Send only the data payload to Claude, not the executor envelope
-                    tool_payload = result.get("data") if isinstance(result, dict) else result
+                    # Send successful data directly, but preserve failures so Claude does not
+                    # receive an opaque null result when a subprocess exits non-zero.
+                    if isinstance(result, dict) and result.get("ok") is False:
+                        tool_payload = {
+                            "ok": False,
+                            "error": result.get("error"),
+                            "stderr": result.get("stderr"),
+                            "stdout": result.get("stdout"),
+                        }
+                    else:
+                        tool_payload = result.get("data") if isinstance(result, dict) else result
                     tool_content = json.dumps(tool_payload, ensure_ascii=False, default=str) if not isinstance(tool_payload, str) else tool_payload
                     tool_results.append({
                         "type": "tool_result",

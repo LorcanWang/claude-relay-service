@@ -15,7 +15,7 @@ SKILL_ROOT = Path(
 )
 TIMEOUT = int(os.environ.get("SKILL_TIMEOUT", "60"))
 STDOUT_CAP = 1_000_000   # 1 MB
-STDERR_CAP = 100_000
+STDERR_CAP = 1_000_000
 
 
 def execute_command(
@@ -95,6 +95,13 @@ def execute_command(
     stderr = result.stderr[:STDERR_CAP]
 
     if result.returncode != 0:
+        logger.warning(
+            "Command failed (exit %s): %s\nSTDERR:\n%s\nSTDOUT:\n%s",
+            result.returncode,
+            command,
+            result.stderr.rstrip() or "(empty)",
+            result.stdout.rstrip() or "(empty)",
+        )
         return {
             "ok": False,
             "error": f"Exit {result.returncode}",
