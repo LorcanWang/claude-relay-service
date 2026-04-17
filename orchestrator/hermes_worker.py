@@ -33,7 +33,13 @@ if _env_file.exists():
 
 from hermes_emitter import get_pending_events, get_queue_length
 from hermes_extractor import extract_memories, extraction_to_memories
-from hermes_store import write_memories_batch, upsert_session, upsert_profile, get_profile
+from hermes_store import (
+    write_memories_batch,
+    upsert_session,
+    upsert_profile,
+    get_profile,
+    update_room_registry,
+)
 from hermes_crm_bridge import memories_to_crm_actions, write_crm_actions
 from hermes_campaign import normalize_snapshot, detect_anomalies, anomalies_to_memories
 
@@ -95,6 +101,39 @@ def process_turn_batch(event: dict):
     if memories:
         saved_ids = write_memories_batch(memories)
         logger.info("Saved %d memories", len(saved_ids))
+
+        # Update the room's entity registry from what we just observed.
+        # Note: write_memories_batch doesn't return the prepared memories,
+        # so we re-run the matcher here to get the refs + importance pairs.
+        # This is cheap (microseconds) and keeps the registry in sync even if
+        # the extractor pre-populated entityRefs.
+        if room_id and memories:
+            observed = []
+            try:
+                from hermes_entity_matcher import match_entities
+                for m in memories:
+                    refs = m.get("entityRefs")
+                    if not refs:
+                        text = f"{m.get('title', '')} {m.get('summary', '')}".strip()
+                        refs = match_entities(text, org_id=org_id, skill_configs=event.get("skill_configs"))
+                    importance = int(m.get("importance") or 50)
+                    for r in refs:
+                        observed.append({
+                            "kind": r.get("kind"),
+                            "id": r.get("id"),
+                            "label": r.get("label"),
+                            "importance": importance,
+                        })
+            except Exception as exc:
+                logger.debug("Observed-entity collection failed: %s", exc)
+            if observed:
+                reg = update_room_registry(org_id, room_id, observed)
+                if reg is not None:
+                    active = sum(1 for v in reg.values() if v.get("status") == "active")
+                    logger.info(
+                        "Room registry updated room=%s observed=%d active=%d total=%d",
+                        room_id, len(observed), active, len(reg),
+                    )
 
     _update_session_record(session_id, org_id, user_id, room_id, turns, extracted)
     _update_user_profile(org_id, user_id, extracted)
@@ -170,6 +209,27 @@ def process_session_closed(event: dict):
             )
             if memories:
                 write_memories_batch(memories)
+                if room_id:
+                    observed = []
+                    try:
+                        from hermes_entity_matcher import match_entities
+                        for m in memories:
+                            refs = m.get("entityRefs")
+                            if not refs:
+                                text = f"{m.get('title', '')} {m.get('summary', '')}".strip()
+                                refs = match_entities(text, org_id=org_id, skill_configs=event.get("skill_configs"))
+                            importance = int(m.get("importance") or 50)
+                            for r in refs:
+                                observed.append({
+                                    "kind": r.get("kind"),
+                                    "id": r.get("id"),
+                                    "label": r.get("label"),
+                                    "importance": importance,
+                                })
+                    except Exception as exc:
+                        logger.debug("Observed-entity collection (close) failed: %s", exc)
+                    if observed:
+                        update_room_registry(org_id, room_id, observed)
             _update_user_profile(org_id, user_id, extracted)
 
     # Analyze skill usage patterns from this session

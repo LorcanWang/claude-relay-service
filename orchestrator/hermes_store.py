@@ -346,6 +346,179 @@ def get_profile(profile_key: str) -> Optional[dict]:
         return None
 
 
+# ── Room entity registry (for cross-room memory bridging) ──────────────────
+
+ROOM_REGISTRY_CAP = int(os.environ.get("HERMES_ROOM_REGISTRY_CAP", "50"))
+ROOM_REGISTRY_PROMOTION_THRESHOLD = 2  # observationCount needed before entity goes "active"
+
+
+def update_room_registry(
+    org_id: str,
+    room_id: str,
+    observed: list[dict],
+) -> Optional[dict]:
+    """Merge newly-observed entityRefs into the room's entityRegistry.
+
+    `observed` items shape: [{kind, id, label, importance?}]. Importance
+    defaults to 50 if caller didn't set one per observation.
+
+    Transactional read-modify-write so concurrent workers don't lose
+    increments. Promotion rule: entities stay `pending` until observationCount
+    hits ROOM_REGISTRY_PROMOTION_THRESHOLD, then flip to `active`. LFU
+    eviction once active-count exceeds ROOM_REGISTRY_CAP; pinned entities
+    (admin-seeded) never evict.
+    """
+    db = _get_db()
+    if not db or not observed:
+        return None
+
+    from firebase_admin import firestore as _fs_module
+
+    profile_key = f"room:{org_id}:{room_id}"
+    ref = db.collection("hermesProfiles").document(profile_key)
+
+    now = _now_iso()
+    observed_by_key: dict[str, dict] = {}
+    for o in observed:
+        kind = o.get("kind")
+        oid = o.get("id")
+        if not kind or not oid:
+            continue
+        key = f"{kind}:{oid}"
+        importance = int(o.get("importance") or 50)
+        bucket = observed_by_key.setdefault(key, {
+            "kind": kind,
+            "id": oid,
+            "label": o.get("label") or str(oid),
+            "count_delta": 0,
+            "max_importance": 0,
+        })
+        bucket["count_delta"] += 1
+        bucket["max_importance"] = max(bucket["max_importance"], importance)
+
+    if not observed_by_key:
+        return None
+
+    transaction = db.transaction()
+
+    @_fs_module.transactional
+    def _apply(tx):
+        snap = ref.get(transaction=tx)
+        data = snap.to_dict() if snap.exists else {}
+        registry = dict(data.get("entityRegistry") or {})
+
+        for key, obs in observed_by_key.items():
+            existing = registry.get(key) or {}
+            new_count = int(existing.get("observationCount", 0)) + obs["count_delta"]
+            new_max_imp = max(int(existing.get("maxImportance", 0)), obs["max_importance"])
+            pinned = bool(existing.get("pinned", False))
+            status = "active" if (pinned or new_count >= ROOM_REGISTRY_PROMOTION_THRESHOLD) else "pending"
+            registry[key] = {
+                "kind": obs["kind"],
+                "id": obs["id"],
+                "label": obs["label"],
+                "observationCount": new_count,
+                "maxImportance": new_max_imp,
+                "firstObservedAt": existing.get("firstObservedAt", now),
+                "lastObservedAt": now,
+                "pinned": pinned,
+                "status": status,
+            }
+
+        # LFU eviction: only over `active` non-pinned entries
+        active_entries = [(k, v) for k, v in registry.items() if v.get("status") == "active" and not v.get("pinned")]
+        if len(active_entries) > ROOM_REGISTRY_CAP:
+            # Ascending by (observationCount * maxImportance), then by lastObservedAt ASC (oldest first)
+            active_entries.sort(key=lambda kv: (
+                int(kv[1].get("observationCount", 0)) * int(kv[1].get("maxImportance", 0)),
+                kv[1].get("lastObservedAt", ""),
+            ))
+            overflow = len(active_entries) - ROOM_REGISTRY_CAP
+            for k, _ in active_entries[:overflow]:
+                registry.pop(k, None)
+
+        payload = {
+            "orgId": org_id,
+            "scopeType": "room",
+            "scopeId": room_id,
+            "entityRegistry": registry,
+            "entityRegistryUpdatedAt": now,
+            "lastUpdated": now,
+        }
+        tx.set(ref, payload, merge=True)
+        return registry
+
+    try:
+        registry = _apply(transaction)
+        _invalidate_retrieval_cache(org_id, room_id)
+        return registry
+    except Exception as exc:
+        logger.error("Failed to update room registry %s: %s", profile_key, exc)
+        return None
+
+
+def pin_room_entities(org_id: str, room_id: str, hints: list[dict]) -> Optional[dict]:
+    """Admin seed: mark entities as pinned + active in a room's registry.
+
+    `hints` shape: [{kind, id, label?}]. Idempotent — re-seeding flips pinned=True
+    and status=active regardless of observation count.
+    """
+    db = _get_db()
+    if not db or not hints:
+        return None
+
+    from firebase_admin import firestore as _fs_module
+
+    profile_key = f"room:{org_id}:{room_id}"
+    ref = db.collection("hermesProfiles").document(profile_key)
+    now = _now_iso()
+
+    transaction = db.transaction()
+
+    @_fs_module.transactional
+    def _apply(tx):
+        snap = ref.get(transaction=tx)
+        data = snap.to_dict() if snap.exists else {}
+        registry = dict(data.get("entityRegistry") or {})
+
+        for h in hints:
+            kind = h.get("kind")
+            hid = h.get("id")
+            if not kind or not hid:
+                continue
+            key = f"{kind}:{hid}"
+            existing = registry.get(key) or {}
+            registry[key] = {
+                "kind": kind,
+                "id": hid,
+                "label": h.get("label") or existing.get("label") or str(hid),
+                "observationCount": int(existing.get("observationCount", 0)),
+                "maxImportance": int(existing.get("maxImportance", 50)),
+                "firstObservedAt": existing.get("firstObservedAt", now),
+                "lastObservedAt": now,
+                "pinned": True,
+                "status": "active",
+            }
+
+        tx.set(ref, {
+            "orgId": org_id,
+            "scopeType": "room",
+            "scopeId": room_id,
+            "entityRegistry": registry,
+            "entityRegistryUpdatedAt": now,
+            "lastUpdated": now,
+        }, merge=True)
+        return registry
+
+    try:
+        registry = _apply(transaction)
+        _invalidate_retrieval_cache(org_id, room_id)
+        return registry
+    except Exception as exc:
+        logger.error("Failed to pin room entities %s: %s", profile_key, exc)
+        return None
+
+
 def get_recent_memories(
     org_id: str,
     scope_type: Optional[str] = None,
