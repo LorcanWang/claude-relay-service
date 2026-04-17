@@ -16,7 +16,12 @@ logger = logging.getLogger("hermes.retrieval")
 from hermes_redis import get_redis
 
 HERMES_RETRIEVAL_ENABLED = os.environ.get("HERMES_RETRIEVAL_ENABLED", "true").lower() == "true"
+HERMES_CROSS_ROOM_ENABLED = os.environ.get("HERMES_CROSS_ROOM_ENABLED", "false").lower() == "true"
 MAX_BUNDLE_TOKENS = int(os.environ.get("HERMES_MAX_BUNDLE_TOKENS", "800"))
+# Token quota reserved for the Cross-Room Signals section (fraction of MAX_BUNDLE_TOKENS).
+CROSS_ROOM_QUOTA = float(os.environ.get("HERMES_CROSS_ROOM_QUOTA", "0.20"))
+CROSS_ROOM_LIMIT = int(os.environ.get("HERMES_CROSS_ROOM_LIMIT", "3"))
+CROSS_ROOM_MIN_IMPORTANCE = int(os.environ.get("HERMES_CROSS_ROOM_MIN_IMPORTANCE", "50"))
 CACHE_TTL = int(os.environ.get("HERMES_CACHE_TTL", "300"))
 
 
@@ -135,16 +140,71 @@ def build_memory_bundle(
             lines.append(f"- {m.get('summary', m.get('title', ''))}")
         sections.append("\n".join(lines))
 
-    if not sections:
+    # ── Cross-Room Signals ────────────────────────────────────────────────
+    cross_section = None
+    if HERMES_CROSS_ROOM_ENABLED and room_id:
+        try:
+            from hermes_store import get_cross_entity_memories
+            room_profile = get_profile(f"room:{org_id}:{room_id}") or {}
+            registry = room_profile.get("entityRegistry") or {}
+            # Dedupe: exclude facts already surfaced in this room's own bundle.
+            own_memories = get_recent_memories(
+                org_id,
+                scope_type="room",
+                scope_id=room_id,
+                limit=30,
+                min_importance=0,
+            )
+            own_dedupe = {m.get("dedupeKey") for m in own_memories if m.get("dedupeKey")}
+
+            cross = get_cross_entity_memories(
+                target_org_id=org_id,
+                target_room_id=room_id,
+                target_registry=registry,
+                memory_types=["decision", "action_item", "insight", "campaign_insight", "campaign_anomaly"],
+                limit=CROSS_ROOM_LIMIT,
+                min_importance=CROSS_ROOM_MIN_IMPORTANCE,
+                exclude_dedupe_keys=own_dedupe,
+            )
+            if cross:
+                lines = ["### Cross-Room Signals"]
+                for m in cross:
+                    src_room = m.get("scopeId", "another room")
+                    overlap = ",".join(m.get("_overlapKeys", []))
+                    summary = m.get("summary") or m.get("title") or ""
+                    lines.append(f"- [room:{src_room} via {overlap}] {summary}")
+                cross_section = "\n".join(lines)
+                logger.info(
+                    "hermes.cross_room fired target=%s candidates=%d final=%d",
+                    room_id, len(cross), min(len(cross), CROSS_ROOM_LIMIT),
+                )
+        except Exception as exc:
+            logger.debug("Cross-room retrieval failed: %s", exc)
+
+    if not sections and not cross_section:
         return None
 
-    inner = "\n\n".join(sections)
+    # Per-section token budgets. Cross-room gets a reserved quota; everything
+    # else fills the rest. Drop whole bullets (newlines) never mid-slice.
+    cross_budget = int(MAX_BUNDLE_TOKENS * CROSS_ROOM_QUOTA) if cross_section else 0
+    primary_budget = MAX_BUNDLE_TOKENS - cross_budget
 
-    estimated_tokens = len(inner) // 4
-    if estimated_tokens > MAX_BUNDLE_TOKENS:
-        ratio = MAX_BUNDLE_TOKENS / estimated_tokens
-        inner = inner[:int(len(inner) * ratio)]
-        inner = inner.rsplit("\n", 1)[0]
+    primary = "\n\n".join(sections) if sections else ""
+    primary_tokens = len(primary) // 4
+    if primary_tokens > primary_budget:
+        ratio = primary_budget / max(primary_tokens, 1)
+        primary = primary[:int(len(primary) * ratio)]
+        primary = primary.rsplit("\n", 1)[0] if "\n" in primary else primary
+
+    cross_final = cross_section or ""
+    cross_tokens = len(cross_final) // 4
+    if cross_tokens > cross_budget and cross_budget > 0:
+        ratio = cross_budget / max(cross_tokens, 1)
+        cross_final = cross_final[:int(len(cross_final) * ratio)]
+        cross_final = cross_final.rsplit("\n", 1)[0] if "\n" in cross_final else cross_final
+
+    inner_parts = [p for p in (primary, cross_final) if p]
+    inner = "\n\n".join(inner_parts)
 
     bundle = (
         "<memory-context>\n"

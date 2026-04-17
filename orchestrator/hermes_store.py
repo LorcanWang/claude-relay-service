@@ -353,6 +353,115 @@ def get_profile(profile_key: str) -> Optional[dict]:
         return None
 
 
+_OVERLAP_WEIGHT = {
+    "sku": 3,
+    "product_line": 2,
+    "campaign": 2,
+    "customer": 2,
+    "channel": 1,
+    "platform": 1,
+}
+FIRESTORE_ARRAY_ANY_CAP = 10
+
+
+def get_cross_entity_memories(
+    target_org_id: str,
+    target_room_id: str,
+    target_registry: dict,
+    memory_types: Optional[list[str]] = None,
+    limit: int = 3,
+    min_importance: int = 50,
+    exclude_dedupe_keys: Optional[set] = None,
+) -> list[dict]:
+    """Fetch sibling-room memories whose entityKeys overlap the target room's
+    registry AND whose source room contributes to target_org_id.
+
+    - target_registry: hermesProfiles[room:{org}:{room}].entityRegistry
+    - Only considers registry entries with status=='active'.
+    - Pure-channel or pure-platform overlap (weight 1 each) does not pass.
+      Overlap must reach score >= 2 (i.e. include at least one sku /
+      product_line / campaign / customer OR two channel/platform hits).
+    - Filters by channel intersection: if candidate has any channel:* AND
+      the target registry has any channel:*, the candidate's channels must
+      intersect with the target's channels.
+    """
+    db = _get_db()
+    if not db or not target_registry:
+        return []
+
+    active = {k: v for k, v in target_registry.items() if v.get("status") == "active"}
+    if not active:
+        return []
+
+    # Top-N entity keys by (observationCount * maxImportance).
+    sorted_keys = sorted(
+        active.items(),
+        key=lambda kv: int(kv[1].get("observationCount", 0)) * int(kv[1].get("maxImportance", 0)),
+        reverse=True,
+    )
+    top_keys = [k for k, _ in sorted_keys[:FIRESTORE_ARRAY_ANY_CAP]]
+    if not top_keys:
+        return []
+
+    target_channels = {k.split(":", 1)[1] for k in active if k.startswith("channel:")}
+
+    try:
+        query = (
+            db.collection("hermesMemories")
+            .where("status", "==", "active")
+            .where("scopeType", "==", "room")
+            .where("entityKeys", "array_contains_any", top_keys)
+            .order_by("temporal.lastSeenAt", direction="DESCENDING")
+            .limit(limit * 6)  # over-fetch; post-filter prunes
+        )
+        raw = list(query.stream())
+    except Exception as exc:
+        logger.debug("get_cross_entity_memories query failed: %s", exc)
+        return []
+
+    exclude_dedupe_keys = exclude_dedupe_keys or set()
+    candidates = []
+    for doc in raw:
+        data = doc.to_dict() or {}
+        # Scope gating: memory must contribute to the target org.
+        if target_org_id not in (data.get("crossRoomOrgIds") or []):
+            continue
+        # Exclude own room.
+        if data.get("scopeId") == target_room_id:
+            continue
+        # Dedupe against memories already surfaced in target's own bundle.
+        if data.get("dedupeKey") in exclude_dedupe_keys:
+            continue
+        # Type filter.
+        if memory_types and data.get("memoryType") not in memory_types:
+            continue
+        # Importance gate.
+        if int(data.get("importance", 0)) < min_importance:
+            continue
+        # Entity overlap scoring.
+        cand_keys = set(data.get("entityKeys") or [])
+        overlap = cand_keys & set(active.keys())
+        if not overlap:
+            continue
+        overlap_score = sum(_OVERLAP_WEIGHT.get(k.split(":", 1)[0], 0) for k in overlap)
+        if overlap_score < 2:
+            continue
+        # Channel negative filter.
+        cand_channels = {k.split(":", 1)[1] for k in cand_keys if k.startswith("channel:")}
+        if cand_channels and target_channels and not (cand_channels & target_channels):
+            continue
+
+        confidence = float(data.get("confidence", 0.5))
+        final_score = overlap_score * (int(data.get("importance", 0)) or 1) * max(confidence, 0.1)
+        data["_overlapScore"] = overlap_score
+        data["_overlapKeys"] = sorted(overlap)
+        data["_finalScore"] = final_score
+        candidates.append(data)
+
+    candidates.sort(key=lambda d: d["_finalScore"], reverse=True)
+    return candidates[:limit]
+
+
 def get_room_cross_room_orgs(room_id: str, default_org_id: str) -> list[str]:
     """Return a room's crossRoomOrgIds, falling back to [default_org_id]."""
     db = _get_db()
