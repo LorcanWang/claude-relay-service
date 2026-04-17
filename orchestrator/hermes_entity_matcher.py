@@ -45,12 +45,14 @@ _CACHE_TTL_SECONDS = 60
 
 
 def _fetch_taxonomy_doc(db, doc_id: str) -> Optional[dict]:
+    if not doc_id:
+        return None
     try:
         doc = db.collection("hermesEntityTaxonomy").document(doc_id).get()
         if doc.exists:
             return doc.to_dict() or {}
     except Exception as exc:
-        logger.warning("Failed to read taxonomy %s: %s", doc_id, exc)
+        logger.warning("Failed to read taxonomy %r: %s", doc_id, exc)
     return None
 
 
@@ -76,6 +78,9 @@ def load_taxonomy(org_id: str) -> dict:
 
     if db is not None:
         for doc_id in ("_global", org_id):
+            if not doc_id:
+                # Skip empty org_id so we never hit "hermesEntityTaxonomy/" (trailing slash).
+                continue
             doc = _fetch_taxonomy_doc(db, doc_id)
             if not doc:
                 continue
