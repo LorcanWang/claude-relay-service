@@ -17,7 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from hermes_store import _get_db  # noqa: E402
+from hermes_store import _get_db, get_room_cross_room_orgs  # noqa: E402
 from hermes_entity_matcher import match_entities, entity_keys  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -42,6 +42,7 @@ def backfill(org_id: str | None, dry_run: bool, batch_size: int = 200):
 
     batch = db.batch()
     batch_writes = 0
+    room_cross_orgs_cache: dict[str, list[str]] = {}
 
     for doc in query.stream():
         data = doc.to_dict() or {}
@@ -58,8 +59,23 @@ def backfill(org_id: str | None, dry_run: bool, batch_size: int = 200):
         )
         new_keys = entity_keys(refs)
 
+        # Resolve crossRoomOrgIds for room-scoped memories (cached per room).
+        memory_org = data.get("orgId", "")
+        new_cross_orgs = data.get("crossRoomOrgIds") or []
+        if data.get("scopeType") == "room":
+            room_scope_id = data.get("scopeId", "")
+            cache_key = f"{memory_org}:{room_scope_id}"
+            if cache_key not in room_cross_orgs_cache:
+                room_cross_orgs_cache[cache_key] = get_room_cross_room_orgs(room_scope_id, memory_org)
+            new_cross_orgs = room_cross_orgs_cache[cache_key]
+        elif not new_cross_orgs and memory_org:
+            new_cross_orgs = [memory_org]
+
         existing_keys = data.get("entityKeys") or []
-        if sorted(new_keys) == sorted(existing_keys):
+        existing_cross = data.get("crossRoomOrgIds") or []
+        keys_match = sorted(new_keys) == sorted(existing_keys)
+        cross_match = sorted(existing_cross) == sorted(new_cross_orgs)
+        if keys_match and cross_match:
             unchanged += 1
             continue
 
@@ -67,7 +83,7 @@ def backfill(org_id: str | None, dry_run: bool, batch_size: int = 200):
         mt = data.get("memoryType", "unknown")
         by_type_changed[mt] = by_type_changed.get(mt, 0) + 1
         if len(sample_keys) < 5 and new_keys:
-            sample_keys.append(f"{doc.id} ({mt}): {new_keys}")
+            sample_keys.append(f"{doc.id} ({mt}): {new_keys} cross={new_cross_orgs}")
 
         if dry_run:
             continue
@@ -75,6 +91,7 @@ def backfill(org_id: str | None, dry_run: bool, batch_size: int = 200):
         batch.update(doc.reference, {
             "entityRefs": refs,
             "entityKeys": new_keys,
+            "crossRoomOrgIds": new_cross_orgs,
         })
         batch_writes += 1
         if batch_writes >= batch_size:

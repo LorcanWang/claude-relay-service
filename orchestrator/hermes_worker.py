@@ -39,6 +39,7 @@ from hermes_store import (
     upsert_profile,
     get_profile,
     update_room_registry,
+    get_room_cross_room_orgs,
 )
 from hermes_crm_bridge import memories_to_crm_actions, write_crm_actions
 from hermes_campaign import normalize_snapshot, detect_anomalies, anomalies_to_memories
@@ -99,6 +100,14 @@ def process_turn_batch(event: dict):
     )
 
     if memories:
+        # Resolve the room's crossRoomOrgIds once per batch, stamp on every memory.
+        # Room memories use the room's setting; non-room (session/user) memories
+        # default to [org_id] — they don't bridge anyway.
+        if room_id:
+            cross_orgs = get_room_cross_room_orgs(room_id, org_id)
+            for m in memories:
+                if m.get("scopeType") == "room":
+                    m["crossRoomOrgIds"] = cross_orgs
         saved_ids = write_memories_batch(memories)
         logger.info("Saved %d memories", len(saved_ids))
 
@@ -208,6 +217,11 @@ def process_session_closed(event: dict):
                 skill_configs=event.get("skill_configs"),
             )
             if memories:
+                if room_id:
+                    cross_orgs = get_room_cross_room_orgs(room_id, org_id)
+                    for m in memories:
+                        if m.get("scopeType") == "room":
+                            m["crossRoomOrgIds"] = cross_orgs
                 write_memories_batch(memories)
                 if room_id:
                     observed = []

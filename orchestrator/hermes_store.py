@@ -134,6 +134,13 @@ def _prepare_memory(memory: dict, now: str) -> dict:
     memory.setdefault("entityRefs", [])
     memory.setdefault("entityKeys", [])
 
+    # Denormalize crossRoomOrgIds from the source room onto the memory so that
+    # cross-room retrieval can filter by contributing-org without a join.
+    # Default to creator's org only when caller doesn't resolve it.
+    if not memory.get("crossRoomOrgIds"):
+        org = memory.get("orgId")
+        memory["crossRoomOrgIds"] = [org] if org else []
+
     # Strip the internal-only hint field so it doesn't get persisted.
     memory.pop("_skillConfigs", None)
     return memory
@@ -344,6 +351,23 @@ def get_profile(profile_key: str) -> Optional[dict]:
     except Exception as exc:
         logger.error("Failed to get profile: %s", exc)
         return None
+
+
+def get_room_cross_room_orgs(room_id: str, default_org_id: str) -> list[str]:
+    """Return a room's crossRoomOrgIds, falling back to [default_org_id]."""
+    db = _get_db()
+    if not db or not room_id:
+        return [default_org_id] if default_org_id else []
+    try:
+        doc = db.collection("chatRooms").document(room_id).get()
+        if doc.exists:
+            data = doc.to_dict() or {}
+            ids = data.get("crossRoomOrgIds")
+            if isinstance(ids, list) and ids:
+                return list(ids)
+    except Exception as exc:
+        logger.debug("Failed to read room %s crossRoomOrgIds: %s", room_id, exc)
+    return [default_org_id] if default_org_id else []
 
 
 # ── Room entity registry (for cross-room memory bridging) ──────────────────
