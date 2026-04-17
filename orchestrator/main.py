@@ -881,6 +881,7 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                             tool_names=_hermes_tool_names,
                             message_index=len(session["messages"]),
                             customer_id=_crm_customer_id,
+                            skill_configs=req.skillConfigs or {},
                         )
                     except Exception as _hermes_exc:
                         logger.debug("Hermes emit failed: %s", _hermes_exc)

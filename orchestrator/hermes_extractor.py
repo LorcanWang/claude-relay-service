@@ -148,6 +148,7 @@ def extraction_to_memories(
     user_id: str,
     session_id: str,
     room_id: Optional[str],
+    skill_configs: Optional[dict] = None,
 ) -> list[dict]:
     """Convert extraction output into hermesMemories documents."""
     memories = []
@@ -237,5 +238,11 @@ def extraction_to_memories(
                 for p in participants
             ],
         })
+
+    # Attach skill_configs as a hint so the store-layer entity matcher can
+    # resolve customer/campaign IDs. Stripped before persisting.
+    if skill_configs:
+        for m in memories:
+            m.setdefault("_skillConfigs", skill_configs)
 
     return memories

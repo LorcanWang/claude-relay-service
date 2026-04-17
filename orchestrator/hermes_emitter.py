@@ -54,6 +54,7 @@ def emit_turn_completed(
     tool_names: list[str],
     message_index: int,
     customer_id: Optional[str] = None,
+    skill_configs: Optional[dict] = None,
 ):
     if not HERMES_ENABLED:
         return
@@ -83,6 +84,7 @@ def emit_turn_completed(
         },
         "importance": combined_importance,
         "customer_id": customer_id,
+        "skill_configs": skill_configs or {},
     }
 
     buffer_key = session_id
@@ -109,6 +111,10 @@ def _flush_buffer(buffer_key: str):
         return
 
     customer_ids = [t.get("customer_id") for t in turns if t.get("customer_id")]
+    # Use the most recent turn's skill_configs — they may have evolved over the batch
+    merged_skill_configs = {}
+    for t in turns:
+        merged_skill_configs.update(t.get("skill_configs") or {})
     batch_event = {
         "type": "turn_batch_ready",
         "session_id": turns[0]["session_id"],
@@ -118,6 +124,7 @@ def _flush_buffer(buffer_key: str):
         "customer_id": customer_ids[0] if customer_ids else None,
         "turns": turns,
         "turn_count": len(turns),
+        "skill_configs": merged_skill_configs,
     }
 
     _push_event(batch_event)

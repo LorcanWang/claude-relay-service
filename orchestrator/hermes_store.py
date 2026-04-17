@@ -110,6 +110,32 @@ def _prepare_memory(memory: dict, now: str) -> dict:
     memory.setdefault("observationCount", 1)
     memory.setdefault("retrieval", {"retrievalCount": 0, "pinned": False})
     memory["dedupeKey"] = _make_dedupe_key(memory)
+
+    # Entity tagging for cross-room bridging. If caller didn't pre-populate
+    # entityRefs (e.g. from the extractor pass), run the deterministic matcher
+    # over title+summary here so every memory lands with the field indexed.
+    # Safe to run cheaply — matcher is microseconds on short text.
+    if not memory.get("entityRefs"):
+        try:
+            from hermes_entity_matcher import match_entities, entity_keys
+            text = f"{memory.get('title', '')} {memory.get('summary', '')}".strip()
+            refs = match_entities(
+                text,
+                org_id=memory.get("orgId", ""),
+                skill_configs=memory.get("_skillConfigs"),
+            )
+            if refs:
+                memory["entityRefs"] = refs
+                memory["entityKeys"] = entity_keys(refs)
+        except Exception as exc:
+            logger.debug("Entity matching skipped for memory %s: %s", memory["id"], exc)
+
+    # Ensure entityKeys is always present (empty list) so Firestore indexes stay consistent.
+    memory.setdefault("entityRefs", [])
+    memory.setdefault("entityKeys", [])
+
+    # Strip the internal-only hint field so it doesn't get persisted.
+    memory.pop("_skillConfigs", None)
     return memory
 
 

@@ -89,6 +89,7 @@ def process_turn_batch(event: dict):
         user_id=user_id,
         session_id=session_id,
         room_id=room_id,
+        skill_configs=event.get("skill_configs"),
     )
 
     if memories:
@@ -165,6 +166,7 @@ def process_session_closed(event: dict):
                 user_id=user_id,
                 session_id=session_id,
                 room_id=room_id,
+                skill_configs=event.get("skill_configs"),
             )
             if memories:
                 write_memories_batch(memories)
