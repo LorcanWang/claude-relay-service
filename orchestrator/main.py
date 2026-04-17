@@ -68,7 +68,11 @@ DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "claude-sonnet-4-6")
 MAX_LOOP = int(os.environ.get("MAX_LOOP_ITERATIONS", "50"))
 # Compaction: when stored messages exceed this, summarize old ones like Claude Code CLI does.
 COMPACT_THRESHOLD = int(os.environ.get("COMPACT_THRESHOLD", "40"))
-COMPACT_KEEP_RECENT = int(os.environ.get("COMPACT_KEEP_RECENT", "10"))
+COMPACT_KEEP_RECENT = int(os.environ.get("COMPACT_KEEP_RECENT", "20"))
+# In addition to keep_recent, preserve the last N tool_use/tool_result pairs from the
+# compacted middle verbatim — this keeps fresh few-shot examples so Claude doesn't lose
+# tool-use patterning after compaction.
+COMPACT_PRESERVE_TOOL_PAIRS = int(os.environ.get("COMPACT_PRESERVE_TOOL_PAIRS", "2"))
 # Override relay URL to bypass Cloudflare/CDN gzip compression on SSE streams.
 # If set, this replaces the baseURL sent by the frontend.
 RELAY_BASE_URL = os.environ.get("RELAY_BASE_URL", "")
@@ -256,6 +260,36 @@ def _find_compaction_boundary(messages):
     return keep_start
 
 
+def _extract_recent_tool_pairs(messages, n_pairs):
+    """Pull the last N tool_use/tool_result pairs out of `messages`.
+
+    Returns (preserved, remaining). Preserved keeps original order; remaining is
+    `messages` with those pairs removed. Used to keep tool-use patterning around
+    compaction so Claude still has fresh few-shot examples of how tools got called.
+    """
+    if n_pairs <= 0 or len(messages) < 2:
+        return [], list(messages)
+
+    preserved_idx: set[int] = set()
+    pairs_found = 0
+    i = len(messages) - 1
+    while i > 0 and pairs_found < n_pairs:
+        if _has_tool_result(messages[i]) and _has_tool_use(messages[i - 1]):
+            preserved_idx.add(i - 1)
+            preserved_idx.add(i)
+            pairs_found += 1
+            i -= 2
+        else:
+            i -= 1
+
+    if not preserved_idx:
+        return [], list(messages)
+
+    preserved = [messages[idx] for idx in sorted(preserved_idx)]
+    remaining = [m for idx, m in enumerate(messages) if idx not in preserved_idx]
+    return preserved, remaining
+
+
 def _prune_message_for_summary(message):
     content = message.get("content")
     if not isinstance(content, list):
@@ -358,16 +392,31 @@ def compact_session(session: dict, base_url: str, auth_token: str, model: str) -
         return False
 
     head_messages = messages[:2]
-    to_summarize = [m for m in messages[2:keep_start] if not _is_compaction_message(m)]
+    to_summarize_raw = [m for m in messages[2:keep_start] if not _is_compaction_message(m)]
     keep_recent = [m for m in messages[keep_start:] if not _is_compaction_message(m)]
 
-    if not to_summarize:
+    if not to_summarize_raw:
         return False
 
-    logger.info(
-        "Compacting session [%s]: summarizing %d messages, keeping %d recent, preserving %d head messages",
-        session.get("session_id", "?"), len(to_summarize), len(keep_recent), len(head_messages),
+    # Preserve the last N tool_use/tool_result pairs from the middle verbatim so
+    # tool-use patterning survives compaction. These sit between summary and recent tail.
+    preserved_pairs, to_summarize = _extract_recent_tool_pairs(
+        to_summarize_raw, COMPACT_PRESERVE_TOOL_PAIRS
     )
+
+    logger.info(
+        "Compacting session [%s]: summarizing %d messages, preserving %d tool-pair msgs, "
+        "keeping %d recent, preserving %d head messages",
+        session.get("session_id", "?"), len(to_summarize), len(preserved_pairs),
+        len(keep_recent), len(head_messages),
+    )
+
+    if not to_summarize:
+        # Nothing actually needs summarization after pulling pairs out — just splice pairs in.
+        session["messages"] = head_messages + preserved_pairs + keep_recent
+        session["compact_count"] = session.get("compact_count", 0) + 1
+        logger.info("Compaction (pairs-only) done. Session now has %d messages.", len(session["messages"]))
+        return True
 
     previous_summary = session.get("_previous_summary", "").strip()
     if previous_summary:
@@ -444,7 +493,7 @@ def compact_session(session: dict, base_url: str, auth_token: str, model: str) -
             ),
         })
 
-    session["messages"] = head_messages + compact_block + keep_recent
+    session["messages"] = head_messages + compact_block + preserved_pairs + keep_recent
     session["compact_count"] = session.get("compact_count", 0) + 1
     logger.info("Compaction done. Session now has %d messages.", len(session["messages"]))
     return True
