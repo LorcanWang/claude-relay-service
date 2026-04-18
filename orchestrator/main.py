@@ -42,13 +42,14 @@ from pydantic import BaseModel
 from anthropic_client import (
     APP_ACTION_TOOL,
     AnthropicStream,
+    DESCRIBE_SKILL_TOOL,
     RUN_COMMAND_TOOL,
     call_anthropic,
     extract_text,
 )
 from executor import execute_command
 from session import clear_session, get_session, new_session, save_session
-from skill_loader import build_system_prompt
+from skill_loader import build_system_prompt, load_skill_doc
 from stream import sse, sse_agent_status, sse_agent_switch, stream_error
 from mcp_config import collect_mcp_configs
 from mcp_manager import MCPManager
@@ -66,6 +67,12 @@ logger = logging.getLogger("orchestrator")
 RUNNER_KEY = os.environ.get("RUNNER_KEY", "")
 DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "claude-sonnet-4-6")
 MAX_LOOP = int(os.environ.get("MAX_LOOP_ITERATIONS", "50"))
+# Max output tokens per call. Bumped from 8192 default so Sonnet/Opus can emit
+# longer analyses without getting cut off.
+MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "16384"))
+# Extended thinking budget (tokens). Only used on Opus models; Sonnet/Haiku
+# turns stay lean. Set to 0 to disable globally.
+OPUS_THINKING_BUDGET = int(os.environ.get("OPUS_THINKING_BUDGET", "4096"))
 # Compaction: when stored messages exceed this, summarize old ones like Claude Code CLI does.
 COMPACT_THRESHOLD = int(os.environ.get("COMPACT_THRESHOLD", "40"))
 COMPACT_KEEP_RECENT = int(os.environ.get("COMPACT_KEEP_RECENT", "20"))
@@ -745,8 +752,12 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                 last_user["content"] = f"[{req.senderDisplayName}]: {last_user['content']}"
             session["messages"].append(last_user)
 
-        # ── build full system prompt ──────────────────────────────────────────
-        full_system = build_system_prompt(
+        # ── build system prompt as segmented blocks ───────────────────────────
+        # system_blocks[0] is the stable core (platform rules + app_action + skill
+        # usage). We attach cache_control to it so repeat turns hit the Anthropic
+        # prompt cache. Skill index + dynamic tail stay uncached because they
+        # vary per room/turn.
+        system_blocks = build_system_prompt(
             req.systemPrompt,
             [s.dict() for s in effective_skills],
             org_id=req.orgId,
@@ -755,7 +766,16 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
             skill_configs=req.skillConfigs or {},
             room_id=req.roomId,
         )
-        tools = [RUN_COMMAND_TOOL, APP_ACTION_TOOL] if effective_skills else [APP_ACTION_TOOL]
+        if system_blocks:
+            system_blocks[0] = {
+                **system_blocks[0],
+                "cache_control": {"type": "ephemeral"},
+            }
+
+        if effective_skills:
+            tools = [RUN_COMMAND_TOOL, DESCRIBE_SKILL_TOOL, APP_ACTION_TOOL]
+        else:
+            tools = [APP_ACTION_TOOL]
 
         # ── MCP tools ─────────────────────────────────────────────────────────
         mcp_mgr = None
@@ -801,7 +821,8 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                 req.roomId,
             )
             if memory_bundle:
-                full_system = f"{full_system}\n\n{memory_bundle}"
+                # Memory is per-turn dynamic — append as an uncached tail block.
+                system_blocks.append({"type": "text", "text": memory_bundle})
                 logger.info("Hermes memory injected (%d chars)", len(memory_bundle))
         except Exception as exc:
             logger.warning("Hermes retrieval failed, continuing without: %s", exc)
@@ -820,9 +841,11 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
             api_kwargs = dict(
                 base_url=RELAY_BASE_URL or req.anthropicConfig.baseURL,
                 auth_token=req.anthropicConfig.authToken,
-                system=full_system,
+                system=system_blocks,
                 tools=tools,
                 model=model,
+                max_tokens=MAX_OUTPUT_TOKENS,
+                thinking_budget=OPUS_THINKING_BUDGET,
             )
 
             yield sse({"type": "start"})
@@ -946,6 +969,26 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                         collected_actions.append(inp)
                         logger.info("App action collected: %r", inp)
                         result = {"ok": True, "action": inp.get("action", "")}
+                    elif tool_name == "describe_skill":
+                        skill_name = (inp.get("name") or "").strip()
+                        enabled_set = {s.name for s in effective_skills}
+                        if skill_name not in enabled_set:
+                            result = {
+                                "ok": False,
+                                "error": (
+                                    f"Skill '{skill_name}' is not enabled for this room. "
+                                    f"Available: {sorted(enabled_set)}"
+                                ),
+                            }
+                        else:
+                            doc = await asyncio.to_thread(load_skill_doc, skill_name)
+                            if doc:
+                                result = {"ok": True, "data": doc}
+                            else:
+                                result = {
+                                    "ok": False,
+                                    "error": f"No SKILL.md found for '{skill_name}'",
+                                }
                     elif mcp_mgr and mcp_mgr.is_mcp_tool(tool_name):
                         _publish_agent_switch(session_id, "lynx", tool_name, f"Calling {tool_name}")
                         _publish_agent_status(session_id, tool_name, "working", f"Calling {tool_name}")

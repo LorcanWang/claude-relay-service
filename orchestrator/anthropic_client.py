@@ -71,19 +71,70 @@ RUN_COMMAND_TOOL = {
     },
 }
 
+DESCRIBE_SKILL_TOOL = {
+    "name": "describe_skill",
+    "description": (
+        "Fetch the full documentation for one enabled skill — its subcommand list, "
+        "argument schemas, and usage examples. Call this BEFORE using `run_command` on a "
+        "skill you haven't used yet in this conversation, so you know the exact invocation. "
+        "The skill index in the system prompt only shows the name and one-line description; "
+        "this tool returns the full SKILL.md body for planning."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": (
+                    "Skill name (must be one of the skills listed under '## Available Skills' "
+                    "in the system prompt)."
+                ),
+            },
+        },
+        "required": ["name"],
+    },
+}
+
+
+def _opus_thinking_config(
+    model: str, budget_tokens: int | None, max_tokens: int | None = None
+) -> dict | None:
+    """Return a `thinking` param dict for Opus models, or None otherwise.
+
+    Anthropic extended thinking: https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking
+    Only fires on Opus. Sonnet/Haiku turns stay lean. `budget_tokens` is clamped
+    below `max_tokens` (Anthropic requires budget < max) to avoid config errors.
+    """
+    if not model or not budget_tokens or budget_tokens <= 0:
+        return None
+    if "opus" not in model.lower():
+        return None
+    budget = int(budget_tokens)
+    if max_tokens and budget >= max_tokens:
+        budget = max(512, max_tokens - 512)
+    return {"type": "enabled", "budget_tokens": budget}
+
 
 def call_anthropic(
     *,
     base_url: str,
     auth_token: str,
-    system: str,
+    system: str | list[dict],
     messages: list[dict],
     tools: list[dict] | None = None,
     model: str = DEFAULT_MODEL,
     max_tokens: int = DEFAULT_MAX_TOKENS,
+    thinking_budget: int | None = None,
 ) -> dict[str, Any]:
     """
     POST to {base_url}/messages (non-streaming).
+
+    `system` may be a plain string (legacy callers like the compaction
+    summarizer) or an Anthropic-structured list of `{type: "text", text: ...,
+    cache_control?: {...}}` blocks (preferred for main chat — enables prompt
+    caching on stable prefix).
+
+    `thinking_budget` enables extended thinking but only on Opus models.
 
     Returns the parsed response dict, or raises on HTTP/network error.
     """
@@ -98,6 +149,9 @@ def call_anthropic(
     }
     if tools:
         payload["tools"] = tools
+    thinking_cfg = _opus_thinking_config(model, thinking_budget, max_tokens)
+    if thinking_cfg:
+        payload["thinking"] = thinking_cfg
 
     headers = {
         "Content-Type": "application/json",
@@ -140,11 +194,12 @@ class AnthropicStream:
         *,
         base_url: str,
         auth_token: str,
-        system: str,
+        system: str | list[dict],
         messages: list[dict],
         tools: list[dict] | None = None,
         model: str = DEFAULT_MODEL,
         max_tokens: int = DEFAULT_MAX_TOKENS,
+        thinking_budget: int | None = None,
     ):
         self._url = base_url.rstrip("/") + "/v1/messages"
         self._payload: dict[str, Any] = {
@@ -156,6 +211,9 @@ class AnthropicStream:
         }
         if tools:
             self._payload["tools"] = tools
+        thinking_cfg = _opus_thinking_config(model, thinking_budget, max_tokens)
+        if thinking_cfg:
+            self._payload["thinking"] = thinking_cfg
         self._headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {auth_token}",
@@ -205,6 +263,11 @@ class AnthropicStream:
                     }
                     current_tool_input_json = ""
                     self.content.append(current_block)
+                elif btype == "thinking":
+                    # Extended thinking — preserve in content for follow-up turns,
+                    # but don't surface to the UI stream.
+                    current_block = {"type": "thinking", "thinking": "", "signature": ""}
+                    self.content.append(current_block)
 
             elif etype == "content_block_delta":
                 delta = event.get("delta", {})
@@ -213,6 +276,10 @@ class AnthropicStream:
                     current_block["text"] += delta.get("text", "")
                 elif dtype == "input_json_delta" and current_block and current_block["type"] == "tool_use":
                     current_tool_input_json += delta.get("partial_json", "")
+                elif dtype == "thinking_delta" and current_block and current_block["type"] == "thinking":
+                    current_block["thinking"] += delta.get("thinking", "")
+                elif dtype == "signature_delta" and current_block and current_block["type"] == "thinking":
+                    current_block["signature"] += delta.get("signature", "")
 
             elif etype == "content_block_stop":
                 if current_block and current_block["type"] == "tool_use":
@@ -318,6 +385,9 @@ class AnthropicStream:
                             }
                             current_tool_input_json = ""
                             self.content.append(current_block)
+                        elif btype == "thinking":
+                            current_block = {"type": "thinking", "thinking": "", "signature": ""}
+                            self.content.append(current_block)
 
                     elif etype == "content_block_delta":
                         delta = event.get("delta", {})
@@ -328,6 +398,10 @@ class AnthropicStream:
                             yield text
                         elif dtype == "input_json_delta" and current_block and current_block["type"] == "tool_use":
                             current_tool_input_json += delta.get("partial_json", "")
+                        elif dtype == "thinking_delta" and current_block and current_block["type"] == "thinking":
+                            current_block["thinking"] += delta.get("thinking", "")
+                        elif dtype == "signature_delta" and current_block and current_block["type"] == "thinking":
+                            current_block["signature"] += delta.get("signature", "")
 
                     elif etype == "content_block_stop":
                         if current_block and current_block["type"] == "tool_use":

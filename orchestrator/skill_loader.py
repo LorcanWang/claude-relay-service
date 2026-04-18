@@ -79,6 +79,81 @@ def load_agent_manifest(skill_name: str) -> dict | None:
         return None
 
 
+APP_ACTIONS_BLOCK = (
+    "## App Actions\n"
+    "You have access to an app_action tool that controls the Zeon webapp directly.\n"
+    "Use it proactively after completing tasks:\n"
+    "- Call app_action(action='navigate', path='/some/path') to send the user to a relevant page "
+    "after creating or updating something (e.g. after creating issue #abc123, navigate to /issues/abc123).\n"
+    "- Call app_action(action='toast', message='...') to show a brief success or error notification "
+    "without navigating away.\n"
+    "Always call app_action as a tool — never describe the action in text alone. "
+    "You may chain it after a run_command in the same loop.\n"
+    "CRITICAL: app_action supplements your answer, it does not replace it. Every turn must "
+    "end with a text response summarizing what you found or did. A turn that ends with only "
+    "an app_action call and empty text leaves the chat bubble blank — never do this."
+)
+
+SKILL_USAGE_BLOCK = (
+    "## Using Skills\n"
+    "The Available Skills section below lists what is enabled for this room. Each entry shows "
+    "the skill name and a short description. To see the full command list for a skill (its "
+    "subcommands, arguments, and examples), call the `describe_skill` tool with the skill name. "
+    "Only load full docs when you actually intend to use that skill — the compact index above "
+    "is enough for planning.\n"
+    "Once you know the command, execute it via `run_command(skill=..., command='python3 X.py ...')`. "
+    "Pass the exact Python invocation shown in the skill docs."
+)
+
+
+def _skill_index_line(skill: dict) -> str:
+    """Compact one-line entry for the skill index: `- name — description`."""
+    name = skill.get("name", "")
+    manifest = load_agent_manifest(name) or {}
+    desc = (manifest.get("description") or skill.get("description") or "").strip()
+    # Truncate overlong descriptions — the index is meant to be scannable.
+    if len(desc) > 220:
+        desc = desc[:217] + "..."
+    if desc:
+        return f"- **{name}** — {desc}"
+    return f"- **{name}**"
+
+
+_SENSITIVE_KEY_HINTS = ("token", "secret", "key", "password", "credential", "api_key", "access_token")
+
+
+def _redact_config_value(key: str, value) -> str:
+    """Hide secrets in the skill index. Keep short non-sensitive values visible."""
+    if any(hint in key.lower() for hint in _SENSITIVE_KEY_HINTS):
+        return "<redacted>"
+    text = str(value)
+    if len(text) > 80:
+        return text[:77] + "..."
+    return text
+
+
+def build_skill_index(enabled_skills: list[dict], skill_configs: dict | None = None) -> str:
+    """Compact skill menu. Full docs are fetched lazily via the describe_skill tool."""
+    if not enabled_skills:
+        return ""
+    lines = ["## Available Skills"]
+    for skill in enabled_skills:
+        lines.append(_skill_index_line(skill))
+        name = skill.get("name", "")
+        config = (skill_configs or {}).get(name, {})
+        if config:
+            cfg_preview = ", ".join(
+                f"{k}={_redact_config_value(k, v)}" for k, v in config.items()
+            )
+            lines.append(f"  _config: {cfg_preview}_")
+    lines.append("")
+    lines.append(
+        "Call `describe_skill(name='<skill>')` to see the full command list before using "
+        "`run_command` on that skill."
+    )
+    return "\n".join(lines)
+
+
 def build_system_prompt(
     base_prompt: str,
     enabled_skills: list[dict],
@@ -87,20 +162,36 @@ def build_system_prompt(
     in_platform: bool = False,
     skill_configs: dict | None = None,
     room_id: str | None = None,
-) -> str:
+) -> list[dict]:
     """
-    Combine the base system prompt from Next.js with SKILL.md content
-    and tool usage instructions.
-    """
-    parts = [base_prompt.strip()]
+    Build the system prompt as a list of Anthropic `text` blocks so we can mark
+    the stable prefix with `cache_control` and leave dynamic tail uncached.
 
-    if org_id or user_id or in_platform:
-        ctx_lines = ["## Current User Context"]
+    Layout:
+      [0] stable core  — base prompt + app actions + skill usage (cache_control)
+      [1] skill index  — per-room compact menu (no cache; changes if room skills change)
+      [2] dynamic tail — user/room context (no cache; varies per turn)
+
+    The caller attaches cache_control to block 0 before sending.
+    """
+    # ── Segment 0: stable core ────────────────────────────────────────────
+    core_parts = [base_prompt.strip(), APP_ACTIONS_BLOCK, SKILL_USAGE_BLOCK]
+    stable_core = "\n\n".join(p for p in core_parts if p)
+
+    # ── Segment 1: skill index (per-room, small) ─────────────────────────
+    skill_index = build_skill_index(enabled_skills, skill_configs)
+
+    # ── Segment 2: dynamic tail (user/room context) ──────────────────────
+    ctx_lines: list[str] = []
+    if org_id or user_id or in_platform or room_id:
+        ctx_lines.append("## Current User Context")
         if org_id:
             ctx_lines.append(f"- **org_id**: `{org_id}`")
         if user_id:
             ctx_lines.append(f"- **user_id**: `{user_id}`")
         ctx_lines.append(f"- **in_platform**: `{'true' if in_platform else 'false'}`")
+        if room_id:
+            ctx_lines.append(f"- **room_id**: `{room_id}`")
         ctx_lines.append(
             "When running skill commands that accept `--org-id`, always pass the org_id above. "
             "Note: LYNX_ORG_ID, LYNX_USER_ID, and skill config values are also injected as "
@@ -108,57 +199,20 @@ def build_system_prompt(
         )
         if in_platform:
             ctx_lines.append(
-                "The user is inside the platform. Prefer using app_action(navigate) to send them "
-                "to the relevant page rather than printing full data tables. "
-                "Always write a clear text answer summarizing what you found, THEN call "
-                "app_action to navigate or show a toast. Never end a turn with only an app_action "
-                "and no text — the chat bubble would be empty."
+                "The user is inside the platform. Prefer app_action(navigate) to send them to "
+                "the relevant page rather than printing full data tables. Always write a clear "
+                "text answer summarizing what you found, THEN call app_action."
             )
         if room_id:
-            ctx_lines.append(f"- **room_id**: `{room_id}`")
             ctx_lines.append(
                 "You are in a multi-user meeting room. Messages may be prefixed with "
                 "[Username]: to identify the sender. Address users by name when relevant."
             )
-        parts.append("\n".join(ctx_lines))
+    dynamic_tail = "\n".join(ctx_lines)
 
-    skill_docs = []
-    for skill in enabled_skills:
-        name = skill.get("name", "")
-        doc = load_skill_doc(name)
-        config = (skill_configs or {}).get(name, {})
-        config_block = ""
-        if config:
-            config_lines = "\n".join(f"  {k}: {v}" for k, v in config.items())
-            config_block = f"\n## Skill Config\n{config_lines}"
-        if doc:
-            skill_docs.append(f"=== SKILL: {name} ===\n{doc.strip()}{config_block}\n=== END SKILL ===")
-        else:
-            desc = skill.get("description", "")
-            skill_docs.append(f"=== SKILL: {name} ===\n{desc}{config_block}\n=== END SKILL ===")
-
-    if skill_docs:
-        parts.append("\n\n".join(skill_docs))
-        parts.append(
-            "When the user's request matches a skill, execute the appropriate command "
-            "described in the skill documentation above using the run_command tool. "
-            "Read the skill's Commands section to determine the correct command and arguments. "
-            "Always run the command with the exact Python invocation shown (e.g. python3 ads.py ...)."
-        )
-
-    parts.append(
-        "## App Actions\n"
-        "You have access to an app_action tool that controls the Zeon webapp directly.\n"
-        "Use it proactively after completing tasks:\n"
-        "- Call app_action(action='navigate', path='/some/path') to send the user to a relevant page "
-        "after creating or updating something (e.g. after creating issue #abc123, navigate to /issues/abc123).\n"
-        "- Call app_action(action='toast', message='...') to show a brief success or error notification "
-        "without navigating away.\n"
-        "Always call app_action as a tool — never describe the action in text alone. "
-        "You may chain it after a run_command in the same loop.\n"
-        "CRITICAL: app_action supplements your answer, it does not replace it. Every turn must "
-        "end with a text response summarizing what you found or did. A turn that ends with only "
-        "an app_action call and empty text leaves the chat bubble blank — never do this."
-    )
-
-    return "\n\n".join(parts)
+    blocks: list[dict] = [{"type": "text", "text": stable_core}]
+    if skill_index:
+        blocks.append({"type": "text", "text": skill_index})
+    if dynamic_tail:
+        blocks.append({"type": "text", "text": dynamic_tail})
+    return blocks
