@@ -811,6 +811,11 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
             collected_actions: list[dict] = []
             step_id = 0
             _hermes_tool_names: list[str] = []
+            # Fires at most once per turn: if Claude ends with empty text after
+            # calling app_action, we re-prompt it for a text summary so the chat
+            # bubble isn't blank. Flag prevents an infinite loop if the model
+            # returns empty again.
+            recovered_empty_end_turn = False
 
             api_kwargs = dict(
                 base_url=RELAY_BASE_URL or req.anthropicConfig.baseURL,
@@ -854,6 +859,32 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                     )
 
                 if stop_reason != "tool_use":
+                    # ── Safety net: empty end_turn after an app_action ───────
+                    # If the model ended the turn with zero text but did emit
+                    # an app_action earlier, the user would see a blank chat
+                    # bubble. Re-prompt once for a text summary.
+                    if (
+                        not has_text
+                        and collected_actions
+                        and not recovered_empty_end_turn
+                    ):
+                        logger.info(
+                            "Empty end_turn after app_action — requesting text "
+                            "summary (session=%s, iter=%d)",
+                            session_id, iteration + 1,
+                        )
+                        recovered_empty_end_turn = True
+                        session["messages"].append({
+                            "role": "user",
+                            "content": (
+                                "Please provide a short text summary (2-4 "
+                                "sentences) of what you found or did in this "
+                                "turn. Do not call additional tools — just "
+                                "reply with text."
+                            ),
+                        })
+                        continue
+
                     # ── end_turn: emit actions + finish ──────────────────────
                     if collected_actions:
                         for action in collected_actions:
