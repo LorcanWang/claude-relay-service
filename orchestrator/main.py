@@ -873,7 +873,22 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                 step_id += 1
 
                 stop_reason = stream.stop_reason
-                logger.info("Stop reason: %s (iteration %d)", stop_reason, iteration + 1)
+                # Log usage so prompt-cache hits are verifiable. cache_read_input_tokens
+                # > 0 = we hit the cached prefix. cache_creation_input_tokens > 0 on the
+                # first turn means we wrote the cache.
+                if stream.usage:
+                    logger.info(
+                        "Stream usage [%s iter=%d]: in=%d cache_create=%d cache_read=%d out=%d stop=%s",
+                        session_id,
+                        iteration + 1,
+                        stream.usage.get("input_tokens", 0),
+                        stream.usage.get("cache_creation_input_tokens", 0),
+                        stream.usage.get("cache_read_input_tokens", 0),
+                        stream.usage.get("output_tokens", 0),
+                        stop_reason,
+                    )
+                else:
+                    logger.info("Stop reason: %s (iteration %d)", stop_reason, iteration + 1)
 
                 # Persist assistant message to session (skip if empty — Anthropic rejects blank content)
                 if stream.content:

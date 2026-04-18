@@ -226,6 +226,9 @@ class AnthropicStream:
         self.content: list[dict] = []
         self.stop_reason: str = "end_turn"
         self.tool_uses: list[dict] = []
+        # Usage — populated from message_start + final message_delta. Useful to
+        # verify prompt caching: non-zero cache_read_input_tokens means cache hit.
+        self.usage: dict[str, int] = {}
 
     def _parse_sse_text(self, text: str) -> None:
         """Parse a full block of SSE text, populating self.content/stop_reason/tool_uses."""
@@ -248,7 +251,15 @@ class AnthropicStream:
 
             etype = event.get("type", "")
 
-            if etype == "content_block_start":
+            if etype == "message_start":
+                msg = event.get("message", {}) or {}
+                usage = msg.get("usage", {}) or {}
+                # Merge — message_start has most fields; message_delta may bump output_tokens.
+                for k, v in usage.items():
+                    if isinstance(v, int):
+                        self.usage[k] = v
+
+            elif etype == "content_block_start":
                 block = event.get("content_block", {})
                 btype = block.get("type", "")
                 if btype == "text":
@@ -295,6 +306,10 @@ class AnthropicStream:
                 delta = event.get("delta", {})
                 if "stop_reason" in delta:
                     self.stop_reason = delta["stop_reason"]
+                usage = event.get("usage", {}) or {}
+                for k, v in usage.items():
+                    if isinstance(v, int):
+                        self.usage[k] = v
 
     async def __aiter__(self) -> AsyncIterator[str]:
         """Yield text delta strings as they arrive. Populates self.content/stop_reason/tool_uses."""
@@ -370,7 +385,14 @@ class AnthropicStream:
 
                     etype = event.get("type", "")
 
-                    if etype == "content_block_start":
+                    if etype == "message_start":
+                        msg = event.get("message", {}) or {}
+                        usage = msg.get("usage", {}) or {}
+                        for k, v in usage.items():
+                            if isinstance(v, int):
+                                self.usage[k] = v
+
+                    elif etype == "content_block_start":
                         block = event.get("content_block", {})
                         btype = block.get("type", "")
                         if btype == "text":
@@ -417,6 +439,10 @@ class AnthropicStream:
                         delta = event.get("delta", {})
                         if "stop_reason" in delta:
                             self.stop_reason = delta["stop_reason"]
+                        usage = event.get("usage", {}) or {}
+                        for k, v in usage.items():
+                            if isinstance(v, int):
+                                self.usage[k] = v
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
