@@ -222,6 +222,166 @@ def _publish_agent_switch(session_id: str, from_agent_id: str, to_agent_id: str,
     )
 
 
+# ── tool-result envelope ──────────────────────────────────────────────────────
+
+TOOL_RESULT_MAX_TOTAL = 20000  # max chars of the JSON-serialized envelope
+TOOL_RESULT_MAX_DATA = 18000   # max chars of the inner `data` when stringified
+
+
+def _summarize_data(data) -> str:
+    """Best-effort one-liner describing the shape of a tool result's data."""
+    if data is None:
+        return "no data"
+    if isinstance(data, str):
+        first = data.strip().split("\n", 1)[0]
+        if len(first) > 140:
+            first = first[:137] + "..."
+        return f'"{first}"' if first else f"{len(data)} chars"
+    if isinstance(data, bool):
+        return str(data).lower()
+    if isinstance(data, (int, float)):
+        return str(data)
+    if isinstance(data, list):
+        return f"{len(data)} item{'s' if len(data) != 1 else ''}"
+    if isinstance(data, dict):
+        keys = list(data.keys())
+        shown = ", ".join(keys[:6])
+        if len(keys) > 6:
+            shown += ", ..."
+        return f"keys: {shown}" if shown else "empty object"
+    return type(data).__name__
+
+
+def _build_tool_envelope(tool_name: str, inp: dict, raw, *, agent_note: str = "") -> dict:
+    """Normalize any tool result to `{status, summary, data?, stderr?, stdout?, meta?}`.
+
+    Claude scans the first keys of a JSON envelope first, so status and summary
+    come before bulky data. Failures keep stderr/stdout for debugging; successes
+    omit them to save tokens. Data is clipped to TOOL_RESULT_MAX_DATA with a
+    truncated flag — never silently cut mid-content.
+    """
+    ok = True
+    data = raw
+    error = None
+    stderr = None
+    stdout = None
+
+    # Always capture agentNote regardless of ok/fail so it survives into meta.
+    if isinstance(raw, dict) and not agent_note:
+        agent_note = raw.get("agentNote") or ""
+
+    if isinstance(raw, dict):
+        if raw.get("ok") is False:
+            ok = False
+            error = raw.get("error") or "unknown error"
+            stderr = raw.get("stderr")
+            stdout = raw.get("stdout")
+            data = None
+        elif "data" in raw:
+            data = raw["data"]
+        else:
+            # Bare success — strip known wrapper keys so they don't echo into data.
+            _wrapper = {"ok", "agentNote", "stderr", "stdout", "error"}
+            stripped = {k: v for k, v in raw.items() if k not in _wrapper}
+            data = stripped if stripped else None
+
+    # app_action carries no useful data — the action was already collected
+    # client-side. Drop the wrapper so Claude doesn't see a duplicate echo.
+    if ok and tool_name == "app_action":
+        data = None
+
+    # Build summary
+    if ok:
+        if tool_name == "app_action":
+            action = (inp or {}).get("action") or "action"
+            path = (inp or {}).get("path")
+            target = f" {path}" if path else ""
+            summary = f"queued {action}{target}"
+        elif tool_name == "describe_skill":
+            n = len(data) if isinstance(data, str) else 0
+            summary = f"loaded {(inp or {}).get('name', '?')} docs ({n} chars)"
+        elif tool_name == "run_command":
+            skill = (inp or {}).get("skill", "?")
+            cmd = (inp or {}).get("command", "")
+            cmd_head = cmd.split()[:3]
+            cmd_brief = " ".join(cmd_head) if cmd_head else ""
+            summary = f"ran {skill} ({cmd_brief}) — {_summarize_data(data)}"
+        else:
+            summary = f"{tool_name}: {_summarize_data(data)}"
+    else:
+        if tool_name == "run_command":
+            skill = (inp or {}).get("skill", "?")
+            summary = f"{skill} failed: {str(error)[:140]}"
+        else:
+            summary = f"{tool_name} failed: {str(error)[:140]}"
+
+    # Clip the data to its own budget before envelope serialization
+    data_serialized = data
+    truncated = False
+    if data is not None:
+        data_str = (
+            data if isinstance(data, str)
+            else json.dumps(data, ensure_ascii=False, default=str)
+        )
+        if len(data_str) > TOOL_RESULT_MAX_DATA:
+            data_serialized = data_str[:TOOL_RESULT_MAX_DATA] + "\n... [truncated]"
+            truncated = True
+        else:
+            data_serialized = data if not isinstance(data, str) else data_str
+
+    envelope: dict = {"status": "ok" if ok else "error", "summary": summary}
+    if ok:
+        if data_serialized is not None:
+            envelope["data"] = data_serialized
+    else:
+        # Clip error so a pathological failure can't blow the envelope budget.
+        err_str = str(error) if error is not None else "unknown error"
+        envelope["error"] = err_str if len(err_str) <= 1000 else err_str[:997] + "..."
+        if stderr:
+            s = str(stderr)
+            envelope["stderr"] = s if len(s) <= 2000 else s[-2000:]
+        if stdout:
+            s = str(stdout)
+            envelope["stdout"] = s if len(s) <= 2000 else s[-2000:]
+
+    meta: dict = {}
+    if truncated:
+        meta["truncated"] = True
+    if agent_note:
+        meta["agentNote"] = str(agent_note)[:200]
+    if meta:
+        envelope["meta"] = meta
+    return envelope
+
+
+def _envelope_to_tool_content(envelope: dict) -> str:
+    """Serialize an envelope to the string put into a tool_result content.
+
+    If the serialized envelope exceeds TOOL_RESULT_MAX_TOTAL, drop bulky fields
+    in priority order (stdout → stderr → data) rather than slicing the JSON
+    string (which would produce invalid JSON).
+    """
+    text = json.dumps(envelope, ensure_ascii=False, default=str)
+    if len(text) <= TOOL_RESULT_MAX_TOTAL:
+        return text
+
+    # Rebuild without the heaviest optional fields.
+    pruned = dict(envelope)
+    meta = dict(pruned.get("meta") or {})
+    for key in ("stdout", "stderr", "data"):
+        if key in pruned:
+            meta[f"dropped_{key}"] = True
+            del pruned[key]
+            pruned["meta"] = meta
+            text = json.dumps(pruned, ensure_ascii=False, default=str)
+            if len(text) <= TOOL_RESULT_MAX_TOTAL:
+                return text
+    # Last resort — slice the summary field, not the JSON string.
+    pruned["summary"] = str(pruned.get("summary", ""))[:500] + "...[over-budget]"
+    text = json.dumps(pruned, ensure_ascii=False, default=str)
+    return text[:TOOL_RESULT_MAX_TOTAL]
+
+
 # ── session compaction ────────────────────────────────────────────────────────
 
 COMPACTION_PREFIX = (
@@ -1044,37 +1204,27 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                         )
                         _publish_agent_switch(session_id, skill_id, "lynx", "Returned to Lynx")
 
+                    # ── Normalize into envelope ─────────────────────────
+                    envelope = _build_tool_envelope(tool_name, inp, result)
+
                     # ── Hermes: track tool execution ────────────────────
                     _hermes_tool_names.append(tool_name)
                     try:
-                        _tool_ok = result.get("ok", True) if isinstance(result, dict) else True
                         emit_tool_executed(
                             org_id=req.orgId,
                             session_id=session_id,
                             tool_name=tool_name,
                             skill_name=inp.get("skill", tool_name),
-                            result_ok=bool(_tool_ok),
-                            result_summary=str(result)[:200] if result else "",
+                            result_ok=envelope["status"] == "ok",
+                            result_summary=envelope.get("summary", "")[:200],
                         )
                     except Exception:
                         pass
 
-                    # Send successful data directly, but preserve failures so Claude does not
-                    # receive an opaque null result when a subprocess exits non-zero.
-                    if isinstance(result, dict) and result.get("ok") is False:
-                        tool_payload = {
-                            "ok": False,
-                            "error": result.get("error"),
-                            "stderr": result.get("stderr"),
-                            "stdout": result.get("stdout"),
-                        }
-                    else:
-                        tool_payload = result.get("data") if isinstance(result, dict) else result
-                    tool_content = json.dumps(tool_payload, ensure_ascii=False, default=str) if not isinstance(tool_payload, str) else tool_payload
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": tool_id,
-                        "content": tool_content[:20000],
+                        "content": _envelope_to_tool_content(envelope),
                     })
 
                 session["messages"].append({"role": "user", "content": tool_results})
