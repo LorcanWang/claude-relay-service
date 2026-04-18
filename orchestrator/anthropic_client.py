@@ -20,7 +20,10 @@ APP_ACTION_TOOL = {
     "name": "app_action",
     "description": (
         "Perform an action in the Zeon webapp — navigate to a page or show a toast notification. "
-        "Call this after completing a task to send the user to the right place."
+        "Call this after completing a task to send the user to the right place. "
+        "IMPORTANT: app_action is a SUPPLEMENT to your answer, never a replacement. "
+        "You must always write a text response in the same turn explaining what you found or did. "
+        "Do not end the turn with only an app_action and no text — the user will see a blank chat bubble."
     ),
     "input_schema": {
         "type": "object",

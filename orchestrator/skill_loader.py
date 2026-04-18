@@ -110,7 +110,9 @@ def build_system_prompt(
             ctx_lines.append(
                 "The user is inside the platform. Prefer using app_action(navigate) to send them "
                 "to the relevant page rather than printing full data tables. "
-                "Give a brief answer and navigate."
+                "Always write a clear text answer summarizing what you found, THEN call "
+                "app_action to navigate or show a toast. Never end a turn with only an app_action "
+                "and no text — the chat bubble would be empty."
             )
         if room_id:
             ctx_lines.append(f"- **room_id**: `{room_id}`")
@@ -153,7 +155,10 @@ def build_system_prompt(
         "- Call app_action(action='toast', message='...') to show a brief success or error notification "
         "without navigating away.\n"
         "Always call app_action as a tool — never describe the action in text alone. "
-        "You may chain it after a run_command in the same loop."
+        "You may chain it after a run_command in the same loop.\n"
+        "CRITICAL: app_action supplements your answer, it does not replace it. Every turn must "
+        "end with a text response summarizing what you found or did. A turn that ends with only "
+        "an app_action call and empty text leaves the chat bubble blank — never do this."
     )
 
     return "\n\n".join(parts)
