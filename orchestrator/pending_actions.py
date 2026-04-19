@@ -620,3 +620,197 @@ def list_pending_for_supervisor(org_id: str, user_id: str, limit: int = 50) -> l
 
 # Backward-compat alias — older imports may still reference list_pending_for_user.
 list_pending_for_user = list_pending_for_requester
+
+
+# ── Post-approval side effects ───────────────────────────────────────────────
+# When a supervisor acts from /hive/signoff (not chat), the original room has
+# no signal that the action resolved — the chat sits frozen at
+# "Queued — awaiting your confirmation". These helpers write:
+#   (1) a synthetic assistant message into chatRooms/{roomId}/messages so the
+#       live Firestore listener re-renders the chat with the outcome, and
+#   (2) a Hermes memoryType="approval_decision" record for the audit trail
+#       surfaced in /admin/hermes-insights.
+
+
+def _resolve_display_name(db, uid: str) -> str:
+    """Look up users/{uid}.displayName for chat attribution. Falls back to
+    email or a short uid prefix so the message is never blank."""
+    if not uid:
+        return "a supervisor"
+    try:
+        snap = db.collection("users").document(uid).get()
+        if snap.exists:
+            data = snap.to_dict() or {}
+            return data.get("displayName") or data.get("email") or uid[:8]
+    except Exception:
+        pass
+    return uid[:8]
+
+
+def _format_outcome_text(outcome: str, title: str, actor_name: str) -> str:
+    if outcome == "approved_executed":
+        return f"**Approved by {actor_name}** — {title} ran successfully."
+    if outcome == "approved_failed":
+        return f"**Approved by {actor_name}** — {title} executed but reported an error."
+    if outcome == "approved_revoked":
+        return (
+            f"**Approved by {actor_name}**, but {title} was skipped — "
+            "the skill is no longer enabled in this room."
+        )
+    if outcome == "cancelled":
+        return f"**Cancelled by {actor_name}** — {title} will not run."
+    if outcome == "expired":
+        return (
+            f"**Expired** — {title} was not approved in time (30-min TTL) "
+            "and will not run."
+        )
+    return f"{title}: {outcome}"
+
+
+def post_room_approval_message(*, pending: dict, outcome: str, actor_uid: str) -> None:
+    """Append a synthetic assistant message to the pending's chat room so the
+    UI reflects the sign-off outcome. No-op if the pending has no roomId
+    (direct-chat pendings; future scope).
+    """
+    db = _get_db()
+    if db is None:
+        return
+    room_id = pending.get("roomId")
+    if not room_id:
+        return
+
+    actor_name = _resolve_display_name(db, actor_uid)
+    title = pending.get("actionTitle") or pending.get("actionId") or "action"
+    text = _format_outcome_text(outcome, title, actor_name)
+
+    try:
+        from firebase_admin import firestore as _fs
+        messages_ref = (
+            db.collection("chatRooms").document(room_id).collection("messages")
+        )
+        last = list(
+            messages_ref.order_by("index", direction=_fs.Query.DESCENDING)
+            .limit(1)
+            .stream()
+        )
+        if last:
+            last_data = last[0].to_dict() or {}
+            next_index = int(last_data.get("index", -1)) + 1
+        else:
+            next_index = 0
+        now = _now_iso()
+        messages_ref.document().set({
+            "clientId": None,
+            "role": "assistant",
+            "parts": [{"type": "text", "text": text}],
+            "content": text,
+            "createdAt": now,
+            "index": next_index,
+            "meta": {
+                "kind": "approval_outcome",
+                "outcome": outcome,
+                "pendingId": pending.get("id"),
+                "actorUid": actor_uid,
+                "actionId": pending.get("actionId"),
+                "skill": pending.get("skill"),
+            },
+        })
+        db.collection("chatRooms").document(room_id).update({
+            "lastMessageAt": now,
+            "updatedAt": now,
+            "messageCount": _fs.Increment(1),
+        })
+    except Exception as exc:
+        logger.warning("post_room_approval_message failed (room=%s): %s", room_id, exc)
+
+
+def write_approval_memory(*, pending: dict, outcome: str, actor_uid: str) -> None:
+    """Persist an approval_decision Hermes memory. Non-fatal on failure."""
+    try:
+        from hermes_store import write_memory
+    except Exception as exc:
+        logger.warning("write_approval_memory: hermes_store unavailable: %s", exc)
+        return
+
+    db = _get_db()
+    actor_name = (
+        _resolve_display_name(db, actor_uid) if db else (actor_uid or "supervisor")
+    )
+    requester_uid = pending.get("userId") or ""
+    requester_name = _resolve_display_name(db, requester_uid) if db else ""
+
+    org_id = pending.get("orgId") or ""
+    room_id = pending.get("roomId") or ""
+    title = pending.get("actionTitle") or pending.get("actionId") or "action"
+
+    verb = {
+        "approved_executed": "approved",
+        "approved_failed": "approved (execution failed)",
+        "approved_revoked": "approved but skipped (skill no longer enabled)",
+        "cancelled": "cancelled",
+        "expired": "expired unapproved",
+    }.get(outcome, outcome)
+
+    summary_parts = [f"{actor_name} {verb} {title}."]
+    if requester_name and requester_name != actor_name:
+        summary_parts.append(f"Requested by {requester_name}.")
+    if pending.get("affectsAdSpend"):
+        summary_parts.append("Flagged: affects ad spend.")
+    if pending.get("destructive"):
+        summary_parts.append("Flagged: destructive.")
+
+    importance = 50 if (pending.get("destructive") or pending.get("affectsAdSpend")) else 30
+
+    memory = {
+        "orgId": org_id,
+        "scopeType": "room" if room_id else "org",
+        "scopeId": room_id or org_id,
+        "memoryType": "approval_decision",
+        "title": f"{verb.capitalize()}: {title}",
+        "summary": " ".join(summary_parts),
+        "importance": importance,
+        "confidence": 1.0,
+        "relevanceTags": [
+            t for t in ["approval", outcome, pending.get("skill") or ""] if t
+        ],
+        "actorRefs": [
+            {"displayName": actor_name, "uid": actor_uid, "role": "approver"},
+            *(
+                [{"displayName": requester_name, "uid": requester_uid, "role": "requester"}]
+                if requester_uid else []
+            ),
+        ],
+        "extra": {
+            "pendingId": pending.get("id"),
+            "actionId": pending.get("actionId"),
+            "skill": pending.get("skill"),
+            "command": (pending.get("command") or "")[:500],
+            "argsHash": pending.get("argsHash"),
+            "outcome": outcome,
+            "roomId": room_id or None,
+            "affectsAdSpend": bool(pending.get("affectsAdSpend")),
+            "destructive": bool(pending.get("destructive")),
+        },
+    }
+    try:
+        write_memory(memory)
+    except Exception as exc:
+        logger.warning("write_approval_memory: persistence failed: %s", exc)
+
+
+def load_pending(pending_id: str) -> dict | None:
+    """Fetch the current pending doc by id. Used by /cancel to hydrate the
+    document for post-effects (the transactional cancel() returns only ok/error)."""
+    db = _get_db()
+    if db is None:
+        return None
+    try:
+        snap = db.collection(COLLECTION).document(pending_id).get()
+        if not snap.exists:
+            return None
+        data = snap.to_dict() or {}
+        data["id"] = pending_id
+        return data
+    except Exception as exc:
+        logger.warning("load_pending failed (id=%s): %s", pending_id, exc)
+        return None

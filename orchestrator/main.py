@@ -66,6 +66,9 @@ from pending_actions import (
     claim_confirmed_for_execution,
     claim_specific_for_execution,
     mark_completed as mark_pending_completed,
+    post_room_approval_message,
+    write_approval_memory,
+    load_pending as load_pending_action,
 )
 from stream import sse, sse_agent_status, sse_agent_switch, stream_error
 from mcp_config import collect_mcp_configs
@@ -938,6 +941,8 @@ def confirm_pending_endpoint(
             "summary": "skill no longer enabled in room — execution refused",
             "status": "error",
         })
+        post_room_approval_message(pending=pending, outcome="approved_revoked", actor_uid=req.userId)
+        write_approval_memory(pending=pending, outcome="approved_revoked", actor_uid=req.userId)
         return {
             "ok": True,
             "pending": pending,
@@ -973,6 +978,9 @@ def confirm_pending_endpoint(
         "summary": (pending.get("actionTitle") or pending.get("actionId") or "") + " executed",
         "status": "ok" if exec_ok else "error",
     })
+    outcome_label = "approved_executed" if exec_ok else "approved_failed"
+    post_room_approval_message(pending=pending, outcome=outcome_label, actor_uid=req.userId)
+    write_approval_memory(pending=pending, outcome=outcome_label, actor_uid=req.userId)
     logger.info(
         "Supervisor-approved execution: id=%s skill=%s ok=%s by=%s",
         pending["id"], pending["skill"], exec_ok, req.userId,
@@ -1008,6 +1016,17 @@ def cancel_pending_endpoint(
         if err == "bad_status" or err.startswith("bad_status:"):
             raise HTTPException(status_code=409, detail=err)
         raise HTTPException(status_code=500, detail=err or "cancel_failed")
+
+    # Post-cancel side effects — chat notice + Hermes audit trail. Re-fetch the
+    # doc because cancel() returns only ok/error. Non-fatal on failure.
+    pending_doc = load_pending_action(pending_id)
+    if pending_doc:
+        post_room_approval_message(
+            pending=pending_doc, outcome="cancelled", actor_uid=req.userId
+        )
+        write_approval_memory(
+            pending=pending_doc, outcome="cancelled", actor_uid=req.userId
+        )
     return {"ok": True}
 
 
