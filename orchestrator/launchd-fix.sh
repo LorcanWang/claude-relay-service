@@ -72,7 +72,15 @@ case "$cmd" in
         echo
         echo "Bootstrapping (bootout + bootstrap)..."
         launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || echo "(not loaded)"
-        sleep 1
+        # Bootout is async — wait for the port to actually free before
+        # bootstrap, otherwise bootstrap fails with EIO/exit 5.
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+            if [ -z "$(find_listener_pid)" ]; then break; fi
+            sleep 1
+        done
+        if [ -n "$(find_listener_pid)" ]; then
+            echo "WARN: port :$PORT still held after 10s — bootstrap may fail"
+        fi
         launchctl bootstrap "gui/$(id -u)" "$plist"
         sleep 2
         new_pid=$(find_listener_pid)
