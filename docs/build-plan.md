@@ -80,19 +80,26 @@ Standardized `{status, summary, data?, error?, stderr?, stdout?, meta?}` shape. 
 
 ## Phase 6 — Confirmation flow (modal + Firestore-backed)
 
-⏳ planned, not started
+🔄 in progress
 
-Per the 10-round review:
-- Out-of-band modal (Option B from R7 review)
-- Firestore `pendingActions` collection (`pendingActionId`, `argsHash`, `requesterUserId`, `expiresAt`, `confirmationNonce`, `status`)
-- Per-user nonce — only the requesting user can confirm
-- Reopen re-entry shows pending actions on next visit
-- State machine: PENDING → CONFIRMED → EXECUTING → COMPLETED (or → CANCELLED / EXPIRED)
-- Server-side authority — client-side `confirmed: true` alone is replayable
+### 6a — Backend gate ✅ shipped `7cf973e`
+- New `orchestrator/pending_actions.py` module with create/confirm/cancel/list/mark_executing/mark_completed
+- Dispatcher branches on `matched_action.requiresConfirmation`, writes Firestore `pendingActions/{id}` with server nonce + per-user binding + argsHash + 30-min TTL
+- Returns envelope `status: "awaiting_confirmation"` with `pending` field for UI
+- New endpoints: `POST /pending-actions/{id}/confirm`, `POST .../cancel`, `GET /pending-actions?orgId&userId`
+- `confirm()` uses Firestore transaction (concurrent confirms can't both succeed)
+- `list_pending_for_user` redacts `nonce` field
+- Fail-safe: store unavailable → dispatcher returns error, never executes ungated
 
-Triggers off `meta.requiresConfirmation: true` from the manifest (already declared).
+### 6b — Frontend modal/card + resume execution ⏳ next
+- `app/api/pending-actions/[id]/confirm/route.ts` (Next.js proxy → orchestrator)
+- Detect `status === "awaiting_confirmation"` in tool envelope, render Approve/Cancel card inline
+- After confirm, send a synthetic `[confirmed:{id}]` user message
+- Orchestrator detects this pattern, looks up pending, validates status=confirmed + userId + argsHash, calls `mark_executing`, runs the original command, calls `mark_completed`
 
-Estimated: 3 days.
+### 6c — Re-entry surface ⏳ later
+- On room load, query `GET /pending-actions` for non-terminal entries
+- Show "you have N pending actions" banner with click-to-reopen
 
 ---
 
