@@ -8,7 +8,11 @@ status: active
 
 # Map of Content
 
-> Knowledge base for Claude Relay Service — 14 documents
+> Knowledge base for Claude Relay Service — 15 documents
+
+## Planning
+
+- [[build-plan|Build Plan & Status]] `planning` `roadmap` `status`
 
 ## Architecture
 
