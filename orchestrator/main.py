@@ -61,6 +61,8 @@ from pending_actions import (
     confirm as confirm_pending_action,
     cancel as cancel_pending_action,
     list_pending_for_user,
+    claim_confirmed_for_execution,
+    mark_completed as mark_pending_completed,
 )
 from stream import sse, sse_agent_status, sse_agent_switch, stream_error
 from mcp_config import collect_mcp_configs
@@ -1342,60 +1344,99 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                                     )
 
                             # Phase 6: if the matched action requires confirmation,
-                            # write a pending-action doc and short-circuit execution.
-                            # The frontend (next phase) will render an Approve/Cancel
-                            # card from the awaiting_confirmation envelope. For now
-                            # the user can verify Firestore + curl-confirm.
+                            # check for a confirmed pending FIRST (resume path).
+                            # If user already approved this exact command, run it
+                            # transparently. Otherwise, gate by writing a new
+                            # pending and short-circuiting execution.
                             if (
                                 matched_action
                                 and matched_action.get("requiresConfirmation")
                             ):
-                                pending_doc = create_pending_action(
+                                claimed = claim_confirmed_for_execution(
                                     org_id=req.orgId or "",
                                     user_id=req.userId or "",
-                                    room_id=req.roomId,
-                                    session_id=session_id,
                                     skill=skill_name,
                                     command=command,
-                                    action_id=matched_action.get("id", ""),
-                                    action_title=matched_action.get("title", ""),
-                                    destructive=bool(matched_action.get("destructive")),
-                                    affects_ad_spend=bool(matched_action.get("affectsAdSpend")),
                                 )
-                                _publish_agent_status(
-                                    session_id,
-                                    skill_id,
-                                    "completed",
-                                    "Awaiting approval",
-                                )
-                                _publish_agent_switch(session_id, skill_id, "lynx", "Returned to Lynx")
-                                if pending_doc:
-                                    result = {
-                                        "ok": True,
-                                        "awaiting_confirmation": True,
-                                        "pending": {
-                                            "id": pending_doc["id"],
-                                            "actionId": matched_action.get("id"),
-                                            "actionTitle": matched_action.get("title"),
-                                            "command": command,
-                                            "skill": skill_name,
-                                            "destructive": bool(matched_action.get("destructive")),
-                                            "affectsAdSpend": bool(matched_action.get("affectsAdSpend")),
-                                            "expiresAt": pending_doc["expiresAt"],
-                                        },
-                                    }
+                                if claimed:
+                                    # Resume path: atomic claim succeeded — the doc
+                                    # is now status=executing and reserved for us.
+                                    # Two concurrent resume turns can't both end up
+                                    # here because the txn is conditional on
+                                    # status="confirmed" at commit.
+                                    pending_id = claimed.get("id", "")
+                                    logger.info(
+                                        "Resuming claimed pending: id=%s skill=%s action=%s",
+                                        pending_id, skill_name, matched_action.get("id"),
+                                    )
+                                    _publish_agent_switch(session_id, "lynx", skill_id, f"Delegating to {skill_name} (approved)")
+                                    _publish_agent_status(session_id, skill_id, "working", preview or "Running approved command")
+                                    result = execute_command(skill_name, command, enabled_names, context={
+                                        "org_id": req.orgId,
+                                        "user_id": req.userId,
+                                        "session_id": session_id,
+                                        "in_platform": req.inPlatform,
+                                        "skill_configs": req.skillConfigs or {},
+                                        "room_id": req.roomId,
+                                    })
+                                    # Stash a brief result summary on the pending
+                                    # for the admin re-entry surface; never the full data.
+                                    mark_pending_completed(pending_id, result={
+                                        "summary": (matched_action.get("title") or matched_action.get("id") or "") + " executed",
+                                        "status": "ok" if (isinstance(result, dict) and result.get("ok") is not False) else "error",
+                                    })
+                                    note = result.get("agentNote") if isinstance(result, dict) else ""
+                                    _publish_agent_status(session_id, skill_id, "completed", note or "Done")
+                                    _publish_agent_switch(session_id, skill_id, "lynx", "Returned to Lynx")
                                 else:
-                                    # Firestore unavailable — fail safe: do NOT
-                                    # execute. Tell the model so it relays a clear
-                                    # error to the user.
-                                    result = {
-                                        "ok": False,
-                                        "error": (
-                                            "Confirmation store unavailable — "
-                                            "cannot gate this action safely. Please "
-                                            "retry in a moment."
-                                        ),
-                                    }
+                                    # Gate path: new pending, no execution.
+                                    pending_doc = create_pending_action(
+                                        org_id=req.orgId or "",
+                                        user_id=req.userId or "",
+                                        room_id=req.roomId,
+                                        session_id=session_id,
+                                        skill=skill_name,
+                                        command=command,
+                                        action_id=matched_action.get("id", ""),
+                                        action_title=matched_action.get("title", ""),
+                                        destructive=bool(matched_action.get("destructive")),
+                                        affects_ad_spend=bool(matched_action.get("affectsAdSpend")),
+                                    )
+                                    _publish_agent_status(
+                                        session_id,
+                                        skill_id,
+                                        "completed",
+                                        "Awaiting approval",
+                                    )
+                                    _publish_agent_switch(session_id, skill_id, "lynx", "Returned to Lynx")
+                                    if pending_doc:
+                                        result = {
+                                            "ok": True,
+                                            "awaiting_confirmation": True,
+                                            "pending": {
+                                                "id": pending_doc["id"],
+                                                "nonce": pending_doc["nonce"],
+                                                "actionId": matched_action.get("id"),
+                                                "actionTitle": matched_action.get("title"),
+                                                "command": command,
+                                                "skill": skill_name,
+                                                "destructive": bool(matched_action.get("destructive")),
+                                                "affectsAdSpend": bool(matched_action.get("affectsAdSpend")),
+                                                "expiresAt": pending_doc["expiresAt"],
+                                            },
+                                        }
+                                    else:
+                                        # Firestore unavailable — fail safe: do NOT
+                                        # execute. Tell the model so it relays a clear
+                                        # error to the user.
+                                        result = {
+                                            "ok": False,
+                                            "error": (
+                                                "Confirmation store unavailable — "
+                                                "cannot gate this action safely. Please "
+                                                "retry in a moment."
+                                            ),
+                                        }
                             else:
                                 logger.info("Tool call: skill=%r command=%r", skill_name, command)
                                 result = execute_command(skill_name, command, enabled_names, context={

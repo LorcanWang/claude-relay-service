@@ -6,7 +6,8 @@ Every requires-confirmation tool call writes a doc here BEFORE executing.
 The frontend renders a confirm/cancel UI; on approve, it POSTs to the
 orchestrator's /pending-actions/{id}/confirm endpoint with the per-user
 nonce. The orchestrator marks status=confirmed; the next chat turn
-checks for confirmed-but-unexecuted entries and resumes.
+checks for confirmed-but-unexecuted entries (atomically, via
+claim_confirmed_for_execution) and resumes.
 
 Design (from the 10-round Codex review, R7 verdict):
   - Server-side authority — never trust client-side `confirmed: true` alone.
@@ -15,6 +16,13 @@ Design (from the 10-round Codex review, R7 verdict):
   - State machine: PENDING → CONFIRMED → EXECUTING → COMPLETED
                                       ↘ CANCELLED
                        PENDING → EXPIRED (background sweeper / lazy)
+
+Trust boundary note: the nonce is delivered to the requesting user inside the
+`awaiting_confirmation` tool envelope, which means it traverses the Anthropic
+API as part of the assistant message stream. We accept this trust assumption
+(Anthropic is a non-adversarial API provider). The userId binding remains the
+real defense: even if the nonce leaked, only the original requester (verified
+server-side via Firebase Auth) can confirm.
 """
 from __future__ import annotations
 
@@ -200,20 +208,42 @@ def confirm(pending_id: str, *, nonce: str, user_id: str) -> dict:
 
 
 def cancel(pending_id: str, *, user_id: str) -> dict:
+    """Cancel a pending or confirmed action. Transactional so it can't race
+    with claim_confirmed_for_execution — if resume already flipped the doc
+    to "executing", cancel returns bad_status.
+    """
     db = _get_db()
     if db is None:
         return {"ok": False, "error": "store_unavailable"}
+
     ref = db.collection(COLLECTION).document(pending_id)
-    snap = ref.get()
-    if not snap.exists:
-        return {"ok": False, "error": "not_found"}
-    pending = snap.to_dict() or {}
-    if pending.get("userId") != user_id:
-        return {"ok": False, "error": "wrong_user"}
-    if pending.get("status") not in ("pending", "confirmed"):
-        return {"ok": False, "error": f"bad_status: {pending.get('status')}"}
-    ref.update({"status": "cancelled", "cancelledAt": _now_iso()})
-    return {"ok": True}
+    outcome: dict = {"ok": False, "error": "unknown"}
+
+    try:
+        from firebase_admin import firestore as _fs
+        transaction = db.transaction()
+
+        @_fs.transactional
+        def _txn(txn):
+            snap = ref.get(transaction=txn)
+            if not snap.exists:
+                outcome.clear(); outcome["ok"] = False; outcome["error"] = "not_found"
+                return
+            pending = snap.to_dict() or {}
+            if pending.get("userId") != user_id:
+                outcome.clear(); outcome["ok"] = False; outcome["error"] = "wrong_user"
+                return
+            if pending.get("status") not in ("pending", "confirmed"):
+                outcome.clear(); outcome["ok"] = False
+                outcome["error"] = f"bad_status: {pending.get('status')}"
+                return
+            txn.update(ref, {"status": "cancelled", "cancelledAt": _now_iso()})
+            outcome.clear(); outcome["ok"] = True
+
+        _txn(transaction)
+    except Exception as exc:
+        return {"ok": False, "error": f"txn_failed: {exc}"}
+    return outcome
 
 
 def mark_executing(pending_id: str) -> bool:
@@ -258,6 +288,159 @@ def mark_completed(pending_id: str, result: dict | None = None) -> bool:
 
 
 _LIST_REDACT_FIELDS = {"nonce"}
+
+
+def claim_confirmed_for_execution(
+    org_id: str,
+    user_id: str,
+    skill: str,
+    command: str,
+) -> dict | None:
+    """Atomically find AND claim a confirmed pending action for execution.
+
+    Used by the dispatcher to detect "the user already approved this exact
+    command" AND flip the chosen doc from confirmed → executing in one
+    transaction. Two concurrent resume turns can't both win because the
+    transactional update is conditional on `status=="confirmed"` at commit.
+
+    Match criteria (same as the previous find-only version):
+      - org/user binding (only the requester's confirmation counts)
+      - argsHash exact match (model reformulation → no resume, gate again)
+      - status == "confirmed" at the moment we claim it
+      - not expired
+
+    Returns the claimed doc (with id, status now "executing") or None if
+    no eligible pending exists / another caller raced us.
+
+    Caller MUST follow with `mark_completed()` after running, success or
+    failure, so the audit log captures the outcome.
+    """
+    db = _get_db()
+    if db is None:
+        return None
+    target_hash = _hash_args(skill, command)
+    try:
+        # Query candidates outside the transaction to keep the txn small.
+        snap = (
+            db.collection(COLLECTION)
+            .where("orgId", "==", org_id)
+            .where("userId", "==", user_id)
+            .where("argsHash", "==", target_hash)
+            .where("status", "==", "confirmed")
+            .order_by("createdAt", direction="DESCENDING")
+            .limit(5)
+            .get()
+        )
+    except Exception as exc:
+        logger.warning("claim_confirmed: query failed: %s", exc)
+        return None
+
+    now = _now()
+    candidates: list[str] = []
+    for d in snap:
+        doc = d.to_dict() or {}
+        try:
+            if datetime.fromisoformat(doc.get("expiresAt", "")) < now:
+                continue
+        except Exception:
+            continue
+        if doc.get("id"):
+            candidates.append(doc["id"])
+
+    # Try to atomically claim each candidate in turn until one succeeds.
+    from firebase_admin import firestore as _fs
+
+    for pending_id in candidates:
+        ref = db.collection(COLLECTION).document(pending_id)
+        outcome: dict = {"ok": False}
+
+        try:
+            transaction = db.transaction()
+
+            @_fs.transactional
+            def _txn(txn):
+                snap2 = ref.get(transaction=txn)
+                if not snap2.exists:
+                    outcome.clear(); outcome["ok"] = False
+                    return
+                doc2 = snap2.to_dict() or {}
+                # Re-verify under the lock — another caller may have claimed,
+                # cancelled, or expired the doc since we listed it.
+                if doc2.get("status") != "confirmed":
+                    outcome.clear(); outcome["ok"] = False
+                    return
+                if doc2.get("argsHash") != target_hash:
+                    outcome.clear(); outcome["ok"] = False
+                    return
+                if doc2.get("userId") != user_id:
+                    outcome.clear(); outcome["ok"] = False
+                    return
+                try:
+                    if datetime.fromisoformat(doc2.get("expiresAt", "")) < _now():
+                        txn.update(ref, {"status": "expired"})
+                        outcome.clear(); outcome["ok"] = False
+                        return
+                except Exception:
+                    pass
+                txn.update(ref, {
+                    "status": "executing",
+                    "executedAt": _now_iso(),
+                })
+                doc2["status"] = "executing"
+                outcome.clear(); outcome["ok"] = True; outcome["doc"] = doc2
+
+            _txn(transaction)
+        except Exception as exc:
+            logger.warning("claim_confirmed: txn failed for %s: %s", pending_id, exc)
+            continue
+
+        if outcome.get("ok"):
+            logger.info(
+                "Claimed confirmed pending for execution: id=%s skill=%s",
+                pending_id, skill,
+            )
+            return outcome["doc"]
+    return None
+
+
+def find_confirmed_for_resume(
+    org_id: str,
+    user_id: str,
+    skill: str,
+    command: str,
+) -> dict | None:
+    """DEPRECATED — kept for backward compat. Use claim_confirmed_for_execution
+    instead, which atomically flips the status to "executing" so two concurrent
+    resumes can't both run.
+    """
+    db = _get_db()
+    if db is None:
+        return None
+    target_hash = _hash_args(skill, command)
+    try:
+        snap = (
+            db.collection(COLLECTION)
+            .where("orgId", "==", org_id)
+            .where("userId", "==", user_id)
+            .where("argsHash", "==", target_hash)
+            .where("status", "==", "confirmed")
+            .order_by("createdAt", direction="DESCENDING")
+            .limit(5)
+            .get()
+        )
+    except Exception as exc:
+        logger.warning("find_confirmed_for_resume query failed: %s", exc)
+        return None
+    now = _now()
+    for d in snap:
+        doc = d.to_dict() or {}
+        try:
+            if datetime.fromisoformat(doc.get("expiresAt", "")) < now:
+                continue
+        except Exception:
+            continue
+        return doc
+    return None
 
 
 def list_pending_for_user(org_id: str, user_id: str, limit: int = 20) -> list[dict]:
