@@ -459,7 +459,25 @@ def get_cross_entity_memories(
         candidates.append(data)
 
     candidates.sort(key=lambda d: d["_finalScore"], reverse=True)
-    return candidates[:limit]
+    final = candidates[:limit]
+
+    # Increment bridgeHits counter on each memory that actually made the cut
+    # so admins can see which memories are load-bearing across rooms.
+    if final:
+        try:
+            from firebase_admin import firestore as _fs
+            for d in final:
+                doc_id = d.get("id")
+                if not doc_id:
+                    continue
+                db.collection("hermesMemories").document(doc_id).update({
+                    "bridgeHits": _fs.Increment(1),
+                    "lastBridgedAt": _now_iso(),
+                })
+        except Exception as exc:
+            logger.debug("bridgeHits increment failed: %s", exc)
+
+    return final
 
 
 def get_room_cross_room_orgs(room_id: str, default_org_id: str) -> list[str]:
@@ -485,6 +503,22 @@ ROOM_REGISTRY_CAP = int(os.environ.get("HERMES_ROOM_REGISTRY_CAP", "50"))
 ROOM_REGISTRY_PROMOTION_THRESHOLD = 2  # observationCount needed before entity goes "active"
 
 
+def _fetch_room_entity_hints(db, room_id: str) -> list[dict]:
+    """Read admin-set entity hints from the chatRoom doc."""
+    if not room_id:
+        return []
+    try:
+        doc = db.collection("chatRooms").document(room_id).get()
+        if doc.exists:
+            data = doc.to_dict() or {}
+            hints = data.get("roomEntityHints") or []
+            if isinstance(hints, list):
+                return [h for h in hints if isinstance(h, dict) and h.get("kind") and h.get("id")]
+    except Exception as exc:
+        logger.debug("Failed to read room hints %s: %s", room_id, exc)
+    return []
+
+
 def update_room_registry(
     org_id: str,
     room_id: str,
@@ -500,6 +534,10 @@ def update_room_registry(
     hits ROOM_REGISTRY_PROMOTION_THRESHOLD, then flip to `active`. LFU
     eviction once active-count exceeds ROOM_REGISTRY_CAP; pinned entities
     (admin-seeded) never evict.
+
+    Also syncs admin-set roomEntityHints from the chatRoom doc — any hints
+    not already pinned in the registry get promoted here. Removed hints get
+    un-pinned (but stay in registry as regular entries that can still evict).
     """
     db = _get_db()
     if not db or not observed:
@@ -509,6 +547,10 @@ def update_room_registry(
 
     profile_key = f"room:{org_id}:{room_id}"
     ref = db.collection("hermesProfiles").document(profile_key)
+
+    # Read admin hints once outside the transaction (non-critical sync).
+    hints_list = _fetch_room_entity_hints(db, room_id)
+    hints_by_key = {f"{h['kind']}:{h['id']}": h for h in hints_list}
 
     now = _now_iso()
     observed_by_key: dict[str, dict] = {}
@@ -539,6 +581,29 @@ def update_room_registry(
         snap = ref.get(transaction=tx)
         data = snap.to_dict() if snap.exists else {}
         registry = dict(data.get("entityRegistry") or {})
+
+        # Sync admin hints first: add pinned entries for any hints not yet in
+        # registry, and un-pin registry entries whose key was removed from hints.
+        current_pinned_keys = {k for k, v in registry.items() if v.get("pinned")}
+        hint_keys = set(hints_by_key.keys())
+        for key in hint_keys - current_pinned_keys:
+            h = hints_by_key[key]
+            existing = registry.get(key) or {}
+            registry[key] = {
+                "kind": h["kind"],
+                "id": h["id"],
+                "label": h.get("label") or existing.get("label") or h["id"],
+                "observationCount": int(existing.get("observationCount", 0)),
+                "maxImportance": int(existing.get("maxImportance", 50)),
+                "firstObservedAt": existing.get("firstObservedAt", now),
+                "lastObservedAt": now,
+                "pinned": True,
+                "status": "active",
+            }
+        for key in current_pinned_keys - hint_keys:
+            entry = registry.get(key)
+            if entry:
+                entry["pinned"] = False  # keep data, just un-pin; next eviction may drop it
 
         for key, obs in observed_by_key.items():
             existing = registry.get(key) or {}
