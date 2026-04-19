@@ -60,8 +60,11 @@ from pending_actions import (
     create_pending as create_pending_action,
     confirm as confirm_pending_action,
     cancel as cancel_pending_action,
-    list_pending_for_user,
+    list_pending_for_user,            # backward-compat alias
+    list_pending_for_requester,
+    list_pending_for_supervisor,
     claim_confirmed_for_execution,
+    claim_specific_for_execution,
     mark_completed as mark_pending_completed,
 )
 from stream import sse, sse_agent_status, sse_agent_switch, stream_error
@@ -865,7 +868,12 @@ def clear_session_endpoint(req: ClearSessionRequest, _=Depends(verify_token)):
 
 
 class ConfirmPendingRequest(BaseModel):
-    nonce: str
+    """Body for POST /pending-actions/{id}/confirm.
+
+    The Next.js proxy derives userId from Firebase Auth and passes it here;
+    callers MUST NOT trust this from a public-facing client. Nonce was
+    removed in phase 6c — supervisor membership + auth is the new authority.
+    """
     userId: str
 
 
@@ -875,24 +883,106 @@ def confirm_pending_endpoint(
     req: ConfirmPendingRequest,
     _=Depends(verify_token),
 ):
-    """Mark a pending action as confirmed. Frontend POSTs here when the user
-    clicks Approve in the confirmation card. Validates the per-user nonce
-    (issued at create-time) and the requester's user_id; never trusts a bare
-    `confirmed: true` from the client.
+    """Approve a pending action AND immediately execute it server-side.
+
+    Authority rules (enforced inside confirm_pending_action):
+      - userId must be in pending.roomSupervisorUserIds (snapshot)
+      - high-stakes (affectsAdSpend or destructive) actions reject self-
+        approval (caller != requester)
+
+    On approve: atomically claim the doc (confirmed → executing), run the
+    stored skill+command server-side, mark completed with result summary.
+    No chat resume needed.
     """
-    result = confirm_pending_action(pending_id, nonce=req.nonce, user_id=req.userId)
+    result = confirm_pending_action(pending_id, user_id=req.userId)
     if not result.get("ok"):
-        # Map common errors to HTTP statuses for clearer UX. Note bad_status
-        # may carry a suffix (e.g. "bad_status: confirmed") — match by prefix.
         err = result.get("error", "") or ""
         if err == "not_found":
             raise HTTPException(status_code=404, detail=err)
-        if err in ("bad_nonce", "wrong_user"):
+        if err in ("not_supervisor", "self_approval_forbidden"):
             raise HTTPException(status_code=403, detail=err)
         if err == "expired" or err == "bad_status" or err.startswith("bad_status:"):
             raise HTTPException(status_code=409, detail=err)
         raise HTTPException(status_code=500, detail=err or "confirm_failed")
-    return {"ok": True, "pending": result["pending"]}
+
+    pending = result["pending"]
+    # Server-side execution — atomic claim then run.
+    claimed = claim_specific_for_execution(pending["id"])
+    if not claimed:
+        # Race: another approver / sweeper already executed or the doc
+        # transitioned. Confirmation succeeded but execution didn't fire here.
+        return {"ok": True, "pending": pending, "executed": False, "executionSkipped": True}
+
+    # Re-check the room's CURRENT enabled skills — if the skill was removed
+    # from the room after the pending was created, that's a revocation and we
+    # should refuse to execute even though the supervisor approved.
+    current_enabled: list[str] = []
+    try:
+        from hermes_store import _get_db as _gdb
+        _db = _gdb()
+        if _db is not None and pending.get("roomId"):
+            room_snap = _db.collection("chatRooms").document(pending["roomId"]).get()
+            if room_snap.exists:
+                room_doc = room_snap.to_dict() or {}
+                current_enabled = list(room_doc.get("agentIds") or [])
+    except Exception as _exc:
+        logger.warning("supervisor-exec: failed to recheck room enabled skills: %s", _exc)
+
+    skill_slug = _slugify_agent_id(pending["skill"])
+    if current_enabled and skill_slug not in current_enabled:
+        logger.warning(
+            "supervisor-exec REVOKED: skill=%s no longer enabled for room=%s",
+            pending["skill"], pending.get("roomId"),
+        )
+        mark_pending_completed(pending["id"], result={
+            "summary": "skill no longer enabled in room — execution refused",
+            "status": "error",
+        })
+        return {
+            "ok": True,
+            "pending": pending,
+            "executed": False,
+            "executionRevoked": True,
+        }
+
+    # Use the SNAPSHOT of skill_configs taken at create time — preserves
+    # requester intent (e.g. account_name=bannernprint) so the supervisor
+    # is approving the same action they reviewed, not a config-drifted one.
+    snap_configs = pending.get("skillConfigsSnapshot") or {}
+    snap_in_platform = bool(pending.get("inPlatformSnapshot", True))
+
+    exec_result = execute_command(
+        pending["skill"],
+        pending["command"],
+        # enabled_names check inside execute_command requires the skill itself.
+        # We've already revoked-checked above; pass the skill name explicitly.
+        [pending["skill"]],
+        context={
+            "org_id": pending.get("orgId"),
+            "user_id": pending.get("userId"),  # original requester
+            "session_id": pending.get("sessionId"),
+            "in_platform": snap_in_platform,
+            "skill_configs": snap_configs,
+            "room_id": pending.get("roomId"),
+        },
+    )
+    exec_ok = (
+        isinstance(exec_result, dict) and exec_result.get("ok") is not False
+    )
+    mark_pending_completed(pending["id"], result={
+        "summary": (pending.get("actionTitle") or pending.get("actionId") or "") + " executed",
+        "status": "ok" if exec_ok else "error",
+    })
+    logger.info(
+        "Supervisor-approved execution: id=%s skill=%s ok=%s by=%s",
+        pending["id"], pending["skill"], exec_ok, req.userId,
+    )
+    return {
+        "ok": True,
+        "pending": pending,
+        "executed": True,
+        "executionOk": exec_ok,
+    }
 
 
 class CancelPendingRequest(BaseModel):
@@ -905,13 +995,18 @@ def cancel_pending_endpoint(
     req: CancelPendingRequest,
     _=Depends(verify_token),
 ):
+    """Cancel a pending action. Caller must be EITHER the original requester
+    or a supervisor of the room (validated inside cancel_pending_action).
+    """
     result = cancel_pending_action(pending_id, user_id=req.userId)
     if not result.get("ok"):
         err = result.get("error", "")
         if err == "not_found":
             raise HTTPException(status_code=404, detail=err)
-        if err == "wrong_user":
+        if err == "not_authorized":
             raise HTTPException(status_code=403, detail=err)
+        if err == "bad_status" or err.startswith("bad_status:"):
+            raise HTTPException(status_code=409, detail=err)
         raise HTTPException(status_code=500, detail=err or "cancel_failed")
     return {"ok": True}
 
@@ -920,15 +1015,23 @@ def cancel_pending_endpoint(
 def list_pending_endpoint(
     orgId: str = Query(...),
     userId: str = Query(...),
+    role: str = Query("requester"),
     limit: int = Query(20),
     _=Depends(verify_token),
 ):
-    """Re-entry surface — returns non-terminal pending actions for a user
-    (status pending or confirmed). Used by the frontend on chat reopen so
-    the user sees 'you have N pending actions'.
+    """List pending actions. The `role` query param controls perspective:
+
+      - role=requester (default): actions THIS user requested (their outbox)
+      - role=supervisor: actions awaiting THIS user's approval (signoff queue)
+
+    The Next.js proxy MUST derive `userId` from Firebase Auth — never trust a
+    raw query param from a public-facing client.
     """
-    items = list_pending_for_user(orgId, userId, limit=min(limit, 100))
-    return {"ok": True, "items": items}
+    if role == "supervisor":
+        items = list_pending_for_supervisor(orgId, userId, limit=min(limit, 100))
+    else:
+        items = list_pending_for_requester(orgId, userId, limit=min(limit, 100))
+    return {"ok": True, "items": items, "role": role}
 
 
 @app.get("/status/stream")
@@ -1401,6 +1504,11 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                                         action_title=matched_action.get("title", ""),
                                         destructive=bool(matched_action.get("destructive")),
                                         affects_ad_spend=bool(matched_action.get("affectsAdSpend")),
+                                        # Snapshot the room's full skill configs so
+                                        # the supervisor-approved execution runs
+                                        # against the requester's intended account.
+                                        skill_configs=req.skillConfigs or {},
+                                        in_platform=bool(req.inPlatform),
                                     )
                                     _publish_agent_status(
                                         session_id,

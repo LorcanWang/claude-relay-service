@@ -61,6 +61,27 @@ def _hash_args(skill: str, command: str) -> str:
     return h.hexdigest()[:32]
 
 
+def _load_room_supervisors(db, room_id: str) -> list[str]:
+    """Read chatRoom.supervisorUserIds. Falls back to [createdBy] if missing,
+    or [] if the room itself doesn't exist (no approval is possible)."""
+    if not room_id:
+        return []
+    try:
+        snap = db.collection("chatRooms").document(room_id).get()
+    except Exception as exc:
+        logger.warning("Failed to load room %s supervisors: %s", room_id, exc)
+        return []
+    if not snap.exists:
+        return []
+    data = snap.to_dict() or {}
+    supers = data.get("supervisorUserIds") or []
+    if not supers:
+        creator = data.get("createdBy")
+        if creator:
+            return [creator]
+    return [s for s in supers if s]
+
+
 def create_pending(
     *,
     org_id: str,
@@ -73,17 +94,32 @@ def create_pending(
     action_title: str,
     destructive: bool = False,
     affects_ad_spend: bool = False,
+    skill_configs: dict | None = None,
+    in_platform: bool = True,
 ) -> dict | None:
-    """Create a pending action doc. Returns the created record (with id+nonce)
-    or None if Firestore is unavailable.
+    """Create a pending action doc. SNAPSHOTS the room's supervisorUserIds
+    onto the doc at create time so later supervisor edits don't retroactively
+    affect already-pending actions.
+
+    Returns the created record (with id) or None if Firestore is unavailable
+    OR the room has no supervisors assigned.
     """
     db = _get_db()
     if db is None:
         logger.warning("Firestore unavailable — cannot create pending action")
         return None
 
+    supervisors = _load_room_supervisors(db, room_id or "")
+    if not supervisors:
+        # Fail safe: no supervisors → no approval possible → don't create the
+        # pending. Caller's tool envelope will signal an error.
+        logger.warning(
+            "Refusing to create pending — room %s has no supervisors", room_id,
+        )
+        return None
+
     pending_id = uuid.uuid4().hex
-    nonce = secrets.token_urlsafe(24)
+    nonce = secrets.token_urlsafe(24)  # legacy field, no longer enforced
     now = _now()
     expires = now + timedelta(minutes=PENDING_TTL_MINUTES)
 
@@ -100,6 +136,16 @@ def create_pending(
         "argsHash": _hash_args(skill, command),
         "destructive": bool(destructive),
         "affectsAdSpend": bool(affects_ad_spend),
+        # Snapshot of who can approve this specific action. Frozen at create
+        # time — supervisor edits to the room don't retroactively affect this.
+        "roomSupervisorUserIds": supervisors,
+        # Snapshot of skill configs at create time so server-side execution
+        # after supervisor approval runs against the SAME account/context
+        # the requester intended (not a default that could drift). Without
+        # this snapshot, a Google Ads action approved 20 min after creation
+        # could run against a different campaign than the user reviewed.
+        "skillConfigsSnapshot": skill_configs or {},
+        "inPlatformSnapshot": bool(in_platform),
         "nonce": nonce,
         "status": "pending",
         "createdAt": now.isoformat(),
@@ -112,8 +158,8 @@ def create_pending(
     try:
         db.collection(COLLECTION).document(pending_id).set(doc)
         logger.info(
-            "Pending action created: id=%s skill=%s action=%s user=%s",
-            pending_id, skill, action_id, user_id,
+            "Pending action created: id=%s skill=%s action=%s requester=%s supervisors=%s",
+            pending_id, skill, action_id, user_id, supervisors,
         )
         return doc
     except Exception as exc:
@@ -135,20 +181,26 @@ def get_pending(pending_id: str) -> dict | None:
         return None
 
 
-def confirm(pending_id: str, *, nonce: str, user_id: str) -> dict:
-    """Validate nonce + user + freshness, mark CONFIRMED. Returns
-    {ok: bool, error?: str, pending?: dict}.
+def confirm(pending_id: str, *, user_id: str) -> dict:
+    """Mark a pending action CONFIRMED. Authority rules:
 
-    Uses a Firestore transaction so two concurrent confirms can't both flip
-    status — only one wins, the second returns bad_status.
+      1. caller must be in `pending.roomSupervisorUserIds` (snapshot)
+      2. for high-stakes actions (affectsAdSpend OR destructive) the caller
+         must NOT be the requester — no self-approval. Read-only and
+         persistence actions may be self-approved.
+      3. status must still be "pending" and not expired
+
+    Transactional so concurrent confirms can't both succeed. Nonce is
+    no longer enforced (legacy field) since chat-side approval buttons
+    were removed; supervisor membership + Firebase Auth is the new model.
+
+    Returns {ok: bool, error?: str, pending?: dict}.
     """
     db = _get_db()
     if db is None:
         return {"ok": False, "error": "store_unavailable"}
 
     ref = db.collection(COLLECTION).document(pending_id)
-
-    # Outcome from inside the transaction. Reassigned via closure.
     outcome: dict = {"ok": False, "error": "unknown"}
 
     try:
@@ -166,12 +218,22 @@ def confirm(pending_id: str, *, nonce: str, user_id: str) -> dict:
                 outcome.clear(); outcome["ok"] = False
                 outcome["error"] = f"bad_status: {pending.get('status')}"
                 return
-            if pending.get("nonce") != nonce:
-                outcome.clear(); outcome["ok"] = False; outcome["error"] = "bad_nonce"
+
+            # (1) Supervisor membership.
+            supers = pending.get("roomSupervisorUserIds") or []
+            if user_id not in supers:
+                outcome.clear(); outcome["ok"] = False
+                outcome["error"] = "not_supervisor"
                 return
-            if pending.get("userId") != user_id:
-                outcome.clear(); outcome["ok"] = False; outcome["error"] = "wrong_user"
+
+            # (2) Self-approval ban for high-stakes.
+            high_stakes = bool(pending.get("destructive")) or bool(pending.get("affectsAdSpend"))
+            if high_stakes and pending.get("userId") == user_id:
+                outcome.clear(); outcome["ok"] = False
+                outcome["error"] = "self_approval_forbidden"
                 return
+
+            # (3) Freshness.
             expires_at = pending.get("expiresAt")
             if expires_at:
                 try:
@@ -181,6 +243,7 @@ def confirm(pending_id: str, *, nonce: str, user_id: str) -> dict:
                         return
                 except Exception:
                     pass
+
             now_iso = _now_iso()
             txn.update(ref, {
                 "status": "confirmed",
@@ -197,7 +260,7 @@ def confirm(pending_id: str, *, nonce: str, user_id: str) -> dict:
         return {"ok": False, "error": f"txn_failed: {exc}"}
 
     if not outcome.get("ok"):
-        if outcome.get("error") in ("bad_nonce", "wrong_user"):
+        if outcome.get("error") in ("not_supervisor", "self_approval_forbidden"):
             logger.warning(
                 "confirm rejected: id=%s err=%s user=%s",
                 pending_id, outcome.get("error"), user_id,
@@ -208,9 +271,12 @@ def confirm(pending_id: str, *, nonce: str, user_id: str) -> dict:
 
 
 def cancel(pending_id: str, *, user_id: str) -> dict:
-    """Cancel a pending or confirmed action. Transactional so it can't race
-    with claim_confirmed_for_execution — if resume already flipped the doc
-    to "executing", cancel returns bad_status.
+    """Cancel a pending or confirmed action. Authority — caller must be EITHER:
+      - the original requester (cancel your own request before approval), OR
+      - a supervisor of the room (kill anything that shouldn't run)
+
+    Transactional so it can't race with claim_confirmed_for_execution — if
+    resume already flipped to "executing", cancel returns bad_status.
     """
     db = _get_db()
     if db is None:
@@ -230,14 +296,22 @@ def cancel(pending_id: str, *, user_id: str) -> dict:
                 outcome.clear(); outcome["ok"] = False; outcome["error"] = "not_found"
                 return
             pending = snap.to_dict() or {}
-            if pending.get("userId") != user_id:
-                outcome.clear(); outcome["ok"] = False; outcome["error"] = "wrong_user"
+            is_requester = pending.get("userId") == user_id
+            supers = pending.get("roomSupervisorUserIds") or []
+            is_supervisor = user_id in supers
+            if not (is_requester or is_supervisor):
+                outcome.clear(); outcome["ok"] = False; outcome["error"] = "not_authorized"
                 return
             if pending.get("status") not in ("pending", "confirmed"):
                 outcome.clear(); outcome["ok"] = False
                 outcome["error"] = f"bad_status: {pending.get('status')}"
                 return
-            txn.update(ref, {"status": "cancelled", "cancelledAt": _now_iso()})
+            txn.update(ref, {
+                "status": "cancelled",
+                "cancelledAt": _now_iso(),
+                "cancelledBy": user_id,
+                "cancelledByRole": "supervisor" if is_supervisor else "requester",
+            })
             outcome.clear(); outcome["ok"] = True
 
         _txn(transaction)
@@ -403,6 +477,59 @@ def claim_confirmed_for_execution(
     return None
 
 
+def claim_specific_for_execution(pending_id: str) -> dict | None:
+    """Atomically flip a specific pending from confirmed → executing.
+    Returns the claimed doc on success, None if the doc isn't in
+    "confirmed" state (already executing, completed, cancelled, or
+    expired). Caller MUST run the command and call mark_completed.
+
+    Used by the /hive/signoff approve handler to execute the action
+    server-side in the same request as the confirmation. Different from
+    claim_confirmed_for_execution (chat resume path), which searches by
+    skill+command rather than id.
+    """
+    db = _get_db()
+    if db is None:
+        return None
+    ref = db.collection(COLLECTION).document(pending_id)
+    outcome: dict = {"ok": False}
+    try:
+        from firebase_admin import firestore as _fs
+        transaction = db.transaction()
+
+        @_fs.transactional
+        def _txn(txn):
+            snap = ref.get(transaction=txn)
+            if not snap.exists:
+                outcome.clear(); outcome["ok"] = False
+                return
+            doc = snap.to_dict() or {}
+            if doc.get("status") != "confirmed":
+                outcome.clear(); outcome["ok"] = False
+                return
+            try:
+                if datetime.fromisoformat(doc.get("expiresAt", "")) < _now():
+                    txn.update(ref, {"status": "expired"})
+                    outcome.clear(); outcome["ok"] = False
+                    return
+            except Exception:
+                pass
+            txn.update(ref, {
+                "status": "executing",
+                "executedAt": _now_iso(),
+            })
+            doc["status"] = "executing"
+            outcome.clear(); outcome["ok"] = True; outcome["doc"] = doc
+
+        _txn(transaction)
+    except Exception as exc:
+        logger.warning("claim_specific: txn failed for %s: %s", pending_id, exc)
+        return None
+    if outcome.get("ok"):
+        return outcome["doc"]
+    return None
+
+
 def find_confirmed_for_resume(
     org_id: str,
     user_id: str,
@@ -443,14 +570,16 @@ def find_confirmed_for_resume(
     return None
 
 
-def list_pending_for_user(org_id: str, user_id: str, limit: int = 20) -> list[dict]:
-    """Used by the frontend re-entry surface ('you have N pending actions').
+def _strip_redacted(doc: dict) -> dict:
+    out = dict(doc)
+    for k in _LIST_REDACT_FIELDS:
+        out.pop(k, None)
+    return out
 
-    Strips `nonce` from the returned docs — the nonce is the auth secret the
-    client uses to confirm. The client already has it from the original
-    awaiting_confirmation tool envelope; the list endpoint returning it would
-    let any caller with a valid token enumerate confirmation tokens for any
-    user_id they pass.
+
+def list_pending_for_requester(org_id: str, user_id: str, limit: int = 20) -> list[dict]:
+    """Pending actions THIS USER requested (their own outbox / read-only history).
+    Strips the legacy `nonce` field before returning.
     """
     db = _get_db()
     if db is None:
@@ -465,13 +594,35 @@ def list_pending_for_user(org_id: str, user_id: str, limit: int = 20) -> list[di
             .limit(limit)
             .get()
         )
-        out = []
-        for d in snap:
-            doc = d.to_dict() or {}
-            for k in _LIST_REDACT_FIELDS:
-                doc.pop(k, None)
-            out.append(doc)
-        return out
+        return [_strip_redacted(d.to_dict() or {}) for d in snap]
     except Exception as exc:
-        logger.warning("list_pending_for_user failed: %s", exc)
+        logger.warning("list_pending_for_requester failed: %s", exc)
         return []
+
+
+def list_pending_for_supervisor(org_id: str, user_id: str, limit: int = 50) -> list[dict]:
+    """Pending actions awaiting THIS USER's approval — i.e. the user is in
+    `roomSupervisorUserIds` of pending actions whose status is "pending".
+    Used by the /hive/signoff dashboard.
+    """
+    db = _get_db()
+    if db is None:
+        return []
+    try:
+        snap = (
+            db.collection(COLLECTION)
+            .where("orgId", "==", org_id)
+            .where("status", "==", "pending")
+            .where("roomSupervisorUserIds", "array_contains", user_id)
+            .order_by("createdAt", direction="DESCENDING")
+            .limit(limit)
+            .get()
+        )
+        return [_strip_redacted(d.to_dict() or {}) for d in snap]
+    except Exception as exc:
+        logger.warning("list_pending_for_supervisor failed: %s", exc)
+        return []
+
+
+# Backward-compat alias — older imports may still reference list_pending_for_user.
+list_pending_for_user = list_pending_for_requester
