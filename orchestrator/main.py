@@ -1520,7 +1520,6 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                                     if pending_doc:
                                         pending_payload = {
                                             "id": pending_doc["id"],
-                                            "nonce": pending_doc["nonce"],
                                             "actionId": matched_action.get("id"),
                                             "actionTitle": matched_action.get("title"),
                                             "command": command,
@@ -1528,6 +1527,12 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                                             "destructive": bool(matched_action.get("destructive")),
                                             "affectsAdSpend": bool(matched_action.get("affectsAdSpend")),
                                             "expiresAt": pending_doc["expiresAt"],
+                                            # Phase 6c: requester is exposed so the inline card
+                                            # UI can decide whether to show the requester-only
+                                            # "Cancel my request" button. Approval lives on
+                                            # /hive/signoff and is gated server-side by supervisor
+                                            # membership — the UI hint is not security.
+                                            "requesterUserId": req.userId or "",
                                         }
                                         # Surface the pending action to the UI as a
                                         # data-action so the inline Approve/Cancel
