@@ -268,6 +268,48 @@ def build_skill_index(enabled_skills: list[dict], skill_configs: dict | None = N
     return "\n".join(lines)
 
 
+def build_background_skills_block(enabled_skills: list[dict]) -> str:
+    """List skills that are enabled for the room but hidden from model invocation.
+
+    These run automatically via orchestrator-side pipelines (e.g. crm-notes is
+    triggered by the Hermes note-taker on every turn). The model can't call
+    them, but it should KNOW they exist so it doesn't tell the user "I can't
+    do X" when X is actually being handled in the background. This block is
+    informational only — there is no tool the model can invoke against these.
+    """
+    if not enabled_skills:
+        return ""
+    hidden = [s for s in enabled_skills if not is_model_invocable(s.get("name", ""))]
+    if not hidden:
+        return ""
+    lines = ["## Background Skills (running automatically — you cannot invoke these)"]
+    for skill in hidden:
+        name = skill.get("name", "")
+        manifest = load_agent_manifest(name) or {}
+        desc = (
+            (_manifest_field(manifest, "description") or skill.get("description") or "")
+        ).strip()
+        when = (
+            _manifest_field(manifest, "whenToUse", "when-to-use", "when_to_use") or ""
+        ).strip()
+        if len(desc) > 220:
+            desc = desc[:217] + "..."
+        if len(when) > 220:
+            when = when[:217] + "..."
+        head = f"- **{name}** — {desc}" if desc else f"- **{name}**"
+        lines.append(head)
+        if when:
+            lines.append(f"  _{when}_")
+    lines.append("")
+    lines.append(
+        "When the user asks about something covered by a background skill, do NOT "
+        "say 'I can't do that here' — explain how the background pipeline handles it "
+        "(e.g. 'CRM notes are written automatically as we talk') and continue helping "
+        "with the substance of their question."
+    )
+    return "\n".join(lines)
+
+
 def build_system_prompt(
     base_prompt: str,
     enabled_skills: list[dict],
@@ -313,9 +355,15 @@ def build_system_prompt(
         )
         if in_platform:
             ctx_lines.append(
-                "The user is inside the platform. Prefer app_action(navigate) to send them to "
-                "the relevant page rather than printing full data tables. Always write a clear "
-                "text answer summarizing what you found, THEN call app_action."
+                "The user is inside the platform. When you have data to show, prefer "
+                "app_action(navigate) over printing huge tables. Always write a clear text "
+                "summary first, then call app_action.\n"
+                "IMPORTANT: the skills listed above are tools you happen to have, NOT the "
+                "boundary of what you can discuss. Engage with whatever the user asks — "
+                "general advice, follow-ups, planning, recommendations — using your own "
+                "knowledge plus any relevant context. Only mention 'I don't have a tool for "
+                "X' if the user explicitly needs a tool action and there really isn't one. "
+                "Never refuse a topic because it doesn't match your enabled skill list."
             )
         if room_id:
             ctx_lines.append(
@@ -324,9 +372,13 @@ def build_system_prompt(
             )
     dynamic_tail = "\n".join(ctx_lines)
 
+    background_block = build_background_skills_block(enabled_skills)
+
     blocks: list[dict] = [{"type": "text", "text": stable_core}]
     if skill_index:
         blocks.append({"type": "text", "text": skill_index})
+    if background_block:
+        blocks.append({"type": "text", "text": background_block})
     if dynamic_tail:
         blocks.append({"type": "text", "text": dynamic_tail})
     return blocks
