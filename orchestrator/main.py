@@ -899,7 +899,7 @@ def confirm_pending_endpoint(
         err = result.get("error", "") or ""
         if err == "not_found":
             raise HTTPException(status_code=404, detail=err)
-        if err in ("not_supervisor", "self_approval_forbidden"):
+        if err == "not_supervisor":
             raise HTTPException(status_code=403, detail=err)
         if err == "expired" or err == "bad_status" or err.startswith("bad_status:"):
             raise HTTPException(status_code=409, detail=err)

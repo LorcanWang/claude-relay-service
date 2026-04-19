@@ -185,14 +185,15 @@ def confirm(pending_id: str, *, user_id: str) -> dict:
     """Mark a pending action CONFIRMED. Authority rules:
 
       1. caller must be in `pending.roomSupervisorUserIds` (snapshot)
-      2. for high-stakes actions (affectsAdSpend OR destructive) the caller
-         must NOT be the requester — no self-approval. Read-only and
-         persistence actions may be self-approved.
-      3. status must still be "pending" and not expired
+      2. status must still be "pending" and not expired
+
+    Self-approval is allowed — supervisor membership is the policy. If
+    you want segregation of duties, assign a different supervisor in
+    the room settings.
 
     Transactional so concurrent confirms can't both succeed. Nonce is
     no longer enforced (legacy field) since chat-side approval buttons
-    were removed; supervisor membership + Firebase Auth is the new model.
+    were removed; supervisor membership + Firebase Auth is the model.
 
     Returns {ok: bool, error?: str, pending?: dict}.
     """
@@ -226,14 +227,7 @@ def confirm(pending_id: str, *, user_id: str) -> dict:
                 outcome["error"] = "not_supervisor"
                 return
 
-            # (2) Self-approval ban for high-stakes.
-            high_stakes = bool(pending.get("destructive")) or bool(pending.get("affectsAdSpend"))
-            if high_stakes and pending.get("userId") == user_id:
-                outcome.clear(); outcome["ok"] = False
-                outcome["error"] = "self_approval_forbidden"
-                return
-
-            # (3) Freshness.
+            # (2) Freshness.
             expires_at = pending.get("expiresAt")
             if expires_at:
                 try:
@@ -260,7 +254,7 @@ def confirm(pending_id: str, *, user_id: str) -> dict:
         return {"ok": False, "error": f"txn_failed: {exc}"}
 
     if not outcome.get("ok"):
-        if outcome.get("error") in ("not_supervisor", "self_approval_forbidden"):
+        if outcome.get("error") == "not_supervisor":
             logger.warning(
                 "confirm rejected: id=%s err=%s user=%s",
                 pending_id, outcome.get("error"), user_id,
