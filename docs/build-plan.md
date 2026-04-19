@@ -78,9 +78,9 @@ Standardized `{status, summary, data?, error?, stderr?, stdout?, meta?}` shape. 
 
 ---
 
-## Phase 6 — Confirmation flow (modal + Firestore-backed)
+## Phase 6 — Confirmation flow (supervisor signoff dashboard)
 
-🔄 in progress
+✅ shipped (6a–6c, 4 commits per repo)
 
 ### 6a — Backend gate ✅ shipped `7cf973e`
 - New `orchestrator/pending_actions.py` module with create/confirm/cancel/list/mark_executing/mark_completed
@@ -90,6 +90,30 @@ Standardized `{status, summary, data?, error?, stderr?, stdout?, meta?}` shape. 
 - `confirm()` uses Firestore transaction (concurrent confirms can't both succeed)
 - `list_pending_for_user` redacts `nonce` field
 - Fail-safe: store unavailable → dispatcher returns error, never executes ungated
+
+### 6c — Supervisor signoff dashboard ✅ shipped (zeon `b9c4802`/`5a4caa3`/`23d5a9a` + relay `17dcb7c`/`7ec5114`)
+
+Major architectural shift: per-user nonce model replaced with supervisor-membership model (user feedback: "imagine an employee trying to increase budget without approval — the approval place should be on a different dashboard, only the user assigned as supervisor of the room can approve").
+
+- Schema: `chatRoom.supervisorUserIds` snapshot onto each pending at create time. Backfill script applied for prod rooms (BNP + AALYN both default to creator = Bruce).
+- Backend (`pending_actions.py`):
+  - `confirm()` validates supervisor membership (snapshot), bans self-approval on high-stakes (affectsAdSpend OR destructive)
+  - `cancel()` allows requester or supervisor (dual-path, records cancelledByRole)
+  - `claim_specific_for_execution(id)` — atomic claim by id for supervisor approve handler
+  - `list_pending_for_supervisor` / `list_pending_for_requester`
+  - Snapshots `skillConfigsSnapshot` so approve runs against requester's intended account
+- Backend (`main.py`):
+  - `POST /pending-actions/{id}/confirm` — atomic claim then `execute_command` server-side. Re-checks current room's enabled skills (revokes if removed). Returns `{ok, executed, executionOk, executionRevoked}`. No chat resume needed.
+  - Drops nonce, adds `requesterUserId` to data-action payload for the read-only chat card.
+- Frontend:
+  - Inline card → read-only with "Open Sign-off" link + requester-only "Cancel my request"
+  - `/hive/signoff` page with live Firestore sync, grouped by room, Approve/Cancel UI
+  - "Sign-off" button on Hive list header
+  - Admin-only "Supervisors" UserSearchSelect in room edit dialog
+  - Hard-delete sweeps non-terminal pendingActions for the room
+- Firestore: new indexes on pendingActions (supervisor / requester / room queries) + rules (read for supervisor or requester; writes server-only)
+- Defense-in-depth: room PUT route strips supervisorUserIds from body if caller isn't admin
+- Self-approval ban: enforced server-side in `confirm()` AND surfaced in UI via disabled Approve button when caller IS the requester on a high-stakes action
 
 ### 6b — Frontend card + resume execution ✅ shipped `2d2c905` (relay) + `b79dcc1` (zeon)
 - Backend resume: new `claim_confirmed_for_execution` does an atomic Firestore txn check-confirmed-and-flip-to-executing (replaces the racy find+blind-update). `cancel` also transactional now.
