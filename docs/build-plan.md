@@ -91,11 +91,14 @@ Standardized `{status, summary, data?, error?, stderr?, stdout?, meta?}` shape. 
 - `list_pending_for_user` redacts `nonce` field
 - Fail-safe: store unavailable → dispatcher returns error, never executes ungated
 
-### 6b — Frontend modal/card + resume execution ⏳ next
-- `app/api/pending-actions/[id]/confirm/route.ts` (Next.js proxy → orchestrator)
-- Detect `status === "awaiting_confirmation"` in tool envelope, render Approve/Cancel card inline
-- After confirm, send a synthetic `[confirmed:{id}]` user message
-- Orchestrator detects this pattern, looks up pending, validates status=confirmed + userId + argsHash, calls `mark_executing`, runs the original command, calls `mark_completed`
+### 6b — Frontend card + resume execution ✅ shipped `2d2c905` (relay) + `b79dcc1` (zeon)
+- Backend resume: new `claim_confirmed_for_execution` does an atomic Firestore txn check-confirmed-and-flip-to-executing (replaces the racy find+blind-update). `cancel` also transactional now.
+- Next.js proxy routes: `app/api/pending-actions/[id]/confirm` and `.../cancel`. userId derived from auth (never trusted from client); nonce passes through to orchestrator.
+- `pending-action-card.tsx` (NEW): inline card inside the assistant message bubble with action title, command preview, destructive/affectsAdSpend badges, Approve/Cancel buttons.
+- `chat-message.tsx`: `_extractPendingActions` walks parts (handles v6 + legacy shapes), renders card per match.
+- `chat-interface.tsx`: `handlePendingApproved` auto-sends "Approved — please proceed with X." via useChat → orchestrator's resume path executes transparently.
+- UI copy: "Approved — running now…" (not "next turn", since auto-fires).
+- Codex two-pass review: af6221d6923b3bb13 → fix-first on race + cancel txn → a007edc8643e8daea → commit.
 
 ### 6c — Re-entry surface ⏳ later
 - On room load, query `GET /pending-actions` for non-terminal entries
