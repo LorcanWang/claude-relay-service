@@ -49,7 +49,7 @@ from anthropic_client import (
 )
 from executor import execute_command
 from session import clear_session, get_session, new_session, save_session
-from skill_loader import build_system_prompt, load_skill_doc
+from skill_loader import build_system_prompt, load_skill_doc, is_model_invocable
 from stream import sse, sse_agent_status, sse_agent_switch, stream_error
 from mcp_config import collect_mcp_configs
 from mcp_manager import MCPManager
@@ -1147,12 +1147,15 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                     elif tool_name == "describe_skill":
                         skill_name = (inp.get("name") or "").strip()
                         enabled_set = {s.name for s in effective_skills}
-                        if skill_name not in enabled_set:
+                        # Skills with disableModelInvocation are hidden from the
+                        # model — also block describe_skill from peeking at their docs.
+                        invocable_set = {n for n in enabled_set if is_model_invocable(n)}
+                        if skill_name not in invocable_set:
                             result = {
                                 "ok": False,
                                 "error": (
                                     f"Skill '{skill_name}' is not enabled for this room. "
-                                    f"Available: {sorted(enabled_set)}"
+                                    f"Available: {sorted(invocable_set)}"
                                 ),
                             }
                         else:
@@ -1183,26 +1186,41 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                         command = inp.get("command", "")
                         skill_id = _slugify_agent_id(skill_name)
                         preview = command.strip()[:120] if isinstance(command, str) else ""
-                        _publish_agent_switch(session_id, "lynx", skill_id, f"Delegating to {skill_name}")
-                        _publish_agent_status(session_id, skill_id, "working", preview or "Running command")
-                        logger.info("Tool call: skill=%r command=%r", skill_name, command)
-                        result = execute_command(skill_name, command, enabled_names, context={
-                            "org_id": req.orgId,
-                            "user_id": req.userId,
-                            "session_id": session_id,
-                            "in_platform": req.inPlatform,
-                            "skill_configs": req.skillConfigs or {},
-                            "room_id": req.roomId,
-                        })
-                        logger.info("Tool result ok=%s", result.get("ok", True) if isinstance(result, dict) else True)
-                        note = result.get("agentNote") if isinstance(result, dict) else ""
-                        _publish_agent_status(
-                            session_id,
-                            skill_id,
-                            "completed",
-                            note or "Done",
-                        )
-                        _publish_agent_switch(session_id, skill_id, "lynx", "Returned to Lynx")
+                        # Block run_command on disableModelInvocation skills — model
+                        # could otherwise guess the name and bypass the index/docs filter.
+                        if skill_name and not is_model_invocable(skill_name):
+                            logger.warning(
+                                "Refused run_command on hidden skill %r (disableModelInvocation)",
+                                skill_name,
+                            )
+                            result = {
+                                "ok": False,
+                                "error": (
+                                    f"Skill '{skill_name}' is not available to the model. "
+                                    "It is reserved for human/admin invocation."
+                                ),
+                            }
+                        else:
+                            _publish_agent_switch(session_id, "lynx", skill_id, f"Delegating to {skill_name}")
+                            _publish_agent_status(session_id, skill_id, "working", preview or "Running command")
+                            logger.info("Tool call: skill=%r command=%r", skill_name, command)
+                            result = execute_command(skill_name, command, enabled_names, context={
+                                "org_id": req.orgId,
+                                "user_id": req.userId,
+                                "session_id": session_id,
+                                "in_platform": req.inPlatform,
+                                "skill_configs": req.skillConfigs or {},
+                                "room_id": req.roomId,
+                            })
+                            logger.info("Tool result ok=%s", result.get("ok", True) if isinstance(result, dict) else True)
+                            note = result.get("agentNote") if isinstance(result, dict) else ""
+                            _publish_agent_status(
+                                session_id,
+                                skill_id,
+                                "completed",
+                                note or "Done",
+                            )
+                            _publish_agent_switch(session_id, skill_id, "lynx", "Returned to Lynx")
 
                     # ── Normalize into envelope ─────────────────────────
                     envelope = _build_tool_envelope(tool_name, inp, result)

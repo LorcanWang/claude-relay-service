@@ -65,17 +65,34 @@ def load_skill_doc(skill_name: str) -> str | None:
     return None
 
 
+# Manifest cache — process-lifetime. Avoids re-reading agent.json from disk on
+# every skill index build / describe_skill / invocability check (~25 skills × N
+# call sites per turn = a lot of redundant fs reads). Call clear_manifest_cache()
+# in tests or after editing a skill's agent.json without restarting the process.
+_MANIFEST_CACHE: dict[str, dict | None] = {}
+
+
+def clear_manifest_cache() -> None:
+    _MANIFEST_CACHE.clear()
+
+
 def load_agent_manifest(skill_name: str) -> dict | None:
-    """Return parsed agent.json for a skill, or None if not found."""
+    """Return parsed agent.json for a skill, or None if not found. Cached."""
     if ".." in skill_name or "/" in skill_name or "\\" in skill_name:
         return None
+    if skill_name in _MANIFEST_CACHE:
+        return _MANIFEST_CACHE[skill_name]
     manifest_path = SKILL_ROOT / skill_name / "agent.json"
     if not manifest_path.exists():
+        _MANIFEST_CACHE[skill_name] = None
         return None
     try:
-        return json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        _MANIFEST_CACHE[skill_name] = manifest
+        return manifest
     except Exception as exc:
         logger.warning("Failed to read agent.json for %s: %s", skill_name, exc)
+        _MANIFEST_CACHE[skill_name] = None
         return None
 
 
@@ -106,17 +123,49 @@ SKILL_USAGE_BLOCK = (
 )
 
 
+def _manifest_field(manifest: dict, *names: str):
+    """Read a manifest field, accepting both camelCase and kebab-case spellings."""
+    for n in names:
+        if n in manifest:
+            return manifest[n]
+    return None
+
+
 def _skill_index_line(skill: dict) -> str:
-    """Compact one-line entry for the skill index: `- name — description`."""
+    """Compact one-line entry for the skill index.
+
+    Format: `- name — description` plus an optional `(when: …)` clause from the
+    manifest's `whenToUse` field. The `whenToUse` line tells Claude when to
+    *reach* for the skill — distinct from `description` which says what the
+    skill *is*. Mirrors Claude Code's loadSkillsDir.ts pattern.
+    """
     name = skill.get("name", "")
     manifest = load_agent_manifest(name) or {}
-    desc = (manifest.get("description") or skill.get("description") or "").strip()
-    # Truncate overlong descriptions — the index is meant to be scannable.
+    desc = (
+        (_manifest_field(manifest, "description") or skill.get("description") or "")
+    ).strip()
     if len(desc) > 220:
         desc = desc[:217] + "..."
-    if desc:
-        return f"- **{name}** — {desc}"
-    return f"- **{name}**"
+    when_to_use = (_manifest_field(manifest, "whenToUse", "when-to-use", "when_to_use") or "").strip()
+    if len(when_to_use) > 200:
+        when_to_use = when_to_use[:197] + "..."
+
+    head = f"- **{name}** — {desc}" if desc else f"- **{name}**"
+    if when_to_use:
+        return f"{head}\n  _when: {when_to_use}_"
+    return head
+
+
+def is_model_invocable(skill_name: str) -> bool:
+    """Return False if the skill's manifest sets `disableModelInvocation: true`.
+
+    Lets us register admin-only / human-only skills that show up in the org's
+    enabled list (for visibility/config) but don't appear in the model-facing
+    skill index. Mirrors Claude Code's `disable-model-invocation` field.
+    """
+    manifest = load_agent_manifest(skill_name) or {}
+    flag = _manifest_field(manifest, "disableModelInvocation", "disable-model-invocation")
+    return not bool(flag)
 
 
 _SENSITIVE_KEY_HINTS = ("token", "secret", "key", "password", "credential", "api_key", "access_token")
@@ -133,11 +182,19 @@ def _redact_config_value(key: str, value) -> str:
 
 
 def build_skill_index(enabled_skills: list[dict], skill_configs: dict | None = None) -> str:
-    """Compact skill menu. Full docs are fetched lazily via the describe_skill tool."""
+    """Compact skill menu. Full docs are fetched lazily via the describe_skill tool.
+
+    Skills with `disableModelInvocation: true` in their manifest are filtered
+    out — they remain available in the org's enabled list (for config UI etc.)
+    but are not surfaced to the model.
+    """
     if not enabled_skills:
         return ""
+    visible = [s for s in enabled_skills if is_model_invocable(s.get("name", ""))]
+    if not visible:
+        return ""
     lines = ["## Available Skills"]
-    for skill in enabled_skills:
+    for skill in visible:
         lines.append(_skill_index_line(skill))
         name = skill.get("name", "")
         config = (skill_configs or {}).get(name, {})
