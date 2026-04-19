@@ -56,6 +56,12 @@ from skill_loader import (
     get_skill_actions,
     match_command_to_action,
 )
+from pending_actions import (
+    create_pending as create_pending_action,
+    confirm as confirm_pending_action,
+    cancel as cancel_pending_action,
+    list_pending_for_user,
+)
 from stream import sse, sse_agent_status, sse_agent_switch, stream_error
 from mcp_config import collect_mcp_configs
 from mcp_manager import MCPManager
@@ -279,13 +285,18 @@ def _build_tool_envelope(
     error = None
     stderr = None
     stdout = None
+    awaiting = None  # populated when raw signals confirmation gating
 
     # Always capture agentNote regardless of ok/fail so it survives into meta.
     if isinstance(raw, dict) and not agent_note:
         agent_note = raw.get("agentNote") or ""
 
     if isinstance(raw, dict):
-        if raw.get("ok") is False:
+        if raw.get("awaiting_confirmation"):
+            # Confirmation-gated action — short-circuit normal envelope shape.
+            awaiting = raw.get("pending") or {}
+            data = None
+        elif raw.get("ok") is False:
             ok = False
             error = raw.get("error") or "unknown error"
             stderr = raw.get("stderr")
@@ -305,7 +316,17 @@ def _build_tool_envelope(
         data = None
 
     # Build summary
-    if ok:
+    if awaiting:
+        title = awaiting.get("actionTitle") or awaiting.get("actionId") or "this action"
+        skill_n = awaiting.get("skill") or "skill"
+        flags = []
+        if awaiting.get("destructive"):
+            flags.append("destructive")
+        if awaiting.get("affectsAdSpend"):
+            flags.append("affects ad spend")
+        flag_str = f" [{', '.join(flags)}]" if flags else ""
+        summary = f"awaiting confirmation: {title} via {skill_n}{flag_str}"
+    elif ok:
         if tool_name == "app_action":
             action = (inp or {}).get("action") or "action"
             path = (inp or {}).get("path")
@@ -343,20 +364,28 @@ def _build_tool_envelope(
         else:
             data_serialized = data if not isinstance(data, str) else data_str
 
-    envelope: dict = {"status": "ok" if ok else "error", "summary": summary}
-    if ok:
-        if data_serialized is not None:
-            envelope["data"] = data_serialized
+    if awaiting:
+        # Distinct status so the model + UI can branch immediately.
+        envelope: dict = {
+            "status": "awaiting_confirmation",
+            "summary": summary,
+            "pending": awaiting,
+        }
     else:
-        # Clip error so a pathological failure can't blow the envelope budget.
-        err_str = str(error) if error is not None else "unknown error"
-        envelope["error"] = err_str if len(err_str) <= 1000 else err_str[:997] + "..."
-        if stderr:
-            s = str(stderr)
-            envelope["stderr"] = s if len(s) <= 2000 else s[-2000:]
-        if stdout:
-            s = str(stdout)
-            envelope["stdout"] = s if len(s) <= 2000 else s[-2000:]
+        envelope = {"status": "ok" if ok else "error", "summary": summary}
+        if ok:
+            if data_serialized is not None:
+                envelope["data"] = data_serialized
+        else:
+            # Clip error so a pathological failure can't blow the envelope budget.
+            err_str = str(error) if error is not None else "unknown error"
+            envelope["error"] = err_str if len(err_str) <= 1000 else err_str[:997] + "..."
+            if stderr:
+                s = str(stderr)
+                envelope["stderr"] = s if len(s) <= 2000 else s[-2000:]
+            if stdout:
+                s = str(stdout)
+                envelope["stdout"] = s if len(s) <= 2000 else s[-2000:]
 
     meta: dict = {}
     if truncated:
@@ -830,6 +859,76 @@ def clear_session_endpoint(req: ClearSessionRequest, _=Depends(verify_token)):
     return {"ok": True, "session_id": session_id}
 
 
+# ── Pending action confirmation endpoints ────────────────────────────────────
+
+
+class ConfirmPendingRequest(BaseModel):
+    nonce: str
+    userId: str
+
+
+@app.post("/pending-actions/{pending_id}/confirm")
+def confirm_pending_endpoint(
+    pending_id: str,
+    req: ConfirmPendingRequest,
+    _=Depends(verify_token),
+):
+    """Mark a pending action as confirmed. Frontend POSTs here when the user
+    clicks Approve in the confirmation card. Validates the per-user nonce
+    (issued at create-time) and the requester's user_id; never trusts a bare
+    `confirmed: true` from the client.
+    """
+    result = confirm_pending_action(pending_id, nonce=req.nonce, user_id=req.userId)
+    if not result.get("ok"):
+        # Map common errors to HTTP statuses for clearer UX. Note bad_status
+        # may carry a suffix (e.g. "bad_status: confirmed") — match by prefix.
+        err = result.get("error", "") or ""
+        if err == "not_found":
+            raise HTTPException(status_code=404, detail=err)
+        if err in ("bad_nonce", "wrong_user"):
+            raise HTTPException(status_code=403, detail=err)
+        if err == "expired" or err == "bad_status" or err.startswith("bad_status:"):
+            raise HTTPException(status_code=409, detail=err)
+        raise HTTPException(status_code=500, detail=err or "confirm_failed")
+    return {"ok": True, "pending": result["pending"]}
+
+
+class CancelPendingRequest(BaseModel):
+    userId: str
+
+
+@app.post("/pending-actions/{pending_id}/cancel")
+def cancel_pending_endpoint(
+    pending_id: str,
+    req: CancelPendingRequest,
+    _=Depends(verify_token),
+):
+    result = cancel_pending_action(pending_id, user_id=req.userId)
+    if not result.get("ok"):
+        err = result.get("error", "")
+        if err == "not_found":
+            raise HTTPException(status_code=404, detail=err)
+        if err == "wrong_user":
+            raise HTTPException(status_code=403, detail=err)
+        raise HTTPException(status_code=500, detail=err or "cancel_failed")
+    return {"ok": True}
+
+
+@app.get("/pending-actions")
+def list_pending_endpoint(
+    orgId: str = Query(...),
+    userId: str = Query(...),
+    limit: int = Query(20),
+    _=Depends(verify_token),
+):
+    """Re-entry surface — returns non-terminal pending actions for a user
+    (status pending or confirmed). Used by the frontend on chat reopen so
+    the user sees 'you have N pending actions'.
+    """
+    items = list_pending_for_user(orgId, userId, limit=min(limit, 100))
+    return {"ok": True, "items": items}
+
+
 @app.get("/status/stream")
 async def status_stream(
     session_id: str = Query(...),
@@ -1241,24 +1340,81 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                                         "Action gap: skill=%s command=%r — declare in manifest actions[]",
                                         skill_name, command[:200],
                                     )
-                            logger.info("Tool call: skill=%r command=%r", skill_name, command)
-                            result = execute_command(skill_name, command, enabled_names, context={
-                                "org_id": req.orgId,
-                                "user_id": req.userId,
-                                "session_id": session_id,
-                                "in_platform": req.inPlatform,
-                                "skill_configs": req.skillConfigs or {},
-                                "room_id": req.roomId,
-                            })
-                            logger.info("Tool result ok=%s", result.get("ok", True) if isinstance(result, dict) else True)
-                            note = result.get("agentNote") if isinstance(result, dict) else ""
-                            _publish_agent_status(
-                                session_id,
-                                skill_id,
-                                "completed",
-                                note or "Done",
-                            )
-                            _publish_agent_switch(session_id, skill_id, "lynx", "Returned to Lynx")
+
+                            # Phase 6: if the matched action requires confirmation,
+                            # write a pending-action doc and short-circuit execution.
+                            # The frontend (next phase) will render an Approve/Cancel
+                            # card from the awaiting_confirmation envelope. For now
+                            # the user can verify Firestore + curl-confirm.
+                            if (
+                                matched_action
+                                and matched_action.get("requiresConfirmation")
+                            ):
+                                pending_doc = create_pending_action(
+                                    org_id=req.orgId or "",
+                                    user_id=req.userId or "",
+                                    room_id=req.roomId,
+                                    session_id=session_id,
+                                    skill=skill_name,
+                                    command=command,
+                                    action_id=matched_action.get("id", ""),
+                                    action_title=matched_action.get("title", ""),
+                                    destructive=bool(matched_action.get("destructive")),
+                                    affects_ad_spend=bool(matched_action.get("affectsAdSpend")),
+                                )
+                                _publish_agent_status(
+                                    session_id,
+                                    skill_id,
+                                    "completed",
+                                    "Awaiting approval",
+                                )
+                                _publish_agent_switch(session_id, skill_id, "lynx", "Returned to Lynx")
+                                if pending_doc:
+                                    result = {
+                                        "ok": True,
+                                        "awaiting_confirmation": True,
+                                        "pending": {
+                                            "id": pending_doc["id"],
+                                            "actionId": matched_action.get("id"),
+                                            "actionTitle": matched_action.get("title"),
+                                            "command": command,
+                                            "skill": skill_name,
+                                            "destructive": bool(matched_action.get("destructive")),
+                                            "affectsAdSpend": bool(matched_action.get("affectsAdSpend")),
+                                            "expiresAt": pending_doc["expiresAt"],
+                                        },
+                                    }
+                                else:
+                                    # Firestore unavailable — fail safe: do NOT
+                                    # execute. Tell the model so it relays a clear
+                                    # error to the user.
+                                    result = {
+                                        "ok": False,
+                                        "error": (
+                                            "Confirmation store unavailable — "
+                                            "cannot gate this action safely. Please "
+                                            "retry in a moment."
+                                        ),
+                                    }
+                            else:
+                                logger.info("Tool call: skill=%r command=%r", skill_name, command)
+                                result = execute_command(skill_name, command, enabled_names, context={
+                                    "org_id": req.orgId,
+                                    "user_id": req.userId,
+                                    "session_id": session_id,
+                                    "in_platform": req.inPlatform,
+                                    "skill_configs": req.skillConfigs or {},
+                                    "room_id": req.roomId,
+                                })
+                                logger.info("Tool result ok=%s", result.get("ok", True) if isinstance(result, dict) else True)
+                                note = result.get("agentNote") if isinstance(result, dict) else ""
+                                _publish_agent_status(
+                                    session_id,
+                                    skill_id,
+                                    "completed",
+                                    note or "Done",
+                                )
+                                _publish_agent_switch(session_id, skill_id, "lynx", "Returned to Lynx")
 
                     # ── Normalize into envelope ─────────────────────────
                     envelope = _build_tool_envelope(
