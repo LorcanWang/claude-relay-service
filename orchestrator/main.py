@@ -49,7 +49,13 @@ from anthropic_client import (
 )
 from executor import execute_command
 from session import clear_session, get_session, new_session, save_session
-from skill_loader import build_system_prompt, load_skill_doc, is_model_invocable
+from skill_loader import (
+    build_system_prompt,
+    load_skill_doc,
+    is_model_invocable,
+    get_skill_actions,
+    match_command_to_action,
+)
 from stream import sse, sse_agent_status, sse_agent_switch, stream_error
 from mcp_config import collect_mcp_configs
 from mcp_manager import MCPManager
@@ -252,7 +258,15 @@ def _summarize_data(data) -> str:
     return type(data).__name__
 
 
-def _build_tool_envelope(tool_name: str, inp: dict, raw, *, agent_note: str = "") -> dict:
+def _build_tool_envelope(
+    tool_name: str,
+    inp: dict,
+    raw,
+    *,
+    agent_note: str = "",
+    matched_action: dict | None = None,
+    action_gap: bool = False,
+) -> dict:
     """Normalize any tool result to `{status, summary, data?, stderr?, stdout?, meta?}`.
 
     Claude scans the first keys of a JSON envelope first, so status and summary
@@ -349,6 +363,10 @@ def _build_tool_envelope(tool_name: str, inp: dict, raw, *, agent_note: str = ""
         meta["truncated"] = True
     if agent_note:
         meta["agentNote"] = str(agent_note)[:200]
+    if matched_action and matched_action.get("id"):
+        meta["action"] = matched_action["id"]
+    elif action_gap:
+        meta["action_gap"] = True
     if meta:
         envelope["meta"] = meta
     return envelope
@@ -1139,6 +1157,10 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                     tool_id = tool["id"]
                     tool_name = tool.get("name", "")
                     inp = tool.get("input", {})
+                    # Phase 2 manifest validation — populated only by the
+                    # run_command branch when the skill has actions[] declared.
+                    matched_action: dict | None = None
+                    action_gap = False
 
                     if tool_name == "app_action":
                         collected_actions.append(inp)
@@ -1203,6 +1225,22 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                         else:
                             _publish_agent_switch(session_id, "lynx", skill_id, f"Delegating to {skill_name}")
                             _publish_agent_status(session_id, skill_id, "working", preview or "Running command")
+                            # Phase 2 permissive validation: try to match the
+                            # command against the skill's declared actions
+                            # manifest. Log the result either way; do not block.
+                            if get_skill_actions(skill_name):
+                                matched_action = match_command_to_action(skill_name, command)
+                                if matched_action:
+                                    logger.info(
+                                        "Action matched: skill=%s action=%s",
+                                        skill_name, matched_action.get("id"),
+                                    )
+                                else:
+                                    action_gap = True
+                                    logger.warning(
+                                        "Action gap: skill=%s command=%r — declare in manifest actions[]",
+                                        skill_name, command[:200],
+                                    )
                             logger.info("Tool call: skill=%r command=%r", skill_name, command)
                             result = execute_command(skill_name, command, enabled_names, context={
                                 "org_id": req.orgId,
@@ -1223,7 +1261,13 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                             _publish_agent_switch(session_id, skill_id, "lynx", "Returned to Lynx")
 
                     # ── Normalize into envelope ─────────────────────────
-                    envelope = _build_tool_envelope(tool_name, inp, result)
+                    envelope = _build_tool_envelope(
+                        tool_name,
+                        inp,
+                        result,
+                        matched_action=matched_action,
+                        action_gap=action_gap,
+                    )
 
                     # ── Hermes: track tool execution ────────────────────
                     _hermes_tool_names.append(tool_name)

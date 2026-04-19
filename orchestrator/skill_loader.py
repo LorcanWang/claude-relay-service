@@ -156,6 +156,63 @@ def _skill_index_line(skill: dict) -> str:
     return head
 
 
+def get_skill_actions(skill_name: str) -> list[dict]:
+    """Return the declared `actions[]` from a skill's manifest, or [] if not declared.
+
+    Each action is a dict like:
+      {"id": "update_budget", "title": "Update campaign budget",
+       "readOnly": false, "requiresConfirmation": true, ...}
+
+    Phase 2 (current) uses this for permissive validation: when the model emits
+    a command, we tokenize it, look up the verb against this list, and tag the
+    tool envelope with `meta.action: "<id>"` on match or `meta.action_gap: true`
+    on miss. No execution is blocked — just observability while we discover
+    which actions need to be declared. Becomes authoritative in a later phase.
+    """
+    manifest = load_agent_manifest(skill_name) or {}
+    actions = _manifest_field(manifest, "actions") or []
+    if not isinstance(actions, list):
+        return []
+    return [a for a in actions if isinstance(a, dict) and a.get("id")]
+
+
+def match_command_to_action(skill_name: str, command: str) -> dict | None:
+    """Best-effort match of a `python3 X.py <verb> ...` command against the
+    skill's declared actions. Returns the matching action dict, or None.
+
+    Heuristic: take the first non-flag token after the script path. This works
+    for argparse-shaped CLIs (`python3 ads.py list_campaigns --status ENABLED`)
+    which is what every current skill uses. Manifest authors who later add a
+    different shape can extend by adding an explicit `commandPattern` field.
+    """
+    actions = get_skill_actions(skill_name)
+    if not actions or not isinstance(command, str):
+        return None
+    try:
+        import shlex
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    # Skip past `python3 <script>` (or any leading word + .py file)
+    verb = ""
+    seen_script = False
+    for tok in tokens:
+        if not seen_script:
+            if tok.endswith(".py") or tok.endswith(".sh"):
+                seen_script = True
+            continue
+        if tok.startswith("-"):
+            continue
+        verb = tok
+        break
+    if not verb:
+        return None
+    for action in actions:
+        if action.get("id") == verb:
+            return action
+    return None
+
+
 def is_model_invocable(skill_name: str) -> bool:
     """Return False if the skill's manifest sets `disableModelInvocation: true`.
 
