@@ -1410,20 +1410,31 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                                     )
                                     _publish_agent_switch(session_id, skill_id, "lynx", "Returned to Lynx")
                                     if pending_doc:
+                                        pending_payload = {
+                                            "id": pending_doc["id"],
+                                            "nonce": pending_doc["nonce"],
+                                            "actionId": matched_action.get("id"),
+                                            "actionTitle": matched_action.get("title"),
+                                            "command": command,
+                                            "skill": skill_name,
+                                            "destructive": bool(matched_action.get("destructive")),
+                                            "affectsAdSpend": bool(matched_action.get("affectsAdSpend")),
+                                            "expiresAt": pending_doc["expiresAt"],
+                                        }
+                                        # Surface the pending action to the UI as a
+                                        # data-action so the inline Approve/Cancel
+                                        # card renders. Tool envelopes are
+                                        # consumed server-side and never reach the
+                                        # frontend; data-action is the bridge
+                                        # (same channel as app_action).
+                                        collected_actions.append({
+                                            "action": "pending",
+                                            "pending": pending_payload,
+                                        })
                                         result = {
                                             "ok": True,
                                             "awaiting_confirmation": True,
-                                            "pending": {
-                                                "id": pending_doc["id"],
-                                                "nonce": pending_doc["nonce"],
-                                                "actionId": matched_action.get("id"),
-                                                "actionTitle": matched_action.get("title"),
-                                                "command": command,
-                                                "skill": skill_name,
-                                                "destructive": bool(matched_action.get("destructive")),
-                                                "affectsAdSpend": bool(matched_action.get("affectsAdSpend")),
-                                                "expiresAt": pending_doc["expiresAt"],
-                                            },
+                                            "pending": pending_payload,
                                         }
                                     else:
                                         # Firestore unavailable — fail safe: do NOT
