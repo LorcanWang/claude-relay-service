@@ -151,16 +151,13 @@ After zero `Action gap` warnings for 14 days:
 - Performance bundle `bb76549` (which introduced the bug) stays intact — we
   just unblock the one slot that needs to re-render on every delta.
 
-### 🐛 Hidden skills' whenToUse never reaches the model
-- Symptom: user asked Lynx to "log a CRM note", Lynx answered "I can't log CRM notes from this space" — completely missing that crm-notes runs automatically via the orchestrator's pipeline.
-- Root cause: `build_skill_index` filters out skills with `disableModelInvocation: true` so their `whenToUse` text is never seen by the model. Lynx has no way to know about background skills' existence.
-- **Fix**: add a `## Background Skills` section to the system prompt listing hidden skills' name + whenToUse, with explicit "you cannot call these — they run automatically" framing.
-- Estimated: 30 min including Codex review.
+### ✅ Hidden skills' whenToUse never reaches the model — RESOLVED `fc6bd3e`
+- Was: `build_skill_index` filtered out skills with `disableModelInvocation: true` so their `whenToUse` text never reached the model. Lynx replied "I can't log CRM notes from this space."
+- Fix `fc6bd3e`: new `build_background_skills_block()` emits a `## Background Skills` section listing hidden skills + whenToUse + explicit "do NOT say 'I can't do that here' — explain how the background pipeline handles it" guidance. run_command still refuses hidden skills via the existing `is_model_invocable` gate; this is purely informational.
 
-### 🐛 Room framing makes Lynx feel narrow ("can't help" responses)
-- Same incident as above: Lynx replied "the tools available here are focused on ads performance" instead of engaging helpfully.
-- The in-platform guardrail copy `"Prefer app_action(navigate)..."` reads to the model as "stay in your lane." Combined with the missing background-skill visibility, Lynx refuses adjacent topics it could discuss.
-- **Fix**: soften the system-prompt framing in `skill_loader.py` to make Lynx engage with general questions even when the matching skill isn't directly callable. Pair with the Background Skills section above.
+### ✅ Room framing makes Lynx feel narrow — RESOLVED `fc6bd3e`
+- Was: in-platform guardrail copy read as "stay in your lane." Combined with the missing background-skill visibility, Lynx refused adjacent topics.
+- Fix `fc6bd3e`: softened the in-platform copy with explicit "the skills listed above are tools you happen to have, NOT the boundary of what you can discuss. Engage with whatever the user asks — general advice, follow-ups, planning, recommendations" framing. Only surface "I don't have a tool" when the user explicitly needs a tool action.
 
 ### 🐛 (Pre-existing, out of scope) `tool-invocation` part type rendering is dead code
 - `chat-message.tsx:116` checks `part.type === "tool-invocation"` but AI SDK v6 emits `tool-${toolName}` and `dynamic-tool` instead. Tool UI rendering is silently disabled.
