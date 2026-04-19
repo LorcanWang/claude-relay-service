@@ -138,11 +138,18 @@ After zero `Action gap` warnings for 14 days:
 
 ## Open bugs
 
-### 🐛 Streaming chat goes blank requiring refresh
-- Multiple iterations attempted: `0d4b535` (tier 1: status-gate), `348a11e` (tier 2: structural protection with 10s grace).
-- Codex flagged the parts.length signal as weak against AI SDK v6 in-place mutations (input-streaming → input-available, output-error replacing output with errorText).
-- **Status check needed**: user reported on `2026-04-19` that streaming "no longer working" — unclear if this is the same bug post-348a11e or a new regression. Must reproduce before next attempt.
-- **Codex's preferred long-term fix**: server-side message revision counter + explicit server-authoritative flag. Heavier than the heuristic but bulletproof.
+### ✅ Streaming chat goes blank requiring refresh — RESOLVED `b7607c0`
+- Three prior fix attempts (`0824978`, `0d4b535`, `348a11e`) were all wrong layer.
+- Real root cause (Codex agent a2801357ddea28045): AI SDK v6's `pushMessage`
+  leaks the live mutable assistant message object into React state. By the
+  time `React.memo`'s comparator runs, `prev.message` and `next.message` are
+  the SAME already-mutated reference, so any signature/length compare sees
+  equal and blocks every re-render forever.
+- Fix `b7607c0`: pass `isStreaming` to the last assistant message during
+  loading; comparator returns false when set, bypassing memo entirely for
+  the streaming tail. All other messages still benefit from memo.
+- Performance bundle `bb76549` (which introduced the bug) stays intact — we
+  just unblock the one slot that needs to re-render on every delta.
 
 ### 🐛 Hidden skills' whenToUse never reaches the model
 - Symptom: user asked Lynx to "log a CRM note", Lynx answered "I can't log CRM notes from this space" — completely missing that crm-notes runs automatically via the orchestrator's pipeline.
