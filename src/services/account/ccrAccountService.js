@@ -528,8 +528,40 @@ class CcrAccountService {
     try {
       const client = redis.getClientSafe()
       const accountKey = `${this.ACCOUNT_KEY_PREFIX}${accountId}`
-      const status = await client.hget(accountKey, 'status')
-      return status === 'overloaded'
+      const [status, overloadedAt, rateLimitDurationRaw] = await client.hmget(
+        accountKey,
+        'status',
+        'overloadedAt',
+        'rateLimitDuration'
+      )
+      if (status !== 'overloaded') {
+        return false
+      }
+      // 兜底防死锁：过载恢复依赖下次成功请求，但调度器会跳过过载账号。
+      // 与 upstreamErrorHelper 的 temp_unavailable TTL 对齐到同一个旋钮：
+      // 优先用 UPSTREAM_ERROR_OVERLOAD_TTL_SECONDS（秒），未设置则回退到 rateLimitDuration 分钟。
+      if (overloadedAt) {
+        const envTtlSec = parseInt(process.env.UPSTREAM_ERROR_OVERLOAD_TTL_SECONDS, 10)
+        const parsedMin = parseInt(rateLimitDurationRaw, 10)
+        const durationSec =
+          Number.isFinite(envTtlSec) && envTtlSec > 0
+            ? envTtlSec
+            : (Number.isFinite(parsedMin) && parsedMin > 0 ? parsedMin : 60) * 60
+        const overloadedTs = new Date(overloadedAt).getTime()
+        if (Number.isFinite(overloadedTs) && Date.now() - overloadedTs > durationSec * 1000) {
+          logger.warn(
+            `⏱️ CCR account overload auto-expired after ${durationSec}s: ${accountId}, clearing status`
+          )
+          await this.removeAccountOverload(accountId).catch((err) => {
+            logger.error(
+              `❌ Failed to auto-clear expired overload for CCR account: ${accountId}`,
+              err
+            )
+          })
+          return false
+        }
+      }
+      return true
     } catch (error) {
       logger.error(`❌ Failed to check overload status for CCR account: ${accountId}`, error)
       return false
