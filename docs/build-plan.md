@@ -128,6 +128,24 @@ Major architectural shift: per-user nonce model replaced with supervisor-members
 - On room load, query `GET /pending-actions` for non-terminal entries
 - Show "you have N pending actions" banner with click-to-reopen
 
+### 6d — Post-approval feedback + audit trail ✅ shipped (relay `cd5f386` + zeon `dbe30e9`)
+Closed two gaps that surfaced after 6c went live:
+1. **Chat went dead after sign-off.** When a supervisor approved from `/hive/signoff`, the orchestrator executed server-side but nothing wrote back to the room. Chat sat at "Queued — awaiting confirmation" forever (even after refresh).
+2. **No audit trail.** No way to answer "who approved what, when" — Hermes had no approval memory type.
+
+Fix landed in `pending_actions.py`:
+- `post_room_approval_message()` — appends a synthetic assistant message to `chatRooms/{roomId}/messages` using the same shape as `saveRoomMessages`. Chat's existing Firestore `onSnapshot` listener re-renders live, no refresh. Five outcomes: approved_executed / approved_failed / approved_revoked / cancelled / expired, each attributing the actor by displayName.
+- `write_approval_memory()` — persists a new `memoryType: "approval_decision"` with `actorRefs` (approver + requester), skill, command fingerprint, action id, flags (affectsAdSpend/destructive), outcome. Non-fatal on write failure — the approval itself already committed transactionally.
+- `load_pending()` helper since `cancel()` only returns ok/error; re-hydrates the doc so side-effects have full metadata.
+- Wired into `/confirm` (all three branches) and `/cancel`.
+
+Frontend side (`hermes-insights` refactor):
+- **Campaigns → Intelligence** — query widened to include `insight`, `strategy_memory`, `workflow_pattern` alongside `campaign_*`. The old name was ads-agency-specific; non-ads verticals now see their own signal stream in the same tab. `?type=campaigns` kept as legacy alias.
+- **New Approvals tab** — cards per approval with actor, skill, action, flags, outcome, timestamp. Tone-coded: green=approved, amber=failed/revoked, muted=cancelled.
+- `TYPE_LABELS` / `TYPE_ICONS` register `approval_decision` so the Memories tab renders them consistently too.
+
+No new Firestore indexes — existing `orgId + memoryType + status + temporal.lastSeenAt` composite covers both new queries.
+
 ---
 
 ## Phase 7 — Durable task model (long-running skills)
