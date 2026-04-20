@@ -956,6 +956,76 @@ def confirm_pending_endpoint(
     snap_configs = pending.get("skillConfigsSnapshot") or {}
     snap_in_platform = bool(pending.get("inPlatformSnapshot", True))
 
+    # Phase 7: if the approved action is long-running, DON'T block this HTTP
+    # request on execute_command. Enqueue a task and return — the worker
+    # runs it, writes the result message, and flips the task status. Pending
+    # doc is marked completed with the taskId so the approval UI can
+    # hand off to the task card.
+    if pending.get("longRunning"):
+        from tasks import create_task as _create_task
+        task_doc = _create_task(
+            org_id=pending.get("orgId") or "",
+            user_id=pending.get("userId") or "",
+            room_id=pending.get("roomId"),
+            session_id=pending.get("sessionId") or "",
+            skill=pending.get("skill") or "",
+            command=pending.get("command") or "",
+            action_id=pending.get("actionId") or "",
+            action_title=pending.get("actionTitle") or "",
+            destructive=bool(pending.get("destructive")),
+            affects_ad_spend=bool(pending.get("affectsAdSpend")),
+            skill_configs=snap_configs,
+            in_platform=snap_in_platform,
+            pending_id=pending.get("id"),
+        )
+        if task_doc:
+            # Link pending → task so the UI can navigate from the approval
+            # card to the task status card. mark_pending_completed flips the
+            # pending to "completed" (the approval half of the flow is done);
+            # the task lifecycle continues independently.
+            try:
+                from hermes_store import _get_db as _gdb
+                _db = _gdb()
+                if _db is not None:
+                    _db.collection("pendingActions").document(pending["id"]).update({
+                        "taskId": task_doc["id"],
+                    })
+            except Exception as _exc:
+                logger.warning("Failed to link pending→task: %s", _exc)
+            mark_pending_completed(pending["id"], result={
+                "summary": (pending.get("actionTitle") or pending.get("actionId") or "") + " queued as task",
+                "status": "queued",
+                "taskId": task_doc["id"],
+            })
+            post_room_approval_message(
+                pending=pending,
+                outcome="approved_task_started",
+                actor_uid=req.userId,
+            )
+            write_approval_memory(
+                pending=pending,
+                outcome="approved_task_started",
+                actor_uid=req.userId,
+            )
+            logger.info(
+                "Supervisor-approved task: pending=%s task=%s skill=%s by=%s",
+                pending["id"], task_doc["id"], pending.get("skill"), req.userId,
+            )
+            return {
+                "ok": True,
+                "pending": pending,
+                "executed": False,
+                "taskQueued": True,
+                "task": {"id": task_doc["id"], "status": "queued"},
+            }
+        # Task enqueue failed — fall back to sync execute so the approval
+        # doesn't leave the user hanging. If both paths fail, the error
+        # handler below returns executionOk=False.
+        logger.warning(
+            "Long-running task enqueue failed, falling back to sync execute: pending=%s",
+            pending["id"],
+        )
+
     exec_result = execute_command(
         pending["skill"],
         pending["command"],
@@ -1528,6 +1598,11 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                                         # against the requester's intended account.
                                         skill_configs=req.skillConfigs or {},
                                         in_platform=bool(req.inPlatform),
+                                        # Phase 7: propagate so /confirm can route
+                                        # approval of long-running actions into the
+                                        # task worker instead of blocking the HTTP
+                                        # request on a multi-minute subprocess.
+                                        long_running=bool(matched_action.get("longRunning")),
                                     )
                                     _publish_agent_status(
                                         session_id,
@@ -1580,6 +1655,60 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                                                 "retry in a moment."
                                             ),
                                         }
+                            elif matched_action and matched_action.get("longRunning"):
+                                # Phase 7: durable path — action exceeds the synchronous
+                                # 60s subprocess ceiling (deep scrapes, bulk ops). Write
+                                # a task doc, return an awaiting_task envelope to the
+                                # model, and let task_worker.py execute it independently
+                                # of this HTTP request. The frontend renders a live
+                                # status card that listens on the task doc.
+                                from tasks import create_task as _create_task
+                                task_doc = _create_task(
+                                    org_id=req.orgId or "",
+                                    user_id=req.userId or "",
+                                    room_id=req.roomId,
+                                    session_id=session_id,
+                                    skill=skill_name,
+                                    command=command,
+                                    action_id=matched_action.get("id", ""),
+                                    action_title=matched_action.get("title", ""),
+                                    destructive=bool(matched_action.get("destructive")),
+                                    affects_ad_spend=bool(matched_action.get("affectsAdSpend")),
+                                    skill_configs=req.skillConfigs or {},
+                                    in_platform=bool(req.inPlatform),
+                                )
+                                _publish_agent_status(
+                                    session_id,
+                                    skill_id,
+                                    "completed",
+                                    "Task queued",
+                                )
+                                _publish_agent_switch(session_id, skill_id, "lynx", "Returned to Lynx")
+                                if task_doc:
+                                    task_payload = {
+                                        "id": task_doc["id"],
+                                        "actionId": matched_action.get("id"),
+                                        "actionTitle": matched_action.get("title"),
+                                        "skill": skill_name,
+                                        "status": "queued",
+                                    }
+                                    collected_actions.append({
+                                        "action": "task",
+                                        "task": task_payload,
+                                    })
+                                    result = {
+                                        "ok": True,
+                                        "awaiting_task": True,
+                                        "task": task_payload,
+                                    }
+                                else:
+                                    result = {
+                                        "ok": False,
+                                        "error": (
+                                            "Task store unavailable — cannot enqueue "
+                                            "this long-running action. Please retry."
+                                        ),
+                                    }
                             else:
                                 logger.info("Tool call: skill=%r command=%r", skill_name, command)
                                 result = execute_command(skill_name, command, enabled_names, context={

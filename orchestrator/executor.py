@@ -23,12 +23,18 @@ def execute_command(
     command: str,
     enabled_skill_names: list[str],
     context: dict | None = None,
+    timeout_seconds: int | None = None,
 ) -> dict:
     """
     Run `command` in SKILL_ROOT/{skill_name}/.
 
     context (optional): dict with org_id, user_id, session_id, skill_configs, in_platform.
     These are injected as LYNX_* env vars so skills have a standard way to access caller context.
+
+    timeout_seconds (optional): overrides module-level SKILL_TIMEOUT. Used by the
+    durable task worker which needs much longer ceilings (hours) than the synchronous
+    chat path (60s default). Without this override, the module default silently
+    capped task_worker executions at 60s regardless of TASK_TIMEOUT_SECONDS.
 
     Returns {"ok": True, "data": ...} or {"ok": False, "error": ..., "stderr": ...}.
     """
@@ -76,6 +82,7 @@ def execute_command(
     if skill_config:
         env["LYNX_CONFIG_JSON"] = json.dumps(skill_config, ensure_ascii=False, default=str)
 
+    effective_timeout = timeout_seconds if timeout_seconds is not None else TIMEOUT
     try:
         result = subprocess.run(
             command,
@@ -83,11 +90,11 @@ def execute_command(
             capture_output=True,
             text=True,
             cwd=str(skill_dir),
-            timeout=TIMEOUT,
+            timeout=effective_timeout,
             env=env,
         )
     except subprocess.TimeoutExpired:
-        return {"ok": False, "error": f"Command timed out after {TIMEOUT}s"}
+        return {"ok": False, "error": f"Command timed out after {effective_timeout}s"}
     except Exception as exc:
         return {"ok": False, "error": f"Execution error: {exc}"}
 

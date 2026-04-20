@@ -96,6 +96,7 @@ def create_pending(
     affects_ad_spend: bool = False,
     skill_configs: dict | None = None,
     in_platform: bool = True,
+    long_running: bool = False,
 ) -> dict | None:
     """Create a pending action doc. SNAPSHOTS the room's supervisorUserIds
     onto the doc at create time so later supervisor edits don't retroactively
@@ -146,6 +147,11 @@ def create_pending(
         # could run against a different campaign than the user reviewed.
         "skillConfigsSnapshot": skill_configs or {},
         "inPlatformSnapshot": bool(in_platform),
+        # Phase 7: if the approved action opts into durable execution, the
+        # /confirm endpoint spawns a task instead of running synchronously.
+        # Stored at create time so /confirm doesn't need to re-match the
+        # action against the manifest.
+        "longRunning": bool(long_running),
         "nonce": nonce,
         "status": "pending",
         "createdAt": now.isoformat(),
@@ -154,6 +160,9 @@ def create_pending(
         "confirmedBy": None,
         "executedAt": None,
         "result": None,
+        # Populated by /confirm when the approval spawns a task — lets the UI
+        # redirect the pending card's "still running?" state to the task card.
+        "taskId": None,
     }
     try:
         db.collection(COLLECTION).document(pending_id).set(doc)
@@ -657,6 +666,11 @@ def _format_outcome_text(outcome: str, title: str, actor_name: str) -> str:
             f"**Approved by {actor_name}**, but {title} was skipped — "
             "the skill is no longer enabled in this room."
         )
+    if outcome == "approved_task_started":
+        return (
+            f"**Approved by {actor_name}** — {title} is now running as a task. "
+            "The result will appear here when it finishes."
+        )
     if outcome == "cancelled":
         return f"**Cancelled by {actor_name}** — {title} will not run."
     if outcome == "expired":
@@ -671,6 +685,10 @@ def post_room_approval_message(*, pending: dict, outcome: str, actor_uid: str) -
     """Append a synthetic assistant message to the pending's chat room so the
     UI reflects the sign-off outcome. No-op if the pending has no roomId
     (direct-chat pendings; future scope).
+
+    Uses the shared transactional helper so concurrent writers (active chat
+    stream + this approval outcome + future task-result posts) can't race on
+    the `index` field.
     """
     db = _get_db()
     if db is None:
@@ -683,45 +701,19 @@ def post_room_approval_message(*, pending: dict, outcome: str, actor_uid: str) -
     title = pending.get("actionTitle") or pending.get("actionId") or "action"
     text = _format_outcome_text(outcome, title, actor_name)
 
-    try:
-        from firebase_admin import firestore as _fs
-        messages_ref = (
-            db.collection("chatRooms").document(room_id).collection("messages")
-        )
-        last = list(
-            messages_ref.order_by("index", direction=_fs.Query.DESCENDING)
-            .limit(1)
-            .stream()
-        )
-        if last:
-            last_data = last[0].to_dict() or {}
-            next_index = int(last_data.get("index", -1)) + 1
-        else:
-            next_index = 0
-        now = _now_iso()
-        messages_ref.document().set({
-            "clientId": None,
-            "role": "assistant",
-            "parts": [{"type": "text", "text": text}],
-            "content": text,
-            "createdAt": now,
-            "index": next_index,
-            "meta": {
-                "kind": "approval_outcome",
-                "outcome": outcome,
-                "pendingId": pending.get("id"),
-                "actorUid": actor_uid,
-                "actionId": pending.get("actionId"),
-                "skill": pending.get("skill"),
-            },
-        })
-        db.collection("chatRooms").document(room_id).update({
-            "lastMessageAt": now,
-            "updatedAt": now,
-            "messageCount": _fs.Increment(1),
-        })
-    except Exception as exc:
-        logger.warning("post_room_approval_message failed (room=%s): %s", room_id, exc)
+    from room_messages import post_synthetic_assistant_message
+    post_synthetic_assistant_message(
+        room_id=room_id,
+        text=text,
+        meta={
+            "kind": "approval_outcome",
+            "outcome": outcome,
+            "pendingId": pending.get("id"),
+            "actorUid": actor_uid,
+            "actionId": pending.get("actionId"),
+            "skill": pending.get("skill"),
+        },
+    )
 
 
 def write_approval_memory(*, pending: dict, outcome: str, actor_uid: str) -> None:
@@ -747,6 +739,7 @@ def write_approval_memory(*, pending: dict, outcome: str, actor_uid: str) -> Non
         "approved_executed": "approved",
         "approved_failed": "approved (execution failed)",
         "approved_revoked": "approved but skipped (skill no longer enabled)",
+        "approved_task_started": "approved (queued as long-running task)",
         "cancelled": "cancelled",
         "expired": "expired unapproved",
     }.get(outcome, outcome)
