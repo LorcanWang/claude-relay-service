@@ -70,6 +70,10 @@ from pending_actions import (
     write_approval_memory,
     load_pending as load_pending_action,
 )
+from attachments import (
+    extract_attachment_ids_from_message,
+    resolve_attachments_for_skill,
+)
 from stream import sse, sse_agent_status, sse_agent_switch, stream_error
 from mcp_config import collect_mcp_configs
 from mcp_manager import MCPManager
@@ -145,6 +149,10 @@ def _verify_status_stream_token(token: Optional[str], authorization: Optional[st
 class UIPart(BaseModel):
     type: str
     text: Optional[str] = None
+    # Phase 10: data-attachment parts carry {attachmentId, name, mimeType, sizeBytes}
+    # in the `data` field. Pydantic drops unknown fields by default; keep this
+    # explicit so the attachment resolver can read it.
+    data: Optional[dict] = None
 
 
 class UIMessage(BaseModel):
@@ -1223,6 +1231,49 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                 last_user["content"] = f"[{req.senderDisplayName}]: {last_user['content']}"
             session["messages"].append(last_user)
 
+        # Phase 10: resolve any uploaded attachments on the last user message
+        # into signed URLs + metadata. Same payload is reused across every
+        # execute_command call in this turn — skills get the attachments via
+        # LYNX_ATTACHMENTS_JSON env var.
+        turn_attachments: list[dict] = []
+        if user_messages:
+            _att_ids = extract_attachment_ids_from_message(user_messages[-1])
+            if _att_ids:
+                turn_attachments = resolve_attachments_for_skill(
+                    attachment_ids=_att_ids,
+                    expected_org_id=req.orgId or "",
+                    expected_room_id=req.roomId,
+                )
+                if turn_attachments:
+                    # Hint the model that attachments are available this turn so
+                    # it picks the right tool / skill action. Keep it short —
+                    # the actual URLs + metadata go to the skill, not the model.
+                    try:
+                        att_summary = ", ".join(
+                            f"{a['name']} ({a['mimeType']})" for a in turn_attachments
+                        )
+                        sys_hint = {
+                            "role": "user",
+                            "content": (
+                                f"[system] User attached {len(turn_attachments)} file(s): "
+                                f"{att_summary}. If a skill needs these, the orchestrator "
+                                "passes them automatically via LYNX_ATTACHMENTS_JSON."
+                            ),
+                        }
+                        # Note: we DON'T push this into the persisted session —
+                        # it's one-turn guidance. Treat it as inline with the
+                        # user message's Anthropic-format rendering.
+                        # Simplest: append to the last user message's text.
+                        last = session["messages"][-1] if session["messages"] else None
+                        if last and isinstance(last.get("content"), str):
+                            last["content"] = f"{last['content']}\n\n{sys_hint['content']}"
+                    except Exception:
+                        pass
+                    logger.info(
+                        "Turn attachments: count=%d ids=%s",
+                        len(turn_attachments), [a["id"] for a in turn_attachments],
+                    )
+
         # ── build system prompt as segmented blocks ───────────────────────────
         # system_blocks[0] is the stable core (platform rules + app_action + skill
         # usage). We attach cache_control to it so repeat turns hit the Anthropic
@@ -1570,6 +1621,7 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                                         "in_platform": req.inPlatform,
                                         "skill_configs": req.skillConfigs or {},
                                         "room_id": req.roomId,
+                                        "attachments": turn_attachments,
                                     })
                                     # Stash a brief result summary on the pending
                                     # for the admin re-entry surface; never the full data.
@@ -1718,6 +1770,7 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                                     "in_platform": req.inPlatform,
                                     "skill_configs": req.skillConfigs or {},
                                     "room_id": req.roomId,
+                                    "attachments": turn_attachments,
                                 })
                                 logger.info("Tool result ok=%s", result.get("ok", True) if isinstance(result, dict) else True)
                                 note = result.get("agentNote") if isinstance(result, dict) else ""

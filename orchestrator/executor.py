@@ -82,6 +82,15 @@ def execute_command(
     if skill_config:
         env["LYNX_CONFIG_JSON"] = json.dumps(skill_config, ensure_ascii=False, default=str)
 
+    # Phase 10: attachments uploaded with the current user turn. List of
+    # {id, name, mimeType, url, sizeBytes}. Skills that care (e.g. recruiting
+    # resume import) read + download via the signed URL to a tmpdir.
+    attachments = ctx.get("attachments") or []
+    if attachments:
+        env["LYNX_ATTACHMENTS_JSON"] = json.dumps(
+            attachments, ensure_ascii=False, default=str,
+        )
+
     effective_timeout = timeout_seconds if timeout_seconds is not None else TIMEOUT
     try:
         result = subprocess.run(
