@@ -124,9 +124,10 @@ Major architectural shift: per-user nonce model replaced with supervisor-members
 - UI copy: "Approved — running now…" (not "next turn", since auto-fires).
 - Codex two-pass review: af6221d6923b3bb13 → fix-first on race + cancel txn → a007edc8643e8daea → commit.
 
-### 6c — Re-entry surface ⏳ later
-- On room load, query `GET /pending-actions` for non-terminal entries
-- Show "you have N pending actions" banner with click-to-reopen
+### 6c — Re-entry surface ✅ shipped `100a4f6`
+- `PendingReentryBanner` subscribes to pendingActions via Firestore client SDK. Rules already allow requester reads, so no server round-trip. Query: orgId+userId+status in [pending, confirmed]; roomId filtered client-side (per-room queue is small).
+- Live-dismisses when supervisor approves/cancels — listener drops rows that transition out of pending/confirmed.
+- Amber styling matches the inline card. Click → `/hive/signoff`. The inline card stays the primary affordance; this banner is the fallback for "scrolled away / closed tab" case.
 
 ### 6d — Post-approval feedback + audit trail ✅ shipped (relay `cd5f386` + zeon `dbe30e9`)
 Closed two gaps that surfaced after 6c went live:
