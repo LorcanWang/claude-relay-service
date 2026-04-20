@@ -225,9 +225,14 @@ def _rebuild_last_user_with_attachments(
     ride in LYNX_ATTACHMENTS_JSON for skills that want raw bytes.
     """
     if not messages:
+        logger.warning("[phase10] rebuild_last_user: no messages in session")
         return
     last = messages[-1]
     if last.get("role") != "user":
+        logger.warning(
+            "[phase10] rebuild_last_user: last message role=%s (expected user)",
+            last.get("role"),
+        )
         return
     existing = last.get("content") or ""
     text = existing if isinstance(existing, str) else ""
@@ -238,8 +243,21 @@ def _rebuild_last_user_with_attachments(
     images = [
         a for a in attachments if str(a.get("mimeType", "")).startswith("image/")
     ][:_MAX_IMAGES_PER_TURN]
+    other = [
+        a for a in attachments
+        if a.get("mimeType") != "application/pdf"
+        and not str(a.get("mimeType", "")).startswith("image/")
+    ]
+
+    logger.info(
+        "[phase10] rebuild_last_user: total=%d → pdfs=%d images=%d other=%d (other stays in LYNX_ATTACHMENTS_JSON only)",
+        len(attachments), len(pdfs), len(images), len(other),
+    )
 
     if not pdfs and not images:
+        logger.info(
+            "[phase10] rebuild_last_user: no pdfs/images → leaving content as string"
+        )
         return
 
     blocks: list[dict] = []
@@ -268,6 +286,11 @@ def _rebuild_last_user_with_attachments(
         blocks.append({"type": "text", "text": full_text})
 
     last["content"] = blocks
+    logger.info(
+        "[phase10] rebuild_last_user: content=[%s] files=%s",
+        ", ".join(b.get("type", "?") for b in blocks),
+        att_names,
+    )
 
 
 def _scrub_ephemeral_attachments(messages: list[dict]) -> None:
@@ -1347,6 +1370,10 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
         turn_attachments: list[dict] = []
         if user_messages:
             _att_ids = extract_attachment_ids_from_message(user_messages[-1])
+            logger.info(
+                "[phase10] turn start session=%s room=%s attachment_ids=%d",
+                session_id, req.roomId, len(_att_ids),
+            )
             if _att_ids:
                 turn_attachments = resolve_attachments_for_skill(
                     attachment_ids=_att_ids,
@@ -1359,8 +1386,14 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                         turn_attachments,
                     )
                     logger.info(
-                        "Turn attachments: count=%d ids=%s",
-                        len(turn_attachments), [a["id"] for a in turn_attachments],
+                        "[phase10] turn ready attachments=%d ids=%s",
+                        len(turn_attachments),
+                        [a["id"][:8] for a in turn_attachments],
+                    )
+                else:
+                    logger.warning(
+                        "[phase10] turn had %d ids but resolve returned 0 — check Firestore / scope / GCS",
+                        len(_att_ids),
                     )
 
         # ── build system prompt as segmented blocks ───────────────────────────

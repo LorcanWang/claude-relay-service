@@ -110,15 +110,19 @@ def resolve_attachments_for_skill(
     silently skipped — prevents cross-room leakage if a client or model
     slipped a rogue attachmentId into the message.
     """
+    logger.info(
+        "[phase10] resolve_attachments start ids=%d org=%s room=%s",
+        len(attachment_ids), expected_org_id, expected_room_id,
+    )
     if not attachment_ids:
         return []
     db = _get_db()
     if db is None:
-        logger.warning("Firestore unavailable; cannot resolve attachments")
+        logger.warning("[phase10] Firestore unavailable; cannot resolve attachments")
         return []
     storage_client = _get_storage_client()
     if storage_client is None:
-        logger.warning("GCS client unavailable; attachments skipped")
+        logger.warning("[phase10] GCS client unavailable; attachments skipped")
         return []
 
     bucket = storage_client.bucket(HIVE_BUCKET_NAME)
@@ -127,10 +131,10 @@ def resolve_attachments_for_skill(
         try:
             snap = db.collection("attachments").document(aid).get()
         except Exception as exc:
-            logger.warning("Failed to read attachment %s: %s", aid, exc)
+            logger.warning("[phase10] Failed to read attachment %s: %s", aid, exc)
             continue
         if not snap.exists:
-            logger.warning("Attachment %s not found", aid)
+            logger.warning("[phase10] Attachment %s not found in Firestore", aid)
             continue
         doc = snap.to_dict() or {}
 
@@ -138,19 +142,20 @@ def resolve_attachments_for_skill(
         # somehow referenced an attachment from a different org/room, refuse.
         if doc.get("orgId") != expected_org_id:
             logger.warning(
-                "Attachment %s orgId mismatch (doc=%s expected=%s) — refusing",
+                "[phase10] Attachment %s orgId mismatch (doc=%s expected=%s) — refusing",
                 aid, doc.get("orgId"), expected_org_id,
             )
             continue
         if expected_room_id and doc.get("roomId") != expected_room_id:
             logger.warning(
-                "Attachment %s roomId mismatch (doc=%s expected=%s) — refusing",
+                "[phase10] Attachment %s roomId mismatch (doc=%s expected=%s) — refusing",
                 aid, doc.get("roomId"), expected_room_id,
             )
             continue
 
         storage_path = doc.get("storagePath")
         if not storage_path:
+            logger.warning("[phase10] Attachment %s has no storagePath", aid)
             continue
 
         try:
@@ -162,11 +167,15 @@ def resolve_attachments_for_skill(
             )
         except Exception as exc:
             logger.warning(
-                "Failed to mint signed URL for %s (path=%s): %s",
+                "[phase10] Failed to mint signed URL for %s (path=%s): %s",
                 aid, storage_path, exc,
             )
             continue
 
+        logger.info(
+            "[phase10] resolved attachment id=%s name=%s mime=%s size=%dB",
+            aid, doc.get("name"), doc.get("mimeType"), int(doc.get("sizeBytes") or 0),
+        )
         out.append({
             "id": aid,
             "name": doc.get("name") or aid,
@@ -174,4 +183,8 @@ def resolve_attachments_for_skill(
             "url": url,
             "sizeBytes": int(doc.get("sizeBytes") or 0),
         })
+    logger.info(
+        "[phase10] resolve_attachments done resolved=%d/%d",
+        len(out), len(attachment_ids),
+    )
     return out
