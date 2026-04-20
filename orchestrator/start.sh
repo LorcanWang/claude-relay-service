@@ -7,6 +7,7 @@ cd "$DIR"
 
 ORCHESTRATOR_PID_FILE="$DIR/orchestrator.pid"
 WORKER_PID_FILE="$DIR/hermes_worker.pid"
+TASK_WORKER_PID_FILE="$DIR/task_worker.pid"
 LOG_DIR="$DIR/../logs"
 mkdir -p "$LOG_DIR"
 
@@ -56,6 +57,17 @@ start_worker() {
     echo "  Log: $LOG_DIR/hermes_worker.log"
 }
 
+start_task_worker() {
+    stop_process "$TASK_WORKER_PID_FILE" "task_worker"
+
+    echo "Starting Task worker..."
+    nohup "$PYTHON" task_worker.py > "$LOG_DIR/task_worker.log" 2>&1 &
+    local pid=$!
+    echo "$pid" > "$TASK_WORKER_PID_FILE"
+    echo "  Task worker started (PID $pid)"
+    echo "  Log: $LOG_DIR/task_worker.log"
+}
+
 status() {
     echo "=== Orchestrator ==="
     if [ -f "$ORCHESTRATOR_PID_FILE" ]; then
@@ -81,6 +93,18 @@ status() {
         echo "  Not running"
     fi
 
+    echo "=== Task Worker ==="
+    if [ -f "$TASK_WORKER_PID_FILE" ]; then
+        local pid=$(cat "$TASK_WORKER_PID_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "  Running (PID $pid)"
+        else
+            echo "  Dead (stale PID $pid)"
+        fi
+    else
+        echo "  Not running"
+    fi
+
     # Health check
     local health=$(curl -s localhost:${ORCHESTRATOR_PORT:-8090}/health 2>/dev/null)
     if [ -n "$health" ]; then
@@ -93,34 +117,41 @@ case "${1:-start}" in
     start)
         start_orchestrator
         start_worker
+        start_task_worker
         echo ""
-        echo "Both services started. Use './start.sh status' to check."
+        echo "All services started. Use './start.sh status' to check."
         ;;
     stop)
+        stop_process "$TASK_WORKER_PID_FILE" "task_worker"
         stop_process "$WORKER_PID_FILE" "hermes_worker"
         stop_process "$ORCHESTRATOR_PID_FILE" "orchestrator"
         echo "All services stopped."
         ;;
     restart)
+        stop_process "$TASK_WORKER_PID_FILE" "task_worker"
         stop_process "$WORKER_PID_FILE" "hermes_worker"
         stop_process "$ORCHESTRATOR_PID_FILE" "orchestrator"
         sleep 1
         start_orchestrator
         start_worker
+        start_task_worker
         echo ""
         echo "All services restarted."
         ;;
     --worker-only|worker)
         start_worker
         ;;
+    --task-worker-only|task-worker)
+        start_task_worker
+        ;;
     status)
         status
         ;;
     logs)
-        tail -f "$LOG_DIR/orchestrator.log" "$LOG_DIR/hermes_worker.log"
+        tail -f "$LOG_DIR/orchestrator.log" "$LOG_DIR/hermes_worker.log" "$LOG_DIR/task_worker.log"
         ;;
     *)
-        echo "Usage: $0 {start|stop|restart|worker|status|logs}"
+        echo "Usage: $0 {start|stop|restart|worker|task-worker|status|logs}"
         exit 1
         ;;
 esac

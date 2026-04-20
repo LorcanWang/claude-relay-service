@@ -151,16 +151,32 @@ No new Firestore indexes — existing `orgId + memoryType + status + temporal.la
 
 ## Phase 7 — Durable task model (long-running skills)
 
-⏳ planned, not started
+✅ shipped (relay `0a3a082` + zeon `fa3e50b`)
 
-Per R6 review:
-- `actions[].long_running: true` opts the action into the durable path
-- Returns `taskId` immediately, status persisted to Firestore
-- New `task_worker.py` (separate process; do NOT extend `hermes_worker.py`)
-- No kill/retry in v1 — just durability across tab close
-- Frontend subscribes to task doc via Firestore listener
+**What it solves.** Today `execute_command` is synchronous inside the HTTP/SSE chat request — >60s kills on SKILL_TIMEOUT, tab-close kills the work. Durable tasks mean actions marked `longRunning: true` in their manifest return a `taskId` immediately, then a separate worker process runs them to completion with status persisted to Firestore.
 
-Estimated: 4 days.
+**Backend (`0a3a082`):**
+- `tasks.py` — Firestore `longRunningTasks` state machine `queued → running → completed | failed`. `claim_queued_task` is transactional (read-inside-txn, flip only if still queued) — mirrors `claim_confirmed_for_execution`. Heartbeat + `sweep_stale_running` recovers from worker crashes (Codex said must-have-v1, not deferred). `mark_completed`/`mark_failed` idempotent via `resultMessageId`.
+- `task_worker.py` — separate process (not extending hermes_worker.py; different reliability model — hermes drops, tasks must never drop). Listener + periodic sweep as drop insurance. Heartbeats every 30s. Re-runs revocation check at execution time. Uses `skillConfigsSnapshot`/`inPlatformSnapshot`, never live request context. Posts chat result FIRST (records messageId), THEN marks task terminal — retries can't double-post.
+- `room_messages.py` — shared `post_synthetic_assistant_message` helper used by Phase 6d approvals AND Phase 7 task results. Txn reads `room.messageCount`, writes message with that index, bumps counter — atomic. Fixes pre-existing duplicate-index race in `post_room_approval_message`.
+- `executor.execute_command` — new `timeout_seconds` override. Without it, module-level `SKILL_TIMEOUT` (60s) silently capped task_worker subprocesses regardless of `TASK_TIMEOUT_SECONDS`.
+- `main.py` — dispatcher branches: `longRunning && !requiresConfirmation` enqueues a task and returns `awaiting_task`. `requiresConfirmation && longRunning`: `/confirm` spawns a task (linked to pending via `pending.taskId`) instead of blocking on sync execute. New outcome `approved_task_started` in approval chat copy + Hermes trail.
+- `start.sh` — launches task_worker alongside orchestrator + hermes_worker. Existing launchd plist pulls in the new worker on restart, no new plist needed.
+
+**Frontend (`fa3e50b`):**
+- `task-status-card.tsx` — Firestore `onSnapshot` per taskId. Amber clock (queued) → blue spinner + elapsed (running) → green check (completed) | red X (failed). Copy explicitly tells the user they can close the tab.
+- `chat-message.tsx` — `_extractTaskActions` walks parts for `data-action{action:"task"}`; renders card alongside any pending card on the same turn.
+- `firestore.rules` — `longRunningTasks` read allowed to requester OR room supervisors. Writes server-only.
+- `firestore.indexes.json` — three composite indexes: `(status, createdAt)` for claim, `(status, heartbeatAt)` for sweep, `(orgId, userId, createdAt)` for future outbox.
+
+**Adoption.** To opt a skill into durable execution, add `"longRunning": true` to the relevant action in `agent.json`. That's the only change — the rest is automatic. Good first candidates: amazon-insights full-brand scrape, any bulk-campaign action.
+
+**Intentional v1 cuts** (user + Codex agreed): no kill/retry button, no progress protocol beyond status, single worker. Multi-worker is safe because the claim txn is correct — just not wired yet.
+
+**Deploy checklist:**
+1. Push + `firebase deploy --only firestore:rules,firestore:indexes`
+2. VPS: `bash orchestrator/launchd-fix.sh restart` to pick up task_worker
+3. Opt in one skill manifest and test end-to-end
 
 ---
 
