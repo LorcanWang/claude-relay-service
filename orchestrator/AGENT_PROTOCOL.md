@@ -1,7 +1,7 @@
 ---
 title: "Lynx Agent Protocol"
 status: active
-updated: 2026-04-13
+updated: 2026-04-20
 ---
 
 # Lynx Agent Protocol
@@ -36,6 +36,32 @@ skillConfigs: { "amazon-hawk": { "api_key": "abc123" } }
 Pattern: `LYNX_CONFIG_{UPPER_SNAKE_KEY}` = value
 
 Skills can read individual vars or parse `LYNX_CONFIG_JSON` for the full config dict.
+
+### Attachments (Phase 10)
+
+When the current user turn carries file uploads (paperclip in chat input), the orchestrator resolves each attachment metadata doc, mints a fresh 7-day signed GET URL, and passes the list as an env var:
+
+```
+LYNX_ATTACHMENTS_JSON='[{"id":"uuid","name":"resume.pdf","mimeType":"application/pdf","url":"https://storage.googleapis.com/...?X-Goog-Signature=...","sizeBytes":123456}]'
+```
+
+Field contract per entry:
+
+| Field | Description |
+|-------|-------------|
+| `id` | Attachment doc id — stable for the lifetime of the GCS object |
+| `name` | Original filename (safe to display; don't trust as a path) |
+| `mimeType` | Server-validated against an allowlist (image/*, pdf, csv, txt, json, docx, xlsx) |
+| `url` | Signed GET URL; skill should download to a tmpdir, never re-share upstream |
+| `sizeBytes` | Pre-upload reported size (subject to ≤25 MB cap per file) |
+
+Skills that process uploads should:
+1. Check `LYNX_ATTACHMENTS_JSON` is set
+2. Filter by `mimeType` for relevance
+3. Download via the signed URL to a private tmpdir
+4. Process, then clean up the tmpdir on exit
+
+If a skill needs to EMIT files back to chat (generated PDFs/images), see the orchestrator output-envelope `attachments` key — documented in `docs/build-plan.md` Phase 10c.
 
 ## Upstream: Output FROM skills
 
