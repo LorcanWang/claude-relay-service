@@ -204,6 +204,113 @@ def ui_to_anthropic(msg: UIMessage) -> dict:
     return {"role": role, "content": ""}
 
 
+# ── Attachment → Anthropic content block helpers (Phase 10) ──────────────────
+# Per-turn caps chosen to fit comfortably inside Anthropic's 32MB request /
+# 100-page limits and keep token cost bounded (~3k tokens per PDF page).
+# Extras past the cap ride only via LYNX_ATTACHMENTS_JSON — skills can still
+# fetch them, but Claude won't see them natively.
+_MAX_PDFS_PER_TURN = 3
+_MAX_IMAGES_PER_TURN = 10
+
+
+def _rebuild_last_user_with_attachments(
+    messages: list[dict],
+    attachments: list[dict],
+) -> None:
+    """Replace the last user message's content with a list of Anthropic
+    content blocks: documents (PDFs) first, then images, then text. Codex
+    review said PDFs-before-text improves model attention on the attachments.
+
+    Non-PDF/non-image attachments don't become content blocks — they still
+    ride in LYNX_ATTACHMENTS_JSON for skills that want raw bytes.
+    """
+    if not messages:
+        return
+    last = messages[-1]
+    if last.get("role") != "user":
+        return
+    existing = last.get("content") or ""
+    text = existing if isinstance(existing, str) else ""
+
+    pdfs = [a for a in attachments if a.get("mimeType") == "application/pdf"][
+        :_MAX_PDFS_PER_TURN
+    ]
+    images = [
+        a for a in attachments if str(a.get("mimeType", "")).startswith("image/")
+    ][:_MAX_IMAGES_PER_TURN]
+
+    if not pdfs and not images:
+        return
+
+    blocks: list[dict] = []
+    for a in pdfs:
+        blocks.append({
+            "type": "document",
+            "source": {"type": "url", "url": a["url"]},
+            "title": a.get("name") or "attachment.pdf",
+        })
+    for a in images:
+        blocks.append({
+            "type": "image",
+            "source": {"type": "url", "url": a["url"]},
+        })
+
+    # Include a brief text block naming the files so when we later scrub the
+    # document/image blocks out of the persisted session, the text remainder
+    # still carries enough context for follow-up turns to reference them.
+    att_names = [a.get("name") or a.get("id", "file") for a in (pdfs + images)]
+    prefix = (
+        f"[Attached {len(att_names)} file(s): {', '.join(att_names)}] "
+        if att_names else ""
+    )
+    full_text = (prefix + text).strip()
+    if full_text:
+        blocks.append({"type": "text", "text": full_text})
+
+    last["content"] = blocks
+
+
+def _scrub_ephemeral_attachments(messages: list[dict]) -> None:
+    """After a turn completes and before save_session, strip document/image
+    blocks from the latest user message — replace with nothing (the text
+    block inside already mentions filenames). Future turns re-read the
+    session and see only the text placeholder, so Anthropic doesn't
+    re-ingest the PDF bytes every time we loop.
+
+    Only operates on the LATEST user message; earlier turns have already
+    been scrubbed on their own save cycle.
+    """
+    if not messages:
+        return
+    last = messages[-1]
+    if last.get("role") != "user":
+        return
+    content = last.get("content")
+    if not isinstance(content, list):
+        return
+    scrubbed: list[dict] = []
+    had_media = False
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype in ("document", "image"):
+            had_media = True
+            continue
+        scrubbed.append(block)
+    if not had_media:
+        return
+    # Collapse to a plain string if only text blocks remain — matches the
+    # shape `ui_to_anthropic` produces for no-attachment turns so the
+    # session stays homogeneous.
+    if scrubbed and all(b.get("type") == "text" for b in scrubbed):
+        last["content"] = "\n".join(b.get("text", "") for b in scrubbed).strip()
+    elif scrubbed:
+        last["content"] = scrubbed
+    else:
+        last["content"] = ""
+
+
 def _slugify_agent_id(name: str) -> str:
     slug = re.sub(r"\s+", "-", (name or "").strip().lower())
     slug = re.sub(r"[^a-z0-9_-]", "-", slug)
@@ -1234,7 +1341,9 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
         # Phase 10: resolve any uploaded attachments on the last user message
         # into signed URLs + metadata. Same payload is reused across every
         # execute_command call in this turn — skills get the attachments via
-        # LYNX_ATTACHMENTS_JSON env var.
+        # LYNX_ATTACHMENTS_JSON env var. PDFs/images additionally become
+        # Anthropic content blocks so Claude can read them natively without
+        # requiring pdftotext on the VPS.
         turn_attachments: list[dict] = []
         if user_messages:
             _att_ids = extract_attachment_ids_from_message(user_messages[-1])
@@ -1245,30 +1354,10 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                     expected_room_id=req.roomId,
                 )
                 if turn_attachments:
-                    # Hint the model that attachments are available this turn so
-                    # it picks the right tool / skill action. Keep it short —
-                    # the actual URLs + metadata go to the skill, not the model.
-                    try:
-                        att_summary = ", ".join(
-                            f"{a['name']} ({a['mimeType']})" for a in turn_attachments
-                        )
-                        sys_hint = {
-                            "role": "user",
-                            "content": (
-                                f"[system] User attached {len(turn_attachments)} file(s): "
-                                f"{att_summary}. If a skill needs these, the orchestrator "
-                                "passes them automatically via LYNX_ATTACHMENTS_JSON."
-                            ),
-                        }
-                        # Note: we DON'T push this into the persisted session —
-                        # it's one-turn guidance. Treat it as inline with the
-                        # user message's Anthropic-format rendering.
-                        # Simplest: append to the last user message's text.
-                        last = session["messages"][-1] if session["messages"] else None
-                        if last and isinstance(last.get("content"), str):
-                            last["content"] = f"{last['content']}\n\n{sys_hint['content']}"
-                    except Exception:
-                        pass
+                    _rebuild_last_user_with_attachments(
+                        session["messages"],
+                        turn_attachments,
+                    )
                     logger.info(
                         "Turn attachments: count=%d ids=%s",
                         len(turn_attachments), [a["id"] for a in turn_attachments],
@@ -1326,6 +1415,7 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
             model=model,
         )
         if compacted:
+            _scrub_ephemeral_attachments(session["messages"])
             save_session(session_id, session)
 
         logger.info(
@@ -1826,11 +1916,13 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                 yield sse("[DONE]")
                 logger.warning("Max loop iterations reached for [%s]", session_id)
 
+            _scrub_ephemeral_attachments(session["messages"])
             save_session(session_id, session)
 
         except Exception as exc:
             logger.exception("Error in chat loop for [%s]: %s", session_id, exc)
             try:
+                _scrub_ephemeral_attachments(session["messages"])
                 save_session(session_id, session)
             except Exception:
                 pass
