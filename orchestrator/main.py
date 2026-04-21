@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -1458,6 +1459,7 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
         )
 
         # ── Hermes memory retrieval (off main thread) ────────────────────────
+        memory_bundle_str = ""
         try:
             memory_bundle = await asyncio.to_thread(
                 build_memory_bundle,
@@ -1468,9 +1470,80 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
             if memory_bundle:
                 # Memory is per-turn dynamic — append as an uncached tail block.
                 system_blocks.append({"type": "text", "text": memory_bundle})
+                memory_bundle_str = memory_bundle
                 logger.info("Hermes memory injected (%d chars)", len(memory_bundle))
         except Exception as exc:
             logger.warning("Hermes retrieval failed, continuing without: %s", exc)
+
+        # ── Phase 8: build context-debug snapshot ────────────────────────────
+        # Emit one snapshot per turn so the admin "context drawer" can render
+        # exactly what Lynx is operating with right now. Keep the payload
+        # compact — no signed URLs, no skill config VALUES (keys only, so
+        # secrets never leak through SSE). Actual emit happens after `start`
+        # so the AI SDK streaming protocol is properly initialized.
+        _context_debug_payload: dict | None = None
+        try:
+            _system_chars = sum(
+                len(b.get("text", "")) for b in system_blocks
+                if isinstance(b, dict)
+            )
+            _enabled_agents = [
+                {
+                    "id": _slugify_agent_id(s.name),
+                    "name": s.name,
+                }
+                for s in effective_skills
+            ]
+            _skill_config_keys: dict[str, list[str]] = {}
+            for agent_id, cfg in (req.skillConfigs or {}).items():
+                if isinstance(cfg, dict):
+                    _skill_config_keys[agent_id] = sorted(cfg.keys())
+            # Pending actions in this room that are still actionable — gives
+            # the drawer a count + first title so the admin knows there's
+            # something waiting on /hive/signoff without navigating away.
+            _pendings: list[dict] = []
+            if req.roomId:
+                try:
+                    from hermes_store import _get_db as _gdb
+                    _db2 = _gdb()
+                    if _db2 is not None:
+                        _psnap = (
+                            _db2.collection("pendingActions")
+                            .where("roomId", "==", req.roomId)
+                            .where("status", "in", ["pending", "confirmed"])
+                            .limit(10)
+                            .stream()
+                        )
+                        for _d in _psnap:
+                            _pd = _d.to_dict() or {}
+                            _pendings.append({
+                                "id": _pd.get("id"),
+                                "actionTitle": _pd.get("actionTitle"),
+                                "skill": _pd.get("skill"),
+                                "status": _pd.get("status"),
+                                "requesterUserId": _pd.get("userId"),
+                                "expiresAt": _pd.get("expiresAt"),
+                            })
+                except Exception as _exc:
+                    logger.debug("context-debug pending lookup failed: %s", _exc)
+
+            _context_debug_payload = {
+                "model": model,
+                "roomId": req.roomId,
+                "systemPromptChars": _system_chars,
+                "memoryBundleChars": len(memory_bundle_str),
+                # Trimmed to 2KB — this rides as a data-part on the assistant
+                # message and persists to Firestore, so keep the per-message
+                # footprint reasonable.
+                "memoryBundleMarkdown": memory_bundle_str[:2000],
+                "enabledAgents": _enabled_agents,
+                "skillConfigKeys": _skill_config_keys,
+                "pendingActions": _pendings,
+                "inPlatform": bool(req.inPlatform),
+                "capturedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
+        except Exception as _exc:
+            logger.debug("context-debug build failed: %s", _exc)
 
         # ── AI tool loop (all iterations stream live) ─────────────────────────
         try:
@@ -1494,6 +1567,14 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
             )
 
             yield sse({"type": "start"})
+            # Emit the context-debug snapshot right after start so it lands as
+            # a data part on the assistant message — the chat UI's debug
+            # drawer reads it off message.parts.
+            if _context_debug_payload:
+                yield sse({
+                    "type": "data-context-debug",
+                    "data": _context_debug_payload,
+                })
             _publish_agent_roster(session_id, effective_skills)
             _publish_agent_status(session_id, "lynx", "thinking", "Planning")
 
