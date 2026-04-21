@@ -56,6 +56,31 @@ RELAY_URL = os.environ.get("HERMES_RELAY_URL", os.environ.get("RELAY_BASE_URL", 
 AUTH_TOKEN = os.environ.get("HERMES_AUTH_TOKEN", os.environ.get("RUNNER_KEY", ""))
 
 
+def _write_heartbeat(**extra):
+    """Record a heartbeat row so the admin UI can show 'worker last ran X ago'.
+    Non-fatal — if Firestore is unreachable we just skip.
+
+    The UI reads this at /api/admin/hermes-insights?type=health and colors
+    the badge green/amber/red based on age. Without this, a silently-dead
+    worker looks identical to 'no events to process'.
+    """
+    try:
+        from hermes_store import _get_db
+        db = _get_db()
+        if db is None:
+            return
+        payload = {
+            "path": "hermes-worker",
+            "lastTickAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            **extra,
+        }
+        db.collection("cronHeartbeats").document("hermes-worker").set(
+            payload, merge=True,
+        )
+    except Exception as exc:
+        logger.debug("heartbeat write failed: %s", exc)
+
+
 def process_turn_batch(event: dict):
     """Process a batch of conversation turns — extract, store, bridge to CRM."""
     turns = event.get("turns", [])
@@ -509,20 +534,38 @@ def run_poll_loop():
     logger.info("Hermes Worker started (poll interval=%ds)", POLL_INTERVAL)
     logger.info("Relay URL: %s", RELAY_URL[:50] if RELAY_URL else "NOT SET")
 
+    # Heartbeat cadence: tick every N polls even when the queue is empty so
+    # the admin UI can tell a live-but-idle worker apart from a dead one.
+    # With POLL_INTERVAL=5s this heartbeats every 30s.
+    tick = 0
+    HEARTBEAT_EVERY_N_POLLS = max(1, 30 // POLL_INTERVAL)
+
     while True:
         try:
             queue_len = get_queue_length()
+            processed = 0
             if queue_len > 0:
                 logger.info("Queue has %d events", queue_len)
                 events = get_pending_events(max_count=20)
                 if events:
                     process_events(events)
+                    processed = len(events)
+            # Heartbeat on every event-processing poll (so 'lastTickAt'
+            # advances when work actually happened) AND once every N idle
+            # polls so an idle worker still proves liveness to the UI.
+            if processed > 0 or tick % HEARTBEAT_EVERY_N_POLLS == 0:
+                _write_heartbeat(
+                    queueLength=queue_len,
+                    processed=processed,
+                    relayConfigured=bool(RELAY_URL and AUTH_TOKEN),
+                )
         except KeyboardInterrupt:
             logger.info("Hermes Worker shutting down")
             break
         except Exception as exc:
             logger.exception("Worker loop error: %s", exc)
 
+        tick += 1
         time.sleep(POLL_INTERVAL)
 
 
