@@ -164,6 +164,163 @@ def _emit_tool_executed(task: dict, exec_result: dict) -> None:
         logger.debug("emit_tool_executed failed (non-fatal): %s", exc)
 
 
+def _run_scheduled_turn(task: dict, worker_id: str, task_id: str) -> None:
+    """Phase 11-redux: a scheduled run replays a natural-language prompt in a
+    room's chat session. The cron route (Next.js) pre-built the full
+    ChatRequest — this worker just POSTs it to the orchestrator's /chat
+    endpoint and streams through to completion. All side effects (messages
+    to the room, tool calls, confirmation gate, Hermes memory) happen
+    inside the normal chat loop.
+
+    We consume the SSE stream chunk-by-chunk but only inspect it to decide
+    terminal status (completed / awaiting_confirmation / failed). The
+    stream BODY is the source of truth for user-visible output — which
+    already lands in chatRooms/{roomId}/messages via the chat loop.
+    """
+    import urllib.request
+    import urllib.error
+
+    body = task.get("scheduledTurnRequest")
+    runner_url = task.get("runnerUrl")
+    runner_key = task.get("runnerKey")
+    if not body or not runner_url:
+        mark_failed(
+            task_id,
+            error="scheduled_turn task missing scheduledTurnRequest or runnerUrl",
+        )
+        return
+
+    url = runner_url.rstrip("/") + "/chat"
+    import json as _json
+    req_body = _json.dumps(body).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if runner_key:
+        headers["Authorization"] = f"Bearer {runner_key}"
+
+    logger.info(
+        "[schedule] posting scheduled turn: task=%s room=%s url=%s body_bytes=%d",
+        task_id, body.get("roomId"), url, len(req_body),
+    )
+
+    req = urllib.request.Request(url, data=req_body, headers=headers, method="POST")
+
+    # Track terminal status inferred from the stream — the chat loop emits
+    # a `data-action` with action="pending" when it short-circuits on a
+    # confirmation gate; we surface that as awaiting_confirmation on the
+    # schedule's lastRunStatus.
+    saw_pending = False
+    last_error: str | None = None
+    started = time.time()
+    final_summary = ""
+    try:
+        with urllib.request.urlopen(req, timeout=max(60, TASK_TIMEOUT_SECONDS)) as resp:
+            status_code = resp.getcode()
+            if status_code != 200:
+                raise RuntimeError(f"orchestrator /chat returned HTTP {status_code}")
+            for raw in resp:
+                line = raw.decode("utf-8", errors="replace").rstrip()
+                if not line or not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    ev = _json.loads(payload)
+                except Exception:
+                    continue
+                etype = ev.get("type") if isinstance(ev, dict) else None
+                if etype == "error":
+                    last_error = str(ev.get("error") or "chat-loop error")
+                elif etype == "data-action":
+                    data = ev.get("data") if isinstance(ev, dict) else None
+                    if isinstance(data, dict) and data.get("action") == "pending":
+                        saw_pending = True
+                elif etype == "text-delta":
+                    delta = ev.get("delta") if isinstance(ev, dict) else None
+                    if isinstance(delta, str):
+                        final_summary += delta
+    except urllib.error.HTTPError as exc:
+        try:
+            body_bytes = exc.read() if exc else b""
+        except Exception:
+            body_bytes = b""
+        mark_failed(
+            task_id,
+            error=f"HTTP {exc.code}: {body_bytes.decode('utf-8', errors='replace')[:400]}",
+        )
+        return
+    except Exception as exc:
+        mark_failed(task_id, error=f"scheduled_turn stream failed: {exc}")
+        return
+
+    elapsed = time.time() - started
+    logger.info(
+        "[schedule] scheduled turn done: task=%s elapsed=%.1fs pending=%s err=%s",
+        task_id, elapsed, saw_pending, bool(last_error),
+    )
+
+    # Reflect terminal status back onto the schedule doc so the UI badge
+    # updates. The orchestrator already wrote the assistant/tool messages
+    # into the room; no message post needed here.
+    schedule_id = task.get("scheduleId")
+    if schedule_id:
+        _update_schedule_status(
+            schedule_id,
+            pending_id=None,  # Pending id would come from the chat loop; skip in MVP
+            status=(
+                "awaiting_confirmation" if saw_pending
+                else ("failed" if last_error else "completed")
+            ),
+            last_task_id=task_id,
+        )
+
+    if last_error:
+        mark_failed(task_id, error=last_error)
+    else:
+        mark_completed(
+            task_id,
+            result={
+                "ok": True,
+                "kind": "scheduled_turn",
+                "elapsedSeconds": round(elapsed, 1),
+                "summary": final_summary[:500],
+                "awaitingConfirmation": saw_pending,
+            },
+        )
+
+
+def _update_schedule_status(
+    schedule_id: str,
+    *,
+    pending_id: str | None,
+    status: str,
+    last_task_id: str | None,
+) -> None:
+    """Write lastRunStatus + lastTaskId + lastPendingId onto the schedule
+    doc. Non-fatal on failure — the schedule's source of truth is the
+    next cron claim anyway."""
+    try:
+        db = _get_db()
+        if db is None:
+            return
+        update = {
+            "lastRunStatus": status,
+            "updatedAt": _now_iso(),
+        }
+        if last_task_id:
+            update["lastTaskId"] = last_task_id
+        if pending_id is not None:
+            update["lastPendingId"] = pending_id
+        db.collection("schedules").document(schedule_id).update(update)
+    except Exception as exc:
+        logger.warning("schedule status update failed (id=%s): %s", schedule_id, exc)
+
+
+def _now_iso() -> str:
+    import datetime as _dt
+    return _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+
 def run_task(task: dict, worker_id: str) -> None:
     """Execute one claimed task end-to-end. Heartbeats on a daemon thread,
     posts the result message, then records the message id and flips to
@@ -186,6 +343,18 @@ def run_task(task: dict, worker_id: str) -> None:
 
     beat_thread = threading.Thread(target=_beat_loop, daemon=True)
     beat_thread.start()
+
+    # Phase 11-redux: scheduled turns replay a prompt through /chat. They
+    # skip the tool-call sandbox path entirely — no execute_command, no
+    # revocation check. The orchestrator's chat loop owns revocation.
+    kind = task.get("kind")
+    if kind == "scheduled_turn":
+        try:
+            _run_scheduled_turn(task, worker_id, task_id)
+        finally:
+            stop_heartbeat.set()
+            beat_thread.join(timeout=2)
+        return
 
     try:
         # ── Revocation check. ──────────────────────────────────────────────
