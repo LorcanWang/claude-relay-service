@@ -292,20 +292,24 @@ def _run_scheduled_turn(task: dict, worker_id: str, task_id: str) -> None:
     user_msg_id: str | None = None
     assistant_msg_id: str | None = None
     if room_id_for_post:
-        # 1. The user-role turn — carries the [Scheduled run: …] prefix +
-        #    the prompt so the room has visible context for what triggered
-        #    the assistant reply. Attributed to the schedule's sender
-        #    identity so the bubble doesn't look like a human asked.
+        # 1. The user-role turn — carries only the plain prompt text for the
+        #    UI. The "[Scheduled run: …]" prefix that Claude sees is ugly in
+        #    a chat bubble; use plainPrompt (stored on the task doc) for the
+        #    visible message. Sender attribution ("Schedule · <desc>")
+        #    already makes it clear this wasn't a human typing.
         try:
-            user_text = ""
-            msgs = body.get("messages") if isinstance(body, dict) else None
-            if isinstance(msgs, list) and msgs:
-                parts = msgs[-1].get("parts") if isinstance(msgs[-1], dict) else None
-                if isinstance(parts, list):
-                    user_text = "".join(
-                        (p.get("text") or "") for p in parts
-                        if isinstance(p, dict) and p.get("type") == "text"
-                    )
+            user_text = str(task.get("plainPrompt") or "").strip()
+            if not user_text:
+                # Back-compat for tasks created before plainPrompt existed —
+                # fall back to whatever's in the body, prefix and all.
+                msgs = body.get("messages") if isinstance(body, dict) else None
+                if isinstance(msgs, list) and msgs:
+                    parts = msgs[-1].get("parts") if isinstance(msgs[-1], dict) else None
+                    if isinstance(parts, list):
+                        user_text = "".join(
+                            (p.get("text") or "") for p in parts
+                            if isinstance(p, dict) and p.get("type") == "text"
+                        )
             if user_text:
                 user_msg_id = post_synthetic_message(
                     room_id=room_id_for_post,
