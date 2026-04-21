@@ -281,9 +281,74 @@ def _run_scheduled_turn(task: dict, worker_id: str, task_id: str) -> None:
         task_id, elapsed, saw_pending, bool(last_error),
     )
 
+    # Persist the turn to chatRooms/{roomId}/messages. The orchestrator's
+    # /chat endpoint only writes to the Redis session (for the agent loop);
+    # it's the browser client that normally writes to Firestore after the
+    # SSE stream ends. For scheduled runs, task_worker IS the client —
+    # so we persist here. Without this, the room's chat shows nothing for
+    # scheduled turns even though the session + memory were updated.
+    from room_messages import post_synthetic_message
+    room_id_for_post = task.get("roomId")
+    user_msg_id: str | None = None
+    assistant_msg_id: str | None = None
+    if room_id_for_post:
+        # 1. The user-role turn — carries the [Scheduled run: …] prefix +
+        #    the prompt so the room has visible context for what triggered
+        #    the assistant reply. Attributed to the schedule's sender
+        #    identity so the bubble doesn't look like a human asked.
+        try:
+            user_text = ""
+            msgs = body.get("messages") if isinstance(body, dict) else None
+            if isinstance(msgs, list) and msgs:
+                parts = msgs[-1].get("parts") if isinstance(msgs[-1], dict) else None
+                if isinstance(parts, list):
+                    user_text = "".join(
+                        (p.get("text") or "") for p in parts
+                        if isinstance(p, dict) and p.get("type") == "text"
+                    )
+            if user_text:
+                user_msg_id = post_synthetic_message(
+                    room_id=room_id_for_post,
+                    text=user_text,
+                    role="user",
+                    sender_user_id=body.get("senderUserId"),
+                    sender_display_name=body.get("senderDisplayName"),
+                    meta={
+                        "kind": "scheduled_turn_prompt",
+                        "taskId": task_id,
+                        "scheduleId": task.get("scheduleId"),
+                    },
+                )
+        except Exception as exc:
+            logger.warning(
+                "[schedule] failed to post scheduled user message (task=%s): %s",
+                task_id, exc,
+            )
+
+        # 2. The assistant answer — assembled from text-delta events during
+        #    the stream. Intermediate tool calls don't get their own UI
+        #    message today (the room just sees the final answer).
+        if final_summary.strip():
+            try:
+                assistant_msg_id = post_synthetic_message(
+                    room_id=room_id_for_post,
+                    text=final_summary,
+                    role="assistant",
+                    meta={
+                        "kind": "scheduled_turn_result",
+                        "taskId": task_id,
+                        "scheduleId": task.get("scheduleId"),
+                        "awaitingConfirmation": saw_pending,
+                    },
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[schedule] failed to post scheduled assistant message (task=%s): %s",
+                    task_id, exc,
+                )
+
     # Reflect terminal status back onto the schedule doc so the UI badge
-    # updates. The orchestrator already wrote the assistant/tool messages
-    # into the room; no message post needed here.
+    # updates without needing a secondary fetch.
     schedule_id = task.get("scheduleId")
     if schedule_id:
         _update_schedule_status(
@@ -297,7 +362,7 @@ def _run_scheduled_turn(task: dict, worker_id: str, task_id: str) -> None:
         )
 
     if last_error:
-        mark_failed(task_id, error=last_error)
+        mark_failed(task_id, error=last_error, result_message_id=assistant_msg_id)
     else:
         mark_completed(
             task_id,
@@ -307,7 +372,9 @@ def _run_scheduled_turn(task: dict, worker_id: str, task_id: str) -> None:
                 "elapsedSeconds": round(elapsed, 1),
                 "summary": final_summary[:500],
                 "awaitingConfirmation": saw_pending,
+                "userMessageId": user_msg_id,
             },
+            result_message_id=assistant_msg_id,
         )
 
 

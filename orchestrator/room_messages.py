@@ -26,19 +26,24 @@ from hermes_store import _get_db, _now_iso  # reuse existing ISO formatter
 logger = logging.getLogger("room_messages")
 
 
-def post_synthetic_assistant_message(
+def post_synthetic_message(
     *,
     room_id: str,
     text: str,
+    role: str = "assistant",
     meta: dict | None = None,
+    sender_user_id: str | None = None,
+    sender_display_name: str | None = None,
 ) -> Optional[str]:
-    """Append an assistant-role message to chatRooms/{roomId}/messages in a
-    single transaction that allocates `index` from room.messageCount. Returns
+    """Append a message to chatRooms/{roomId}/messages in a single
+    transaction that allocates `index` from room.messageCount. Returns
     the new message doc id, or None on failure.
 
     Shape matches Next.js saveRoomMessages so the chat UI renders it the
-    same way as any normal Lynx turn: clientId=None, role=assistant,
-    parts=[{type:text,text}], content=text, createdAt, index.
+    same way as any normal turn: clientId=None, role, parts=[{type:text,text}],
+    content=text, createdAt, index. Optional sender fields are included for
+    user-role messages so the UI can attribute the message properly
+    (e.g. "Schedule · Daily audit" for scheduled-run user turns).
     """
     if not room_id or not text:
         return None
@@ -61,7 +66,7 @@ def post_synthetic_assistant_message(
         def _txn(txn):
             room_snap = room_ref.get(transaction=txn)
             if not room_snap.exists:
-                logger.warning("post_synthetic_assistant_message: room %s not found", room_id)
+                logger.warning("post_synthetic_message: room %s not found", room_id)
                 raise RuntimeError("room_not_found")
             room_data = room_snap.to_dict() or {}
             # messageCount is the authoritative counter maintained by the
@@ -74,7 +79,7 @@ def post_synthetic_assistant_message(
 
             msg_doc: dict = {
                 "clientId": None,
-                "role": "assistant",
+                "role": role,
                 "parts": [{"type": "text", "text": text}],
                 "content": text,
                 "createdAt": now_iso,
@@ -82,6 +87,10 @@ def post_synthetic_assistant_message(
             }
             if meta:
                 msg_doc["meta"] = meta
+            if sender_user_id:
+                msg_doc["senderUserId"] = sender_user_id
+            if sender_display_name:
+                msg_doc["senderDisplayName"] = sender_display_name
 
             txn.set(msg_ref, msg_doc)
             txn.update(room_ref, {
@@ -95,9 +104,24 @@ def post_synthetic_assistant_message(
         return None
     except Exception as exc:
         logger.warning(
-            "post_synthetic_assistant_message txn failed (room=%s): %s",
-            room_id, exc,
+            "post_synthetic_message txn failed (room=%s role=%s): %s",
+            room_id, role, exc,
         )
         return None
 
     return new_msg_id
+
+
+# Backward-compat alias. Phase 6d callers (pending_actions.py) pass only
+# room_id/text/meta and always want an assistant role — keep the existing
+# name working so the confirmation-outcome chat messages don't need to
+# change.
+def post_synthetic_assistant_message(
+    *,
+    room_id: str,
+    text: str,
+    meta: dict | None = None,
+) -> Optional[str]:
+    return post_synthetic_message(
+        room_id=room_id, text=text, role="assistant", meta=meta,
+    )
