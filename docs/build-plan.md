@@ -226,6 +226,28 @@ Cron-driven runs of skill actions built on Phase 7's durable task infra. Vercel 
 - Per-schedule timezone (today: UTC only — add picker in create dialog).
 - Manual trigger button ("fire now") in the UI — easy to add once we have an endpoint.
 
+### Phase 11-redux — UX pivot to room-scoped schedules
+
+✅ shipped (zeon `cfce236` → `afdc088` → `742fbab`, relay `9b5bde0`)
+
+**What changed and why:** the original Phase 11 UI asked users to pick a skill, pick an action, and write a raw shell command (`SKILL_ARGS_JSON='...' python3 run.py`). Bruce screenshot-pushed back: too technical, wrong terminology ("skill" → "agent"), single-agent only, and wrong home (standalone page vs. room-internal). The redesign throws out the shell-exposure and recasts schedules as "re-run this natural-language prompt in this room on a cadence."
+
+**Schema (`cfce236`):** Schedule doc drops `skill`, `actionId`, `command`, `requiresConfirmation`, `skillConfigsSnapshot`, `inPlatformSnapshot`. Adds `roomId` (required), `description`, `prompt`. Firestore rules tightened to creator-or-room-member reads; writes stay server-only.
+
+**Execution path (`cfce236` + `9b5bde0`):** cron route resolves the schedule + room + org config via a new shared `buildScheduledChatRequest` helper (mirrors the live-chat resolution in `/api/chat/route.ts` exactly — same systemPrompt merge, enabledSkills, relay account binding). Config resolution happens at FIRE time, not create time (codex fold-in against stale-snapshot over-permission). The resolved ChatRequest is embedded in a `longRunningTask` with `kind: "scheduled_turn"`; the VPS `task_worker.py` branches on kind, POSTs it to the orchestrator's own `/chat` endpoint, and streams through to completion. All side effects (room chat messages, tool calls, confirmation gate, Hermes memory) happen inside the normal chat loop — no parallel machinery.
+
+**Synthetic user turn** per codex: `role: "user"` with transparent prefix `[Scheduled run: <description> — fired at <iso>]`, `senderUserId: "schedule:<id>"`, `senderDisplayName: "Schedule · <desc>"`.
+
+**UI (`afdc088`):** creation happens in-room. Hover over any user message → `🔁` icon opens the schedule dialog pre-filled with that text. Net-new via a `Schedule a prompt` button above the chat input (gated on `manage_hive`). Dialog takes three fields: short name, prompt (textarea, placeholder copy explains it's natural language), cadence (6 presets + Custom fallback). `/hive/schedules` becomes a read-only index grouped by room, with pause/resume/delete and click-through to open the originating space.
+
+**Confirmation compose** (MVP limitation, not a feature): if the scheduled turn trips the confirmation gate mid-Lynx-chain, the stream ends early, `lastRunStatus` flips to `awaiting_confirmation`. Supervisor approval via `/hive/signoff` fires the single pending tool via the existing Phase 6 machinery, but the original Lynx chain-of-reasoning is not preserved. Future work: spawn a fresh scheduled turn with the approved tool result baked into the prefix.
+
+**Deploy checklist (for this phase and the original Phase 11):**
+1. `firebase deploy --only firestore:rules,firestore:indexes --project zeon-solutions` — new rules for schedules, scheduleRuns; new composite indexes.
+2. Vercel: `CRON_SECRET` env var already set. No additional config beyond `vercel.json` cron entry.
+3. VPS: `cd ~/claude-relay-service && git pull && bash orchestrator/launchd-fix.sh restart` — picks up the `kind: "scheduled_turn"` branch in `task_worker.py`.
+4. Test: open a space, ask anything, hover the user message → 🔁 → dialog → pick "Every hour" → save. Wait up to 60s for cron to fire; watch the chat for the scheduled-run assistant turn and `/hive/schedules` for `queued → completed` status.
+
 ---
 
 ## Phase 8 — Context drawer
