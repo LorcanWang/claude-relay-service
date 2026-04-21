@@ -39,10 +39,8 @@ User-facing test: open Hive edit dialog as admin → "Model" field visible.
 - `disableModelInvocation` filters skill from index + blocks describe_skill + refuses run_command
 - `actions[]` declared on 4 skills (google-ad-campaign 20, ga4 11, bigcommerce 10, meta-ad-campaign 19) — 60 actions total with category/readOnly/idempotent/affectsAdSpend/requiresConfirmation/destructive metadata
 - `crm-notes` hidden from model (passive-only background skill)
-- Permissive validation: logs `Action matched` / `Action gap`, tags envelope `meta.action`/`meta.action_gap`. Does NOT block.
+- **Strict mode (Phase 9)**: gap hits go through the pending-action supervisor-approval gate instead of executing silently. Reuses `pendingActions` machinery with `isGap: true` — the "list of undeclared requests" is the /hive/signoff queue filtered on `isGap`. Set `STRICT_ACTIONS=0` to fall back to log-only for manifest debugging.
 - Manifest cache (`_MANIFEST_CACHE`) avoids repeated disk reads
-
-**Burn-in window**: ~14 days. Before flipping to strict mode (refusing undeclared actions), need zero `Action gap` warnings across all production skills for the window. Started `2026-04-19`.
 
 See [[skill-manifest-evolution]].
 
@@ -267,11 +265,13 @@ Estimated: 3 days.
 
 ## Phase 9 — Strict-mode flip + retire runner
 
-⏳ scheduled for ~2026-05-03 (14 days post burn-in start)
+✅ shipped 2026-04-21
 
-After zero `Action gap` warnings for 14 days:
-- Flip undeclared-action mode to strict (refuse rather than log)
-- Delete `runner/` directory entirely (no production caller per R5 verification)
+Flipped early since there's no user base to burn in against:
+- **Strict flip** (`STRICT_ACTIONS=1` default): gap hits write a pending-action with `isGap: true` and short-circuit execution. Supervisor approval on /hive/signoff runs it this time and exposes the command for manifest promotion. `STRICT_ACTIONS=0` reverts to log-only fallback.
+- **User override affordance**: reuses existing pending-action approval UX (same Approve/Cancel card, same /confirm + /cancel endpoints). The "undeclared" badge on the card distinguishes from normal `requiresConfirmation` pendings.
+- **`runner/` deleted** — verified zero production callers; task_worker references to `runnerUrl`/`runnerKey` are orchestrator auth fields, not the removed directory.
+- **Lynx stays generic** — strict mode only gates `run_command` execution; it has no effect on text replies or Lynx's conversational scope. See [[skill-manifest-evolution]].
 
 ---
 

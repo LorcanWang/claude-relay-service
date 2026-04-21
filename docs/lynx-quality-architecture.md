@@ -95,7 +95,7 @@ Three tools exposed (run_command, describe_skill, app_action) when the room has 
 
 ## Output token cap
 
-`MAX_OUTPUT_TOKENS = 16384` (env-tunable, was 8192). Lets long analyses complete without `length`-stop truncation. Doubled cost on a single long turn vs. baseline; rare in practice.
+Per-model caps via `MODEL_MAX_TOKENS` + `max_tokens_for(model)` helper in `orchestrator/main.py`. Opus/Sonnet 4.x get 32k, Haiku 4.x gets 16k; longest-prefix match against the model id, fallback 16k. `MAX_OUTPUT_TOKENS` env var (if set) globally overrides. Motivation: flat 16k cut off long Chinese responses mid-sentence (CJK runs ~1–2 tokens/char). See [[hermes-memory-system]] for how unused headroom is not persisted — caps are per-turn ceilings only.
 
 ## What this DOES NOT replace
 

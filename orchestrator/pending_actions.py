@@ -97,6 +97,7 @@ def create_pending(
     skill_configs: dict | None = None,
     in_platform: bool = True,
     long_running: bool = False,
+    is_gap: bool = False,
 ) -> dict | None:
     """Create a pending action doc. SNAPSHOTS the room's supervisorUserIds
     onto the doc at create time so later supervisor edits don't retroactively
@@ -152,6 +153,12 @@ def create_pending(
         # Stored at create time so /confirm doesn't need to re-match the
         # action against the manifest.
         "longRunning": bool(long_running),
+        # Phase 9: gap pendings are created when strict mode blocks an
+        # undeclared skill action. Supervisor approval path is identical to
+        # regular pendings; the flag is carried so the UI can render a
+        # distinct "undeclared action" header and the /hive/signoff list can
+        # highlight them for manifest-promotion review.
+        "isGap": bool(is_gap),
         "nonce": nonce,
         "status": "pending",
         "createdAt": now.isoformat(),

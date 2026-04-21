@@ -58,22 +58,19 @@ Field semantics:
 - `requiresConfirmation` — currently only logged (permissive phase); will gate execution behind a Firestore-backed confirmation flow in a later phase (planned, not yet documented).
 - `destructive` — true for irreversible removals (`remove_campaign`, `remove_keywords`).
 
-## Permissive validation phase
+## Strict mode (Phase 9)
 
-Phase 2 from the [[lynx-quality-architecture|build order]]. The orchestrator does NOT block on validation errors yet — it only logs and tags the tool envelope:
+`STRICT_ACTIONS=1` (default, shipped 2026-04-21). When a skill has `actions[]` declared and the model's command doesn't match any of them, the orchestrator:
 
-```python
-# orchestrator/main.py — run_command branch
-if get_skill_actions(skill_name):
-    matched_action = match_command_to_action(skill_name, command)
-    if matched_action:
-        logger.info("Action matched: skill=%s action=%s", skill_name, matched_action["id"])
-    else:
-        action_gap = True
-        logger.warning("Action gap: skill=%s command=%r — declare in manifest", ...)
-```
+1. Logs `Action gap: skill=… command=…` + tags the tool envelope `meta.action_gap: true` (observability carries over from the permissive phase).
+2. Creates a `pendingActions` doc with `isGap: true`, `actionId: "__gap__"`, `actionTitle: "Undeclared: <skill> · <command preview>"`.
+3. Returns an `awaiting_confirmation` envelope — no execution.
 
-The `meta.action` (or `meta.action_gap: true`) propagates into the [[tool-envelope]] returned to Claude. After a 14-day burn-in window with zero action_gap warnings across all production skills, strict mode flips on (refuses undeclared actions). See `commit 0c430aa` and `commit 3314285`.
+The pending card in chat + the `/hive/signoff` queue render the "undeclared" badge alongside existing flag pills. Supervisor approval runs the command through the same resume path as regular `requiresConfirmation` pendings (`claim_confirmed_for_execution` → `execute_command` → `mark_pending_completed`). Flip `STRICT_ACTIONS=0` to revert to log-only fallback during manifest debugging.
+
+The list of undeclared requests is just the `/hive/signoff` queue filtered on `isGap` — no separate collection. Use it to decide which commands to promote into each skill's `actions[]` manifest.
+
+See commits `0c430aa` (initial action_gap observability), `3314285` (manifest expansion), and the Phase 9 flip commit.
 
 ## Skill index render
 

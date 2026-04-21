@@ -92,9 +92,44 @@ logger = logging.getLogger("orchestrator")
 RUNNER_KEY = os.environ.get("RUNNER_KEY", "")
 DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "claude-sonnet-4-6")
 MAX_LOOP = int(os.environ.get("MAX_LOOP_ITERATIONS", "50"))
-# Max output tokens per call. Bumped from 8192 default so Sonnet/Opus can emit
-# longer analyses without getting cut off.
-MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "16384"))
+# Phase 9: strict-mode flip. When a skill has actions[] declared and the
+# model emits a command that doesn't match any declared action, gate the
+# execution through the pending-action approval flow instead of running it
+# silently. Set STRICT_ACTIONS=0 to fall back to the permissive log-only
+# behavior while debugging manifest drift.
+STRICT_ACTIONS = os.environ.get("STRICT_ACTIONS", "1") != "0"
+# Per-model output ceilings. Chinese/CJK output is ~1-2 tokens per char, so a
+# flat 16k cap truncated long analyses mid-sentence. Pick caps that match each
+# model's published ceiling; env var (if set) acts as a global override.
+MODEL_MAX_TOKENS = {
+    "claude-opus-4-7": 32000,
+    "claude-opus-4-6": 32000,
+    "claude-opus-4": 32000,
+    "claude-sonnet-4-6": 32000,
+    "claude-sonnet-4": 32000,
+    "claude-haiku-4-5": 16000,
+    "claude-haiku-4": 16000,
+}
+DEFAULT_MODEL_MAX_TOKENS = 16000
+MAX_OUTPUT_TOKENS_ENV = os.environ.get("MAX_OUTPUT_TOKENS")
+
+
+def max_tokens_for(model: str) -> int:
+    """Return the output cap for a model. Longest-prefix match against the
+    MODEL_MAX_TOKENS table; falls back to DEFAULT_MODEL_MAX_TOKENS. If the
+    MAX_OUTPUT_TOKENS env var is set, it overrides for all models."""
+    if MAX_OUTPUT_TOKENS_ENV:
+        try:
+            return int(MAX_OUTPUT_TOKENS_ENV)
+        except ValueError:
+            pass
+    if not model:
+        return DEFAULT_MODEL_MAX_TOKENS
+    best_match = None
+    for key in MODEL_MAX_TOKENS:
+        if model.startswith(key) and (best_match is None or len(key) > len(best_match)):
+            best_match = key
+    return MODEL_MAX_TOKENS[best_match] if best_match else DEFAULT_MODEL_MAX_TOKENS
 # Extended thinking budget (tokens). Only used on Opus models; Sonnet/Haiku
 # turns stay lean. Set to 0 to disable globally.
 OPUS_THINKING_BUDGET = int(os.environ.get("OPUS_THINKING_BUDGET", "4096"))
@@ -1562,7 +1597,7 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                 system=system_blocks,
                 tools=tools,
                 model=model,
-                max_tokens=MAX_OUTPUT_TOKENS,
+                max_tokens=max_tokens_for(model),
                 thinking_budget=OPUS_THINKING_BUDGET,
             )
 
@@ -1790,15 +1825,34 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                                         skill_name, command[:200],
                                     )
 
-                            # Phase 6: if the matched action requires confirmation,
-                            # check for a confirmed pending FIRST (resume path).
-                            # If user already approved this exact command, run it
-                            # transparently. Otherwise, gate by writing a new
-                            # pending and short-circuiting execution.
-                            if (
-                                matched_action
-                                and matched_action.get("requiresConfirmation")
-                            ):
+                            # Phase 6 + Phase 9: route through the supervisor
+                            # approval gate when EITHER
+                            #   (a) the matched action declares requiresConfirmation, OR
+                            #   (b) the command doesn't match any declared action and
+                            #       STRICT_ACTIONS is on (gap → user must authorize).
+                            # Both paths share the same resume/gate machinery; the
+                            # only difference is the action metadata seeded onto the
+                            # pending doc (real action fields vs synthetic gap fields).
+                            is_gap_gate = bool(action_gap and not matched_action and STRICT_ACTIONS)
+                            needs_gate = (
+                                (matched_action and matched_action.get("requiresConfirmation"))
+                                or is_gap_gate
+                            )
+                            if needs_gate:
+                                if is_gap_gate:
+                                    preview_cmd = (command or "").strip().split("\n")[0][:60]
+                                    gate_action_id = "__gap__"
+                                    gate_action_title = f"Undeclared: {skill_name} · {preview_cmd}"
+                                    gate_destructive = False
+                                    gate_affects_ad_spend = False
+                                    gate_long_running = False
+                                else:
+                                    gate_action_id = matched_action.get("id", "")
+                                    gate_action_title = matched_action.get("title", "")
+                                    gate_destructive = bool(matched_action.get("destructive"))
+                                    gate_affects_ad_spend = bool(matched_action.get("affectsAdSpend"))
+                                    gate_long_running = bool(matched_action.get("longRunning"))
+
                                 claimed = claim_confirmed_for_execution(
                                     org_id=req.orgId or "",
                                     user_id=req.userId or "",
@@ -1808,13 +1862,10 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                                 if claimed:
                                     # Resume path: atomic claim succeeded — the doc
                                     # is now status=executing and reserved for us.
-                                    # Two concurrent resume turns can't both end up
-                                    # here because the txn is conditional on
-                                    # status="confirmed" at commit.
                                     pending_id = claimed.get("id", "")
                                     logger.info(
-                                        "Resuming claimed pending: id=%s skill=%s action=%s",
-                                        pending_id, skill_name, matched_action.get("id"),
+                                        "Resuming claimed pending: id=%s skill=%s action=%s gap=%s",
+                                        pending_id, skill_name, gate_action_id, is_gap_gate,
                                     )
                                     _publish_agent_switch(session_id, "lynx", skill_id, f"Delegating to {skill_name} (approved)")
                                     _publish_agent_status(session_id, skill_id, "working", preview or "Running approved command")
@@ -1827,10 +1878,8 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                                         "room_id": req.roomId,
                                         "attachments": turn_attachments,
                                     })
-                                    # Stash a brief result summary on the pending
-                                    # for the admin re-entry surface; never the full data.
                                     mark_pending_completed(pending_id, result={
-                                        "summary": (matched_action.get("title") or matched_action.get("id") or "") + " executed",
+                                        "summary": (gate_action_title or gate_action_id or "") + " executed",
                                         "status": "ok" if (isinstance(result, dict) and result.get("ok") is not False) else "error",
                                     })
                                     note = result.get("agentNote") if isinstance(result, dict) else ""
@@ -1845,20 +1894,14 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                                         session_id=session_id,
                                         skill=skill_name,
                                         command=command,
-                                        action_id=matched_action.get("id", ""),
-                                        action_title=matched_action.get("title", ""),
-                                        destructive=bool(matched_action.get("destructive")),
-                                        affects_ad_spend=bool(matched_action.get("affectsAdSpend")),
-                                        # Snapshot the room's full skill configs so
-                                        # the supervisor-approved execution runs
-                                        # against the requester's intended account.
+                                        action_id=gate_action_id,
+                                        action_title=gate_action_title,
+                                        destructive=gate_destructive,
+                                        affects_ad_spend=gate_affects_ad_spend,
                                         skill_configs=req.skillConfigs or {},
                                         in_platform=bool(req.inPlatform),
-                                        # Phase 7: propagate so /confirm can route
-                                        # approval of long-running actions into the
-                                        # task worker instead of blocking the HTTP
-                                        # request on a multi-minute subprocess.
-                                        long_running=bool(matched_action.get("longRunning")),
+                                        long_running=gate_long_running,
+                                        is_gap=is_gap_gate,
                                     )
                                     _publish_agent_status(
                                         session_id,
@@ -1870,26 +1913,16 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                                     if pending_doc:
                                         pending_payload = {
                                             "id": pending_doc["id"],
-                                            "actionId": matched_action.get("id"),
-                                            "actionTitle": matched_action.get("title"),
+                                            "actionId": gate_action_id,
+                                            "actionTitle": gate_action_title,
                                             "command": command,
                                             "skill": skill_name,
-                                            "destructive": bool(matched_action.get("destructive")),
-                                            "affectsAdSpend": bool(matched_action.get("affectsAdSpend")),
+                                            "destructive": gate_destructive,
+                                            "affectsAdSpend": gate_affects_ad_spend,
                                             "expiresAt": pending_doc["expiresAt"],
-                                            # Phase 6c: requester is exposed so the inline card
-                                            # UI can decide whether to show the requester-only
-                                            # "Cancel my request" button. Approval lives on
-                                            # /hive/signoff and is gated server-side by supervisor
-                                            # membership — the UI hint is not security.
                                             "requesterUserId": req.userId or "",
+                                            "isGap": is_gap_gate,
                                         }
-                                        # Surface the pending action to the UI as a
-                                        # data-action so the inline Approve/Cancel
-                                        # card renders. Tool envelopes are
-                                        # consumed server-side and never reach the
-                                        # frontend; data-action is the bridge
-                                        # (same channel as app_action).
                                         collected_actions.append({
                                             "action": "pending",
                                             "pending": pending_payload,
@@ -1900,9 +1933,6 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                                             "pending": pending_payload,
                                         }
                                     else:
-                                        # Firestore unavailable — fail safe: do NOT
-                                        # execute. Tell the model so it relays a clear
-                                        # error to the user.
                                         result = {
                                             "ok": False,
                                             "error": (
