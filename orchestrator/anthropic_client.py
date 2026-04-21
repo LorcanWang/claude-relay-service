@@ -19,11 +19,18 @@ REQUEST_TIMEOUT = 120  # seconds
 APP_ACTION_TOOL = {
     "name": "app_action",
     "description": (
-        "Perform an action in the Zeon webapp — navigate to a page or show a toast notification. "
-        "Call this after completing a task to send the user to the right place. "
+        "Suggest an action in the Zeon webapp — offer navigation or show a toast. "
+        "action='navigate' renders an inline Yes/No card in the chat; the user "
+        "chooses whether to open it. You are NOT transporting the user — you are "
+        "OFFERING a destination. action='toast' shows a passive notification and "
+        "fires immediately. "
         "IMPORTANT: app_action is a SUPPLEMENT to your answer, never a replacement. "
-        "You must always write a text response in the same turn explaining what you found or did. "
-        "Do not end the turn with only an app_action and no text — the user will see a blank chat bubble."
+        "Always write a text response in the same turn that stands on its own even "
+        "if the user dismisses the card. Do not end a turn with only app_action "
+        "and no text — the user will see a blank chat bubble. "
+        "Only request navigate when the user explicitly asks to view/open/show "
+        "something; do not navigate after a read-only query or an import that "
+        "already returned its result in chat."
     ),
     "input_schema": {
         "type": "object",
@@ -31,7 +38,10 @@ APP_ACTION_TOOL = {
             "action": {
                 "type": "string",
                 "enum": ["navigate", "toast"],
-                "description": "'navigate' to go to a page, 'toast' to show a notification",
+                "description": (
+                    "'navigate' to offer a page (user confirms via a Yes/No card); "
+                    "'toast' to show an instant notification."
+                ),
             },
             "path": {
                 "type": "string",
