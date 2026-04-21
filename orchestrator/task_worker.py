@@ -190,10 +190,25 @@ def _run_scheduled_turn(task: dict, worker_id: str, task_id: str) -> None:
         )
         return
 
-    url = runner_url.rstrip("/") + "/chat"
+    # When task_worker runs on the same host as the orchestrator, hit it via
+    # localhost to bypass Cloudflare — it blocks Python's default urllib
+    # User-Agent with error 1010 ("Access Denied") on the clawdbots.dev
+    # edge. The LOCAL_ORCHESTRATOR_URL env var is set in orchestrator/.env
+    # on the VPS (typically http://localhost:8090). runner_key still works
+    # against localhost because the /chat endpoint's verify_token dependency
+    # matches the same RUNNER_KEY either way.
+    local_url = os.environ.get("LOCAL_ORCHESTRATOR_URL", "").strip()
+    effective_base = local_url or runner_url
+    url = effective_base.rstrip("/") + "/chat"
     import json as _json
     req_body = _json.dumps(body).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        # Set even when we go direct to localhost — cheap, and the next
+        # operator who changes LOCAL_ORCHESTRATOR_URL to a Cloudflare-
+        # fronted host won't be surprised by a 1010 rejection.
+        "User-Agent": "lynx-task-worker/1.0 (+https://zeonsolutions.ai)",
+    }
     if runner_key:
         headers["Authorization"] = f"Bearer {runner_key}"
 
