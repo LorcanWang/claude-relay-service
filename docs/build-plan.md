@@ -180,6 +180,54 @@ No new Firestore indexes — existing `orgId + memoryType + status + temporal.la
 
 ---
 
+## Phase 10 — File attachments
+
+✅ shipped (zeon `b35860a` → `c11df77` → `fa3e50b`, relay `3d40e3d` → `ef4941c` → `a5dad35`, grantllama `0177614` → `ca27ea1` → `506f59e`)
+
+Bidirectional file support for hive chat. User uploads PDFs/images via paperclip; skills like `recruiting` can read them to extract structured data; skills can also emit files back (future use).
+
+**Backend (zeon `b35860a`, `6586483`):** Firebase Storage `zeonsolutions` bucket, `hive-attachments/{orgId}/{roomId}/{attachmentId}/` prefix. Direct browser PUT via 15-min signed upload URL; Firestore `attachments/{id}` metadata doc is the authorization authority (per codex review — signed URLs are bearer-only). `/api/attachments/sign-upload`, `/api/attachments` (register), `/api/attachments/:id/download` (15-min read URL after room-member check). 7-day URL expiry; lifecycle rule deferred.
+
+**Frontend (zeon `c11df77`):** Paperclip + multi-file selection in chat input with per-file upload chips (uploading/done/error, per-file remove). Send button blocks while uploads in flight. `attachment-chip.tsx` handles read-side: image preview loads lazily on click; everything else shows file icon + download button that mints a fresh signed URL. Uploads attach as `data-attachment` parts on the user message.
+
+**Orchestrator (relay `3d40e3d`):** `attachments.py` resolves attachment refs → fetches Firestore doc → validates org/room scope → mints fresh 7-day signed GET URL via google-cloud-storage (same service account as firebase_admin). List injected as `LYNX_ATTACHMENTS_JSON` env var.
+
+**Anthropic-native PDF/image (relay `ef4941c`):** PDFs become `{type:"document",source:{type:"url"}}` blocks, images become `{type:"image"}` blocks. Claude reads natively — no pdftotext/pypdf on VPS. Caps: 3 PDFs / 10 images per turn. Blocks scrubbed from persisted session messages after turn completes (text placeholder preserves filename) so follow-up turns don't re-ingest bytes.
+
+**Executor sandbox (relay `a5dad35`):** Response to an incident where the model ran `brew install poppler` from inside a skill and the grandchild escaped the 60s timeout. Four layers: no shell (Popen with argv list via shlex), argv allowlist (python/python3 + .py file inside skill dir), env-var prefix allowlist (SKILL_ARGS_JSON only — blocks LYNX_ORG_ID impersonation), process-group kill on timeout (SIGTERM 5s → SIGKILL), Linux RLIMITs (NPROC/NOFILE/FSIZE/CPU) as defense in depth. Verified grandchild kill with a smoke test.
+
+**First consumer (grantllama `0177614` → `ca27ea1`):** `recruiting` skill. Two invocation paths: (1) inline `parsed_records` in SKILL_ARGS_JSON — Claude parses PDF via document block, calls skill with pre-extracted fields; (2) legacy local-file path with `parsed_json`. `resume_import.py` now works without the PDF on disk — best-effort extraction, sha256 computed from text when no file, deterministic doc_id preserved via `candidate_id` field. Plus SSL certifi fix for the download path (matches bigcommerce 969bf05 pattern) and structured stderr logs `[phase10][recruiting]` at every decision point.
+
+**Known gap (follow-up):** Attachment metadata snapshotting onto pendingActions / longRunningTasks docs. Needed for confirmation-gated or scheduled actions that carry attachments. Folded into Phase 11 prep.
+
+---
+
+## Phase 11 — Scheduled tasks
+
+✅ shipped (zeon `46298c2` → `d928a49`)
+
+Cron-driven runs of skill actions built on Phase 7's durable task infra. Vercel Cron hits a Next.js endpoint every minute; due schedules spawn either a `longRunningTask` (unlocked skills) or a `pendingAction` (confirmation-gated skills with deadline = next scheduled fire — unapproved → `expired_unapproved`).
+
+**Backend (`46298c2`):**
+- `schedules/{id}` Firestore collection with `cron`, `nextRunAt`, `lastRunStatus`, `requiresConfirmation` (snapshotted at create from action manifest), `skillConfigsSnapshot`, `inPlatformSnapshot`.
+- `/api/cron/schedules` — Vercel Cron endpoint. Sweeps expired schedule-pendings, claims up to 50 due schedules per tick, spawns downstream docs. `CRON_SECRET` bearer auth.
+- `claimDueSchedule` — Firestore transaction atomically advances `nextRunAt`. Miss-tick recovery fires ONCE for the latest missed window, advances past earlier missed ones (codex: "catch up all N" is a surprise-spend hazard). Deterministic task/pending ids `sch_{scheduleId}_{scheduledForIso}` — double-claim returns ALREADY_EXISTS and no-ops.
+- `/api/schedules` CRUD — admin-gated. `sweepExpiredSchedulePendings` marks each unapproved scheduled pending as `expired_unapproved` once its deadline passes.
+
+**Frontend (`d928a49`):** `/hive/schedules` page — list with status-colored badges, create dialog with cron presets (every-hour / 6h / daily / weekly / monthly) + freeform override, skill + action picker driven by `organization.enabledSkills`, auto-surfaces `requiresConfirmation` flag with supervisor banner. Admin-only create/edit/delete. Nav entry added under Hive dropdown (`add-hive-schedules-path.ts` migration).
+
+**Deploy checklist:**
+1. `firebase deploy --only firestore:rules,firestore:indexes --project zeon-solutions`
+2. Vercel project: set `CRON_SECRET` env var; next deploy auto-registers the cron.
+3. Test: create a schedule with a short cadence (e.g. every hour) against a safe skill action, watch `/hive/schedules` for `queued → completed` status.
+
+**Deferred to future work:**
+- Run history collection (today: only `lastTaskId` + `lastRunStatus` fields on the schedule doc). Next increment: `scheduleRuns/{id}` with per-fire audit.
+- Per-schedule timezone (today: UTC only — add picker in create dialog).
+- Manual trigger button ("fire now") in the UI — easy to add once we have an endpoint.
+
+---
+
 ## Phase 8 — Context drawer
 
 ⏳ planned, not started
