@@ -190,15 +190,22 @@ def _run_scheduled_turn(task: dict, worker_id: str, task_id: str) -> None:
         )
         return
 
-    # When task_worker runs on the same host as the orchestrator, hit it via
-    # localhost to bypass Cloudflare — it blocks Python's default urllib
-    # User-Agent with error 1010 ("Access Denied") on the clawdbots.dev
-    # edge. The LOCAL_ORCHESTRATOR_URL env var is set in orchestrator/.env
-    # on the VPS (typically http://localhost:8090). runner_key still works
-    # against localhost because the /chat endpoint's verify_token dependency
-    # matches the same RUNNER_KEY either way.
-    local_url = os.environ.get("LOCAL_ORCHESTRATOR_URL", "").strip()
-    effective_base = local_url or runner_url
+    # When task_worker runs on the same host as the orchestrator (the default
+    # single-machine deployment), hit it via localhost to bypass Cloudflare —
+    # the clawdbots.dev edge blocks Python's default urllib User-Agent with
+    # error 1010 ("Access Denied"). Default is computed from the same
+    # ORCHESTRATOR_PORT main.py reads (default 8090). An explicit
+    # LOCAL_ORCHESTRATOR_URL env var overrides the default — set it to the
+    # empty string to force the remote runner_url (e.g. task_worker on a
+    # different host). runner_key auth works against localhost because the
+    # /chat endpoint's verify_token dependency matches the same RUNNER_KEY
+    # either way.
+    local_url_env = os.environ.get("LOCAL_ORCHESTRATOR_URL")
+    if local_url_env is None:
+        orch_port = os.environ.get("ORCHESTRATOR_PORT", "8090")
+        effective_base = f"http://localhost:{orch_port}"
+    else:
+        effective_base = local_url_env.strip() or runner_url
     url = effective_base.rstrip("/") + "/chat"
     import json as _json
     req_body = _json.dumps(body).encode("utf-8")
