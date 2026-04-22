@@ -81,6 +81,7 @@ from mcp_manager import MCPManager
 from status_hub import status_hub
 from hermes_emitter import emit_turn_completed, emit_tool_executed, emit_session_closed
 from hermes_retrieval import build_memory_bundle
+from metrics_emitter import emit_run_completed, new_run_id
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1415,6 +1416,21 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                             "code": "ROOM_BUSY",
                             "holder": holder_str[:8],
                         })
+                        # Emit metric for the early-return path so the
+                        # finally-block emit isn't the only call site.
+                        # Otherwise ROOM_BUSY rejections are invisible in
+                        # logs/agent_metrics.ndjson.
+                        try:
+                            emit_run_completed(
+                                run_id=new_run_id(),
+                                session_id=session_id,
+                                room_id=req.roomId,
+                                org_id=req.orgId,
+                                user_id=req.userId,
+                                final_outcome="room_busy",
+                            )
+                        except Exception:
+                            pass
                         return
                     lock_acquired = True
             except Exception as exc:
@@ -1428,6 +1444,18 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
 
         enabled_names = [s.name for s in effective_skills]
         model = req.anthropicConfig.model or DEFAULT_MODEL
+
+        # ── per-turn agent metrics (JSONL) ────────────────────────────────────
+        # Mint a run_id at handler entry so the metric record correlates with
+        # whatever the chat loop logs along the way. Counters mutate inside
+        # the loop; finally-block emits exactly one line per turn regardless
+        # of how the handler exits.
+        _metric_run_id = new_run_id()
+        _metric_t0_ms = int(time.time() * 1000)
+        _metric_tool_calls = 0
+        _metric_retrieval_hits = 0
+        _metric_retrieval_empty = True
+        _metric_outcome = "success"
 
         # ── session ───────────────────────────────────────────────────────────
         if req.clearSession:
@@ -1564,6 +1592,15 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                 system_blocks.append({"type": "text", "text": memory_bundle})
                 memory_bundle_str = memory_bundle
                 logger.info("Hermes memory injected (%d chars)", len(memory_bundle))
+                # `retrieval_empty` is the precise "no bundle injected"
+                # signal. Hits is a cheap proxy for "how many memories
+                # landed" — count bullet leaders across the recent-decisions,
+                # insights, and cross-room sections (see hermes_retrieval.py).
+                # Profile-only sections without bullets won't increment hits,
+                # but `retrieval_empty` still reads false because the bundle
+                # was injected. That's the right semantics.
+                _metric_retrieval_empty = False
+                _metric_retrieval_hits = memory_bundle.count("\n- ")
         except Exception as exc:
             logger.warning("Hermes retrieval failed, continuing without: %s", exc)
 
@@ -1778,6 +1815,9 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
 
                 # ── tool_use: extract and execute ────────────────────────────
                 tool_uses = stream.tool_uses
+                # Per-turn metric: count tool calls the model intends to make
+                # in this iteration (sums across loop iterations).
+                _metric_tool_calls += len(tool_uses or [])
                 if not tool_uses:
                     # Edge case: stop_reason=tool_use but no blocks found
                     if collected_actions:
@@ -2134,12 +2174,19 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                 _publish_agent_status(session_id, "lynx", "completed", "Done")
                 yield sse("[DONE]")
                 logger.warning("Max loop iterations reached for [%s]", session_id)
+                _metric_outcome = "max_loop_exhausted"
 
             _scrub_ephemeral_attachments(session["messages"])
             save_session(session_id, session)
 
+        except asyncio.CancelledError:
+            # Client disconnected mid-stream. Don't double-log a Traceback;
+            # just record the outcome and re-raise so SSE cleanup runs.
+            _metric_outcome = "cancelled"
+            raise
         except Exception as exc:
             logger.exception("Error in chat loop for [%s]: %s", session_id, exc)
+            _metric_outcome = "error"
             try:
                 _scrub_ephemeral_attachments(session["messages"])
                 save_session(session_id, session)
@@ -2148,6 +2195,24 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
             async for chunk in stream_error(str(exc)):
                 yield chunk
         finally:
+            # Emit per-turn agent metric record exactly once, regardless of
+            # how the handler exits. Best-effort — append failures don't
+            # touch /chat success.
+            try:
+                emit_run_completed(
+                    run_id=_metric_run_id,
+                    session_id=session_id,
+                    room_id=req.roomId,
+                    org_id=req.orgId,
+                    user_id=req.userId,
+                    tool_call_count=_metric_tool_calls,
+                    retrieval_hit_count=_metric_retrieval_hits,
+                    retrieval_empty=_metric_retrieval_empty,
+                    final_outcome=_metric_outcome,
+                    duration_ms=int(time.time() * 1000) - _metric_t0_ms,
+                )
+            except Exception:
+                pass
             if mcp_mgr:
                 await mcp_mgr.shutdown()
             # Release Redis lock only if we still own it (compare-and-delete)
