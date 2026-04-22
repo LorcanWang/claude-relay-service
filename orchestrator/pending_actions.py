@@ -356,18 +356,45 @@ def mark_executing(pending_id: str) -> bool:
 
 
 def mark_completed(pending_id: str, result: dict | None = None) -> bool:
+    """Flip executing → completed. Transactional so a late completion can't
+    overwrite a sweeper-flipped `failed` doc — the executing precondition
+    check inside the txn means an already-failed doc just stays failed.
+    Returns True only when we actually flipped, False on no-op or error."""
     db = _get_db()
     if db is None:
         return False
+    ref = db.collection(COLLECTION).document(pending_id)
+    summary = result.get("summary") if isinstance(result, dict) else None
+    result_payload = (
+        {"summary": summary, "status": result.get("status")} if summary else None
+    )
     try:
-        update: dict = {"status": "completed", "completedAt": _now_iso()}
-        if result is not None:
-            # Only stash a small summary — never the full data payload.
-            summary = result.get("summary") if isinstance(result, dict) else None
-            update["result"] = {"summary": summary, "status": result.get("status")} if summary else None
-        db.collection(COLLECTION).document(pending_id).update(update)
-        return True
-    except Exception:
+        from firebase_admin import firestore as _fs
+        transaction = db.transaction()
+
+        @_fs.transactional
+        def _txn(txn):
+            snap = ref.get(transaction=txn)
+            if not snap.exists:
+                return False
+            doc = snap.to_dict() or {}
+            if doc.get("status") != "executing":
+                # Already cancelled / failed (sweeper) / completed (race) —
+                # don't clobber.
+                logger.info(
+                    "mark_completed no-op: id=%s already status=%s",
+                    pending_id, doc.get("status"),
+                )
+                return False
+            update = {"status": "completed", "completedAt": _now_iso()}
+            if result_payload is not None:
+                update["result"] = result_payload
+            txn.update(ref, update)
+            return True
+
+        return bool(_txn(transaction))
+    except Exception as exc:
+        logger.warning("mark_completed txn failed for %s: %s", pending_id, exc)
         return False
 
 
@@ -796,6 +823,57 @@ def write_approval_memory(*, pending: dict, outcome: str, actor_uid: str) -> Non
         write_memory(memory)
     except Exception as exc:
         logger.warning("write_approval_memory: persistence failed: %s", exc)
+
+
+def sweep_stuck_executing(stale_seconds: int = 600) -> int:
+    """Find pending docs stuck in `executing` for longer than the stale
+    threshold and flip them to `failed`.
+
+    Background task that protects against orphans when the chat handler
+    successfully claims a pending → starts the subprocess → the client
+    disconnects mid-await. The to_thread wrapper at the call site uses
+    asyncio.shield so the post-await mark_pending_completed runs in
+    normal cases, but a process crash / OOM still leaves the doc
+    executing. This sweeper is the second line of defense.
+
+    Returns the number of docs flipped. Intended to be called on a
+    timer (e.g. every 60s) from a startup background task.
+    """
+    db = _get_db()
+    if db is None:
+        return 0
+    cutoff = (_now() - timedelta(seconds=stale_seconds)).isoformat()
+    try:
+        snap = (
+            db.collection(COLLECTION)
+            .where("status", "==", "executing")
+            .where("executedAt", "<", cutoff)
+            .limit(50)
+            .get()
+        )
+    except Exception as exc:
+        logger.warning("sweep_stuck_executing query failed: %s", exc)
+        return 0
+
+    flipped = 0
+    for d in snap:
+        try:
+            d.reference.update({
+                "status": "failed",
+                "completedAt": _now_iso(),
+                "result": {
+                    "summary": "execution did not finish — sweeper recovered after stale timeout",
+                    "status": "error",
+                },
+            })
+            flipped += 1
+            logger.warning(
+                "sweep_stuck_executing: flipped pending %s (skill=%s) to failed",
+                d.id, (d.to_dict() or {}).get("skill"),
+            )
+        except Exception as exc:
+            logger.warning("sweep_stuck_executing: update failed for %s: %s", d.id, exc)
+    return flipped
 
 
 def load_pending(pending_id: str) -> dict | None:

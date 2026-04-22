@@ -98,6 +98,24 @@ MAX_LOOP = int(os.environ.get("MAX_LOOP_ITERATIONS", "50"))
 # silently. Set STRICT_ACTIONS=0 to fall back to the permissive log-only
 # behavior while debugging manifest drift.
 STRICT_ACTIONS = os.environ.get("STRICT_ACTIONS", "1") != "0"
+# Concurrency: cap the default asyncio threadpool used by asyncio.to_thread.
+# Each slot can be parked on a 60s subprocess; without a cap, an unbounded
+# burst of /chat requests would let asyncio.to_thread grow the pool past
+# default min(32, cpu_count + 4) and starve the host. Override with the env
+# var if you scale uvicorn to many workers and want a smaller per-worker cap.
+EXECUTOR_THREADS = int(os.environ.get("EXECUTOR_THREADS", "16"))
+# Pending-sweeper cadence + staleness threshold. Background task flips
+# pending docs stuck in `executing` past STALE_SECONDS to `failed`. Defends
+# against process crashes between the `claim_*_for_execution` txn and the
+# `mark_pending_completed` write — the asyncio.shield wrapper handles the
+# normal client-disconnect case; this is the second line of defense.
+SWEEPER_INTERVAL_SECONDS = int(os.environ.get("PENDING_SWEEPER_INTERVAL", "60"))
+# Stale threshold larger than the worst realistic queue+execution time so a
+# saturated threadpool doesn't get its in-flight pending flipped to failed
+# while it's still legitimately running. With 16 threads and 60s subprocess
+# cap, worst-case queue latency under burst is bounded; 20 min gives ample
+# margin while still cleaning up real orphans.
+SWEEPER_STALE_SECONDS = int(os.environ.get("PENDING_SWEEPER_STALE", "1200"))
 # Per-model output ceilings. Chinese/CJK output is ~1-2 tokens per char, so a
 # flat 16k cap truncated long analyses mid-sentence. Pick caps that match each
 # model's published ceiling; env var (if set) acts as a global override.
@@ -152,6 +170,45 @@ app.add_middleware(
     allow_headers=["*"],
 )
 security = HTTPBearer(auto_error=False)
+
+
+@app.on_event("startup")
+async def _on_startup():
+    """Concurrency setup:
+      1. Cap the asyncio default executor — asyncio.to_thread uses it for
+         the sync execute_command hops. Default is min(32, cpu_count + 4),
+         which can pile up many parked subprocesses under burst load.
+      2. Spawn the pending-sweeper background task — flips orphaned
+         pendings stuck in `executing` past STALE_SECONDS to `failed`.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(
+        ThreadPoolExecutor(max_workers=EXECUTOR_THREADS, thread_name_prefix="orchestrator-skill")
+    )
+    logger.info("startup: executor threadpool capped at %d", EXECUTOR_THREADS)
+    asyncio.create_task(_pending_sweeper_loop())
+
+
+async def _pending_sweeper_loop():
+    """Periodic background sweep — runs every SWEEPER_INTERVAL_SECONDS,
+    flips pendings stuck in `executing` longer than SWEEPER_STALE_SECONDS
+    to `failed`. Best-effort; logs and keeps looping on any error."""
+    from pending_actions import sweep_stuck_executing
+    logger.info(
+        "pending sweeper running every %ds (stale threshold %ds)",
+        SWEEPER_INTERVAL_SECONDS, SWEEPER_STALE_SECONDS,
+    )
+    while True:
+        try:
+            await asyncio.sleep(SWEEPER_INTERVAL_SECONDS)
+            n = await asyncio.to_thread(sweep_stuck_executing, SWEEPER_STALE_SECONDS)
+            if n:
+                logger.warning("pending sweeper: flipped %d stuck doc(s)", n)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("pending sweeper iteration failed: %s", exc)
 
 
 # ── auth ──────────────────────────────────────────────────────────────────────
@@ -1869,19 +1926,31 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                                     )
                                     _publish_agent_switch(session_id, "lynx", skill_id, f"Delegating to {skill_name} (approved)")
                                     _publish_agent_status(session_id, skill_id, "working", preview or "Running approved command")
-                                    result = execute_command(skill_name, command, enabled_names, context={
-                                        "org_id": req.orgId,
-                                        "user_id": req.userId,
-                                        "session_id": session_id,
-                                        "in_platform": req.inPlatform,
-                                        "skill_configs": req.skillConfigs or {},
-                                        "room_id": req.roomId,
-                                        "attachments": turn_attachments,
-                                    })
-                                    mark_pending_completed(pending_id, result={
-                                        "summary": (gate_action_title or gate_action_id or "") + " executed",
-                                        "status": "ok" if (isinstance(result, dict) and result.get("ok") is not False) else "error",
-                                    })
+                                    # Hop the blocking subprocess off the event loop so other
+                                    # rooms' /chat requests aren't serialized behind it. Wrap
+                                    # the run + completion bookkeeping in asyncio.shield so a
+                                    # client disconnect mid-run doesn't leave the pending doc
+                                    # orphaned in `executing` (sweep_stuck_executing is the
+                                    # second line of defense).
+                                    async def _run_resume():
+                                        r = await asyncio.to_thread(
+                                            execute_command, skill_name, command, enabled_names,
+                                            context={
+                                                "org_id": req.orgId,
+                                                "user_id": req.userId,
+                                                "session_id": session_id,
+                                                "in_platform": req.inPlatform,
+                                                "skill_configs": req.skillConfigs or {},
+                                                "room_id": req.roomId,
+                                                "attachments": turn_attachments,
+                                            },
+                                        )
+                                        mark_pending_completed(pending_id, result={
+                                            "summary": (gate_action_title or gate_action_id or "") + " executed",
+                                            "status": "ok" if (isinstance(r, dict) and r.get("ok") is not False) else "error",
+                                        })
+                                        return r
+                                    result = await asyncio.shield(_run_resume())
                                     note = result.get("agentNote") if isinstance(result, dict) else ""
                                     _publish_agent_status(session_id, skill_id, "completed", note or "Done")
                                     _publish_agent_switch(session_id, skill_id, "lynx", "Returned to Lynx")
@@ -1997,15 +2066,21 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                                     }
                             else:
                                 logger.info("Tool call: skill=%r command=%r", skill_name, command)
-                                result = execute_command(skill_name, command, enabled_names, context={
-                                    "org_id": req.orgId,
-                                    "user_id": req.userId,
-                                    "session_id": session_id,
-                                    "in_platform": req.inPlatform,
-                                    "skill_configs": req.skillConfigs or {},
-                                    "room_id": req.roomId,
-                                    "attachments": turn_attachments,
-                                })
+                                # Hop subprocess off the event loop. No pending doc on this
+                                # path so no shield is needed — a client disconnect just drops
+                                # the result; nothing leaks.
+                                result = await asyncio.to_thread(
+                                    execute_command, skill_name, command, enabled_names,
+                                    context={
+                                        "org_id": req.orgId,
+                                        "user_id": req.userId,
+                                        "session_id": session_id,
+                                        "in_platform": req.inPlatform,
+                                        "skill_configs": req.skillConfigs or {},
+                                        "room_id": req.roomId,
+                                        "attachments": turn_attachments,
+                                    },
+                                )
                                 logger.info("Tool result ok=%s", result.get("ok", True) if isinstance(result, dict) else True)
                                 note = result.get("agentNote") if isinstance(result, dict) else ""
                                 _publish_agent_status(
