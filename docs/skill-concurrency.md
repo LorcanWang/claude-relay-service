@@ -49,18 +49,22 @@ Concurrent invocations can both make the same call — e.g. two scheduled jobs r
 - For mutations, lean on the upstream API's **idempotency key** (`request_id` on most ad APIs).
 - For "read-then-write" flows, read-time-stamp the source and write `If-Match`-style.
 
-### 3. The orchestrator event loop (read this carefully)
+### 3. The orchestrator event loop
 
-`execute_command` is a sync function called from an `async def` handler. **FastAPI does NOT auto-threadpool it.** While a 30s scan runs, every other concurrent room's `/chat` request waits behind it on the same uvicorn worker.
+`execute_command` used to be a sync function called from an `async def` handler — FastAPI did NOT auto-threadpool it, so a 30s scan in room A blocked every other concurrent `/chat` on the same uvicorn worker.
 
-This is a throughput limit, not a correctness bug — but worth knowing.
+**Fix shipped 2026-04-22 (commit `452c37c`):**
 
-**Mitigations** (any one helps):
-- Flag long actions `longRunning: true` so they go through `task_worker.py` (separate process, doesn't share the orchestrator's event loop).
-- Wrap the executor call in `asyncio.to_thread(execute_command, …)` (~10 LOC change in main.py).
-- Run uvicorn with `--workers N` (multi-process, but RAM cost).
+- The two `/chat` call sites (`main.py:~1880` gap/confirm-resume, `main.py:~2010` normal tool call) now `await asyncio.to_thread(execute_command, …)`. Other rooms' turns no longer wait.
+- The `/pending-actions/{id}/confirm` endpoint at `main.py:1203` is intentionally NOT wrapped — that handler is `def`, FastAPI auto-threadpools it.
+- The resume path is wrapped in `asyncio.shield(_run_resume())` so a client disconnect mid-execution can't leave the pending stuck `executing`.
+- A startup background task runs `pending_actions.sweep_stuck_executing()` every 60s as defence-in-depth — flips orphans to `failed`. `mark_completed` is now a transactional update with a `status==executing` precondition so a late thread can't clobber a sweeper-flipped doc.
+- The default executor is capped at `EXECUTOR_THREADS=16` so unbounded `to_thread` bursts don't starve the host.
 
-Detailed discussion — see [[build-plan]] open items. Fix landed: **TBD**.
+**Still on the to-do list:**
+
+- Multi-worker uvicorn (`--workers N`) — blocked on moving `status_hub` to Redis pub/sub. The in-memory hub doesn't fan out across processes; SSE subscribers on worker A would miss events emitted by worker B.
+- Other sync blockers Codex flagged (compaction `httpx.Client.post`, session Redis get/set, attachment Firestore/GCS, `pending_actions.claim_*` Firestore txns). Smaller per-case wins; address as they surface.
 
 ### 4. Long-running task worker
 
@@ -95,4 +99,4 @@ A pass over all skills in `~/grantllama-scrape-skill/.claude/skills/` for the pa
 
 - [[skill-manifest-evolution]] — `actions[]`, `longRunning`, `idempotent` declarations.
 - [[lynx-quality-architecture]] — sync vs durable execution paths.
-- [[build-plan]] — open items including the `asyncio.to_thread` fix.
+- [[build-plan]] — open items; multi-worker uvicorn rollout still pending.

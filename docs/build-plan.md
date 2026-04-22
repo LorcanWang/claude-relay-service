@@ -275,6 +275,25 @@ Flipped early since there's no user base to burn in against:
 
 ---
 
+## Phase 10 — Concurrency: event-loop unblocking
+
+✅ shipped 2026-04-22 (commit `452c37c`)
+
+Codex-reviewed before rollout; VPS verification report returned 6/7 PASS (step 6 parallel-curl proof skipped as optional). See [[skill-concurrency]] for the design rationale.
+
+- `await asyncio.to_thread(execute_command, …)` at `/chat`'s two tool-call sites. Other rooms' turns no longer serialize behind one slow skill.
+- `asyncio.shield` around the confirm-resume cleanup so client disconnects can't orphan a pending doc in `executing`.
+- Startup background task `_pending_sweeper_loop` — `pending_actions.sweep_stuck_executing()` every 60s flips orphans > 1200s → `failed`. New Firestore composite index `(status, executedAt)` deployed in [[chat-streaming-merge|zeon]] @ `fa0047e`.
+- `pending_actions.mark_completed` reworked into a transactional update requiring `status==executing`; late threads can't clobber a sweeper-flipped doc.
+- `EXECUTOR_THREADS=16` default caps the asyncio default executor so unbounded `to_thread` bursts don't starve the host.
+
+**Not yet done** (tracked for a later phase):
+
+- `uvicorn --workers N` rollout — blocked on moving `status_hub` to Redis pub/sub (in-memory hub doesn't fan out across processes).
+- Residual sync blockers: compaction `httpx.Client.post`, session Redis get/set, attachment Firestore/GCS, `pending_actions.claim_*` Firestore txns. Smaller per-case wins.
+
+---
+
 ## Open bugs
 
 ### ✅ Streaming chat goes blank requiring refresh — RESOLVED `b7607c0`
