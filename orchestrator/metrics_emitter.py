@@ -51,6 +51,35 @@ def new_run_id() -> str:
     return uuid.uuid4().hex
 
 
+FIRESTORE_COLLECTION = "agentMetrics"
+# Disable Firestore tail with AGENT_METRICS_FIRESTORE=0. JSONL stays the
+# durable record either way — Firestore is the queryable mirror.
+FIRESTORE_ENABLED = os.environ.get("AGENT_METRICS_FIRESTORE", "1") != "0"
+
+
+def _write_firestore(record: dict) -> None:
+    """Best-effort dual-write to Firestore so the zeon admin UI can read the
+    same data the JSONL captures. Imports are deferred so the module loads
+    even when firebase_admin / hermes_store aren't initialized (tests, CLI
+    runs of the aggregator)."""
+    if not FIRESTORE_ENABLED:
+        return
+    try:
+        from hermes_store import _get_db
+    except Exception:
+        return
+    db = _get_db()
+    if db is None:
+        return
+    try:
+        # Use the run_id as the doc id so retries / replays can be made
+        # idempotent later. Today retries don't happen (one emit per turn),
+        # so set() is fine.
+        db.collection(FIRESTORE_COLLECTION).document(record["run_id"]).set(record)
+    except Exception as exc:
+        logger.debug("metrics_emitter: firestore write failed: %s", exc)
+
+
 def emit_run_completed(
     *,
     run_id: str,
@@ -65,8 +94,9 @@ def emit_run_completed(
     duration_ms: int | None = None,
     extra: dict | None = None,
 ) -> None:
-    """Append one per-turn record. Best-effort; never raises to the caller —
-    this must never break /chat.
+    """Append one per-turn record to JSONL + dual-write to Firestore.
+    Best-effort on both paths; never raises to the caller — this must
+    never break /chat.
 
     final_outcome should be one of `OUTCOMES`. Unknown values are accepted
     and recorded as-is (we log a warning) so a future call-site can extend
@@ -104,3 +134,4 @@ def emit_run_completed(
         # functional even if the metrics file is unwritable (e.g. disk full,
         # rotated mid-flight).
         logger.debug("metrics_emitter: append failed: %s", exc)
+    _write_firestore(record)
