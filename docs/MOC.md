@@ -2,13 +2,13 @@
 title: "Map of Content"
 aliases: ["MOC", "index"]
 tags: [moc]
-updated: 2026-04-19
+updated: 2026-04-21
 status: active
 ---
 
 # Map of Content
 
-> Knowledge base for Claude Relay Service — 15 documents
+> Knowledge base for Claude Relay Service — 16 documents
 
 ## Planning
 
@@ -41,6 +41,7 @@ status: active
 
 - [[skill-manifest-evolution|Skill Manifest Evolution]] `architecture` `skills` `orchestrator` `agent-json` `manifest` `validation`
 - [[tool-envelope|Tool Result Envelope]] `orchestrator` `tool-use` `observability` `claude`
+- [[skill-concurrency|Skill Concurrency Model]] `orchestrator` `skills` `concurrency` `race-condition` `executor`
 
 ## Frontend
 
