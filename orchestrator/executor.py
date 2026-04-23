@@ -395,9 +395,20 @@ def execute_command(
             stderr.rstrip() or "(empty)",
             stdout.rstrip() or "(empty)",
         )
+        # Synthesize an informative `error` string. Callers (main.py and the
+        # room-message formatter) read `error` first; a bare "Exit 1" makes
+        # debugging impossible, so fold a tail of stderr (or stdout) into it.
+        # Keep stderr/stdout fields too — they remain the structured source.
+        tail_src = stderr.strip() or stdout.strip()
+        if tail_src:
+            tail_lines = [l for l in tail_src.splitlines() if l.strip()][-5:]
+            snippet = "\n".join(tail_lines)[:400]
+            err_msg = f"Exit {proc.returncode}: {snippet}"
+        else:
+            err_msg = f"Exit {proc.returncode}"
         return {
             "ok": False,
-            "error": f"Exit {proc.returncode}",
+            "error": err_msg,
             "stderr": stderr.strip() or None,
             "stdout": stdout.strip() or None,
         }
