@@ -770,6 +770,20 @@ def post_room_approval_message(
     title = pending.get("actionTitle") or pending.get("actionId") or "action"
     text = _format_outcome_text(outcome, title, actor_name, error_excerpt)
 
+    # Append public URLs to the text body so the next LLM turn can reference
+    # generated assets (e.g. pass the image URL to instagram-post). The
+    # data-attachment parts give the UI a preview chip, but ui_to_anthropic
+    # drops non-text parts — the model only sees `content`. Without this,
+    # the model hallucinates a URL from training data.
+    if attachments:
+        url_lines = []
+        for att in attachments:
+            url = att.get("url")
+            if url:
+                url_lines.append(f"- [{att.get('name', 'file')}]({url})")
+        if url_lines:
+            text += "\n\n**Generated files:**\n" + "\n".join(url_lines)
+
     from room_messages import post_synthetic_message
     post_synthetic_message(
         room_id=room_id,
