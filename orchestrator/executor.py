@@ -51,10 +51,24 @@ STDERR_CAP = 1_000_000
 _ALLOWED_INTERPRETERS = {"python", "python3"}
 
 # Any of these characters appearing in an argv element (after shlex parsing)
-# is rejected. shlex strips shell meaning from most of them, but $()/backtick/
-# glob/pipe fragments that somehow survive parsing (e.g. from quoted args that
-# the interpreter then reinterprets) get blocked here as defense in depth.
-_FORBIDDEN_ARG_CHARS = re.compile(r"[;&|`$<>\n\r]")
+# is rejected. With Popen(shell=False, args=[...]) the kernel passes argv as
+# a NUL-terminated string array — there is NO shell to interpret &, ;, |, $,
+# `, <, > as metacharacters. They're literal data. The earlier regex blocked
+# all of them as defense-in-depth and produced false-positive refusals on
+# legitimate user data (real case: brand tagline "Fast Printing & Shipping"
+# rejected on instagram-marketing.creative — see commit log).
+#
+# What actually matters with shell=False:
+#   \x00 (NUL): truncates the C string the kernel sees; argv element gets
+#               silently chopped → real injection vector. Keep blocked.
+#   \n / \r:    don't break execution, but argv elements with newlines look
+#               like multiple commands in audit logs / grep. Keep blocked
+#               for log hygiene.
+#
+# Re-add a meta block ONLY if we ever spawn a subshell (`shell=True` or
+# pipe through `bash -c`). For the current Popen(shell=False, [...]) path,
+# this narrower set is correct.
+_FORBIDDEN_ARG_CHARS = re.compile(r"[\x00\n\r]")
 
 # Env-var assignments that may prefix the command. The skill invocation
 # convention (taught in each SKILL.md) is:
