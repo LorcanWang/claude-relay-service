@@ -84,22 +84,29 @@ def post_synthetic_message(
             # a concurrent batch on messages forces our commit to retry.
             stored_count = int(room_data.get("messageCount", 0) or 0)
             actual_max = -1
+            max_query = (
+                messages_ref.order_by("index", direction=_fs.Query.DESCENDING)
+                .limit(1)
+            )
             try:
-                snaps = list(
-                    messages_ref.order_by("index", direction=_fs.Query.DESCENDING)
-                    .limit(1)
-                    .get(transaction=txn)
-                )
+                snaps = list(txn.get(max_query))
                 if snaps:
                     actual_max = int(snaps[0].to_dict().get("index", -1) or -1)
-            except Exception as exc:
-                logger.warning(
-                    "post_synthetic_message: max-index lookup failed (room=%s): %s",
-                    room_id, exc,
-                )
+            except Exception:
+                pass
+            if actual_max < 0:
+                try:
+                    snaps = list(max_query.get())
+                    if snaps:
+                        actual_max = int(snaps[0].to_dict().get("index", -1) or -1)
+                except Exception as exc:
+                    logger.warning(
+                        "post_synthetic_message: max-index lookup failed (room=%s): %s",
+                        room_id, exc,
+                    )
             next_index = max(stored_count, actual_max + 1)
             logger.info(
-                "post_synthetic_message: room=%s stored_count=%s actual_max=%s → next_index=%s",
+                "post_synthetic_message: room=%s stored_count=%d actual_max=%d → next_index=%d",
                 room_id, stored_count, actual_max, next_index,
             )
 
