@@ -61,14 +61,15 @@ _ALLOWED_INTERPRETERS = {"python", "python3"}
 # What actually matters with shell=False:
 #   \x00 (NUL): truncates the C string the kernel sees; argv element gets
 #               silently chopped → real injection vector. Keep blocked.
-#   \n / \r:    don't break execution, but argv elements with newlines look
-#               like multiple commands in audit logs / grep. Keep blocked
-#               for log hygiene.
+#   \n / \r:    harmless with shell=False — they're literal data. LLM agents
+#               routinely send multiline prompts (image descriptions, brand
+#               copy) that contain newlines. Blocking them causes false
+#               refusals. Audit logs already shlex.quote() or repr() argv.
 #
 # Re-add a meta block ONLY if we ever spawn a subshell (`shell=True` or
 # pipe through `bash -c`). For the current Popen(shell=False, [...]) path,
-# this narrower set is correct.
-_FORBIDDEN_ARG_CHARS = re.compile(r"[\x00\n\r]")
+# NUL is the only real vector.
+_FORBIDDEN_ARG_CHARS = re.compile(r"[\x00]")
 
 # Env-var assignments that may prefix the command. The skill invocation
 # convention (taught in each SKILL.md) is:
