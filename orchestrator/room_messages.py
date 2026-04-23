@@ -98,6 +98,10 @@ def post_synthetic_message(
                     room_id, exc,
                 )
             next_index = max(stored_count, actual_max + 1)
+            logger.info(
+                "post_synthetic_message: room=%s stored_count=%s actual_max=%s → next_index=%s",
+                room_id, stored_count, actual_max, next_index,
+            )
 
             parts: list[dict] = [{"type": "text", "text": text}]
             if attachments:
