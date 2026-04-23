@@ -1303,6 +1303,25 @@ def confirm_pending_endpoint(
         error_excerpt=error_excerpt,
     )
     write_approval_memory(pending=pending, outcome=outcome_label, actor_uid=req.userId)
+
+    emit_run_completed(
+        run_id=new_run_id(),
+        session_id=pending.get("sessionId"),
+        room_id=pending.get("roomId"),
+        org_id=pending.get("orgId"),
+        user_id=pending.get("userId"),
+        tool_call_count=1,
+        final_outcome="success" if exec_ok else "error",
+        extra={
+            "trigger": "approval_execution",
+            "pending_id": pending["id"],
+            "skill": pending.get("skill"),
+            "action_id": pending.get("actionId"),
+            "approved_by": req.userId,
+            **({"error_excerpt": error_excerpt} if error_excerpt else {}),
+        },
+    )
+
     logger.info(
         "Supervisor-approved execution: id=%s skill=%s ok=%s by=%s",
         pending["id"], pending["skill"], exec_ok, req.userId,
