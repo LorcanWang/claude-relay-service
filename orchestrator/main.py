@@ -48,7 +48,7 @@ from anthropic_client import (
     call_anthropic,
     extract_text,
 )
-from executor import execute_command
+from executor import execute_command, preflight_check
 from session import clear_session, get_session, new_session, save_session
 from skill_loader import (
     build_system_prompt,
@@ -1113,6 +1113,88 @@ class ConfirmPendingRequest(BaseModel):
     userId: str
 
 
+def _augment_exec_result_with_upload(
+    exec_result: dict,
+    *,
+    org_id: str,
+    room_id: str,
+    skill_name: str,
+) -> tuple[dict, dict | None]:
+    """After an approved skill run, upload any file output to GCS and splice
+    the signed HTTPS URL back into `exec_result["data"]` so the downstream
+    tool_result envelope carries a URL the model can actually pass to a
+    publish step (e.g. `instagram-post post_image --image-url ...`).
+
+    Without this the `creative` → `post_image` chain is broken: `creative`
+    returns a local path, the orchestrator uploads and deletes the local
+    file, but the signed URL only lands on the Firestore attachment doc +
+    a `data-attachment` room part that `ui_to_anthropic` drops. The model
+    then either stalls or hallucinates a URL.
+
+    Returns `(possibly_augmented_result, attachment_dict_or_None)`. The
+    attachment dict is what the caller passes to `post_room_approval_message`
+    so the chat UI still gets the previewable entry.
+
+    Concurrency note: both callers (/confirm endpoint and chat-loop resume)
+    hold the pending doc's atomic "executing" lock via claim_specific /
+    claim_confirmed_for_execution, so only one path ever reaches here for a
+    given pending_id. The idempotency guard on `public_url` is defense in
+    depth — not the primary correctness mechanism. `pending_actions.py`
+    exposes `mark_executing()` as a lower-level helper; any new caller of it
+    MUST route through a claim helper too or this invariant breaks.
+
+    Failure modes reported back to the model via data flags:
+      - `upload_failed: True`   — we had a local path but couldn't get a
+                                  signed URL (GCS down, file vanished, etc).
+                                  The model should surface this to the user
+                                  instead of trying to publish a stale path.
+      - `public_url` present    — happy path; safe to hand to downstream
+                                  skills that accept `--image-url` / etc.
+    """
+    if not isinstance(exec_result, dict):
+        return exec_result, None
+    if exec_result.get("ok") is False:
+        return exec_result, None
+    data = exec_result.get("data")
+    if not isinstance(data, dict):
+        return exec_result, None
+    if data.get("public_url"):
+        return exec_result, None  # already augmented (idempotent)
+    local_path = data.get("path")
+    if not local_path:
+        return exec_result, None
+
+    att = upload_skill_output(
+        local_path=local_path,
+        org_id=org_id or "",
+        room_id=room_id or "",
+        skill_name=skill_name or "",
+        delete_local=True,
+    )
+    if not att or not att.get("url"):
+        # Upload failed. Signal it in the data so the model can branch; keep
+        # the original `path` so debugging is still possible, but the model
+        # knows not to try publishing from it.
+        logger.warning(
+            "[upload] augment failed: skill=%s path=%s — setting upload_failed",
+            skill_name, local_path,
+        )
+        new_result = {
+            **exec_result,
+            "data": {**data, "upload_failed": True},
+        }
+        return new_result, att
+
+    # Shallow-copy so we don't mutate a dict the caller may still inspect.
+    new_data = {**data, "public_url": att["url"], "attachment_id": att.get("attachmentId")}
+    new_result = {**exec_result, "data": new_data}
+    logger.info(
+        "[upload] exec_result augmented: skill=%s attachment_id=%s",
+        skill_name, att.get("attachmentId"),
+    )
+    return new_result, att
+
+
 @app.post("/pending-actions/{pending_id}/confirm")
 def confirm_pending_endpoint(
     pending_id: str,
@@ -1289,20 +1371,19 @@ def confirm_pending_endpoint(
                 error_excerpt = v.strip()[:500]
                 break
 
-    # Upload any file outputs to GCS so the chat UI can preview/download them.
+    # Upload any file outputs to GCS so the chat UI can preview/download them,
+    # AND splice the signed URL back onto exec_result["data"] so the model sees
+    # `public_url` alongside `path` when this result reaches tool context on
+    # the next chat turn (fixes the creative → post_image handoff).
     approval_attachments: list[dict] = []
-    if exec_ok and isinstance(exec_result, dict):
-        data = exec_result.get("data")
-        if isinstance(data, dict) and data.get("path"):
-            att = upload_skill_output(
-                local_path=data["path"],
-                org_id=pending.get("orgId") or "",
-                room_id=pending.get("roomId") or "",
-                skill_name=pending.get("skill") or "",
-                delete_local=True,
-            )
-            if att:
-                approval_attachments.append(att)
+    exec_result, _att = _augment_exec_result_with_upload(
+        exec_result,
+        org_id=pending.get("orgId") or "",
+        room_id=pending.get("roomId") or "",
+        skill_name=pending.get("skill") or "",
+    )
+    if _att:
+        approval_attachments.append(_att)
 
     mark_pending_completed(pending["id"], result={
         "summary": (pending.get("actionTitle") or pending.get("actionId") or "") + " executed",
@@ -1498,6 +1579,13 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
 
         enabled_names = [s.name for s in effective_skills]
         model = req.anthropicConfig.model or DEFAULT_MODEL
+        # Cap runner context at 200k. The "[1m]" suffix is how the frontend
+        # opts into the long-context beta, but at 1M the model's reasoning
+        # quality drops noticeably on tool-use / planning turns. Strip it
+        # here so the relay always sees the standard 200k variant.
+        if isinstance(model, str) and "[1m]" in model:
+            logger.info("Stripping [1m] suffix: %s → 200k variant", model)
+            model = model.replace("[1m]", "")
 
         # ── per-turn agent metrics (JSONL) ────────────────────────────────────
         # Mint a run_id at handler entry so the metric record correlates with
@@ -1989,7 +2077,35 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                                 (matched_action and matched_action.get("requiresConfirmation"))
                                 or is_gap_gate
                             )
+                            # Gate pre-validation: an argv that the executor will
+                            # refuse (interpreter_not_allowed, bad path, etc.)
+                            # should never open an approval card. Previously such
+                            # commands would reach the UI, get clicked "Confirm",
+                            # then silently fail at exec — wasted click and no
+                            # useful feedback to the model. Run the same allowlist
+                            # check synchronously now; on failure, short-circuit
+                            # with the refusal the executor would have produced so
+                            # the model can self-correct without bothering the user.
+                            gate_preflight_error = None
                             if needs_gate:
+                                pre = preflight_check(skill_name, command, enabled_names)
+                                if not pre.get("ok"):
+                                    gate_preflight_error = pre.get(
+                                        "error", "refused_command: preflight_failed"
+                                    )
+                                    logger.info(
+                                        "Gate pre-validation refused: skill=%s reason=%s gap=%s",
+                                        skill_name, gate_preflight_error, is_gap_gate,
+                                    )
+
+                            if gate_preflight_error is not None:
+                                _publish_agent_status(
+                                    session_id, skill_id, "completed",
+                                    "Refused before approval",
+                                )
+                                _publish_agent_switch(session_id, skill_id, "lynx", "Returned to Lynx")
+                                result = {"ok": False, "error": gate_preflight_error}
+                            elif needs_gate:
                                 if is_gap_gate:
                                     preview_cmd = (command or "").strip().split("\n")[0][:60]
                                     gate_action_id = "__gap__"
@@ -2038,6 +2154,18 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                                                 "room_id": req.roomId,
                                                 "attachments": turn_attachments,
                                             },
+                                        )
+                                        # Mirror the confirm-endpoint post-exec step: upload
+                                        # any file output to GCS and splice `public_url` onto
+                                        # exec_result["data"] so the envelope fed back to
+                                        # Claude carries a URL it can hand to `instagram-post`
+                                        # etc. The file is `delete_local=True` inside the
+                                        # helper, matching the confirm path.
+                                        r, _ = _augment_exec_result_with_upload(
+                                            r,
+                                            org_id=req.orgId or "",
+                                            room_id=req.roomId or "",
+                                            skill_name=skill_name,
                                         )
                                         mark_pending_completed(pending_id, result={
                                             "summary": (gate_action_title or gate_action_id or "") + " executed",

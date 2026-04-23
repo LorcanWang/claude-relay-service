@@ -244,6 +244,45 @@ def _audit_log(kind: str, *, skill_name: str, argv_preview: str, cwd: str,
     )
 
 
+def preflight_check(
+    skill_name: str,
+    command: str,
+    enabled_skill_names: list[str],
+) -> dict:
+    """Run the allowlist / interpreter / path-containment checks that
+    `execute_command` would run, without spawning a subprocess or touching
+    the filesystem beyond `skill_dir.is_dir()`.
+
+    Called at gate-creation time so an argv that would be refused at execution
+    (e.g. `ls -t out/`) never opens a fake-approval card — the caller can
+    surface the refusal directly to the model as a tool_result error.
+
+    Returns `{"ok": True}` on pass, or `{"ok": False, "error": str}` on fail.
+    Error strings match what `execute_command` would have emitted so the model
+    sees identical text whether the refusal came early or late.
+    """
+    if ".." in skill_name or "/" in skill_name or "\\" in skill_name:
+        return {"ok": False, "error": f"Invalid skill name: {skill_name!r}"}
+    if skill_name not in enabled_skill_names:
+        return {"ok": False, "error": f"Skill '{skill_name}' is not in enabledSkills"}
+
+    skill_dir = SKILL_ROOT / skill_name
+    if not skill_dir.is_dir():
+        return {"ok": False, "error": f"Skill directory not found: {skill_dir}"}
+
+    try:
+        argv = shlex.split(command or "")
+    except ValueError as exc:
+        return {"ok": False, "error": f"refused_command: shlex_parse_error: {exc}"}
+
+    try:
+        _check_argv(argv, skill_dir)
+    except RefusedCommand as exc:
+        return {"ok": False, "error": f"refused_command: {exc}"}
+
+    return {"ok": True}
+
+
 def execute_command(
     skill_name: str,
     command: str,
