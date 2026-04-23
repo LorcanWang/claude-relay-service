@@ -670,6 +670,62 @@ def _envelope_to_tool_content(envelope: dict) -> str:
     return text[:TOOL_RESULT_MAX_TOTAL]
 
 
+def _inject_exec_into_session(
+    *,
+    session_id: str,
+    pending_id: str,
+    exec_result,
+    exec_ok: bool,
+    skill_name: str,
+) -> None:
+    """Replace the `awaiting_confirmation` tool_result in the session with the
+    actual execution result so the agent sees `public_url` (or error) on the
+    next turn instead of re-issuing the same tool call.
+
+    Scans backwards through session messages for a tool_result whose content
+    contains `"awaiting_confirmation"` and the pending_id, then replaces its
+    content with a proper envelope built from exec_result.
+    """
+    if not session_id:
+        return
+    session = get_session(session_id)
+    if not session:
+        return
+    messages = session.get("messages", [])
+
+    envelope = _build_tool_envelope(
+        "run_command",
+        {"skill": skill_name},
+        exec_result,
+    )
+    new_content = _envelope_to_tool_content(envelope)
+
+    patched = False
+    for msg in reversed(messages):
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            c = block.get("content", "")
+            if not isinstance(c, str):
+                continue
+            if "awaiting_confirmation" in c and pending_id in c:
+                block["content"] = new_content
+                patched = True
+                break
+        if patched:
+            break
+
+    if patched:
+        save_session(session_id, session)
+        logger.info(
+            "Injected exec result into session %s for pending %s",
+            session_id, pending_id,
+        )
+
+
 # ── session compaction ────────────────────────────────────────────────────────
 
 COMPACTION_PREFIX = (
@@ -1399,6 +1455,17 @@ def confirm_pending_endpoint(
         attachments=approval_attachments or None,
     )
     write_approval_memory(pending=pending, outcome=outcome_label, actor_uid=req.userId)
+
+    # Inject the exec result into the agent's session so the next chat turn
+    # sees `public_url` (or error) instead of the stale `awaiting_confirmation`.
+    # Without this the agent re-issues the same creative call or hallucinates.
+    _inject_exec_into_session(
+        session_id=pending.get("sessionId", ""),
+        pending_id=pending["id"],
+        exec_result=exec_result,
+        exec_ok=exec_ok,
+        skill_name=pending.get("skill", ""),
+    )
 
     emit_run_completed(
         run_id=new_run_id(),
