@@ -119,7 +119,18 @@ SKILL_USAGE_BLOCK = (
     "Only load full docs when you actually intend to use that skill — the compact index above "
     "is enough for planning.\n"
     "Once you know the command, execute it via `run_command(skill=..., command='python3 X.py ...')`. "
-    "Pass the exact Python invocation shown in the skill docs."
+    "Pass the exact Python invocation shown in the skill docs.\n\n"
+    "### Chaining Rules\n"
+    "When a skill's tool_result includes a `public_url` field, that is the HTTPS URL of the "
+    "generated asset (uploaded to cloud storage). Use that exact URL in subsequent skill calls "
+    "(e.g. pass it as `--image-url` to a publishing skill). NEVER regenerate an asset that was "
+    "already produced unless the user explicitly asks for a new version or variant.\n"
+    "Skill pairs that commonly chain:\n"
+    "- `instagram-marketing creative` → produces `public_url` → pass to `instagram-post post_image --image-url <public_url>`\n"
+    "- `instagram-marketing reel` → produces `public_url` → pass to `instagram-post post_reel --video-url <public_url>`\n"
+    "When the user says 'publish', 'post it', or 'go ahead' after a creative was generated, use "
+    "the `public_url` from the creative result to call the publishing skill. Do NOT re-run the "
+    "creative step."
 )
 
 
