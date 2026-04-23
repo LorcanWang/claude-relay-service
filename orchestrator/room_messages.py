@@ -82,23 +82,27 @@ def post_synthetic_message(
             # Pattern: take MAX(actual messages index, room.messageCount).
             # Within the txn the read set includes the messages query, so
             # a concurrent batch on messages forces our commit to retry.
-            stored_count = int(room_data.get("messageCount", 0) or 0)
+            raw_count = room_data.get("messageCount")
+            stored_count = int(raw_count) if raw_count is not None else 0
             actual_max = -1
             max_query = (
                 messages_ref.order_by("index", direction=_fs.Query.DESCENDING)
                 .limit(1)
             )
+
+            def _extract_max(snap_list):
+                if not snap_list:
+                    return -1
+                raw = snap_list[0].to_dict().get("index")
+                return int(raw) if raw is not None else -1
+
             try:
-                snaps = list(txn.get(max_query))
-                if snaps:
-                    actual_max = int(snaps[0].to_dict().get("index", -1) or -1)
-            except Exception:
-                pass
+                actual_max = _extract_max(list(txn.get(max_query)))
+            except Exception as exc:
+                logger.debug("txn.get(max_query) failed (room=%s): %s", room_id, exc)
             if actual_max < 0:
                 try:
-                    snaps = list(max_query.get())
-                    if snaps:
-                        actual_max = int(snaps[0].to_dict().get("index", -1) or -1)
+                    actual_max = _extract_max(list(max_query.get()))
                 except Exception as exc:
                     logger.warning(
                         "post_synthetic_message: max-index lookup failed (room=%s): %s",
