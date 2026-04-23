@@ -1276,12 +1276,32 @@ def confirm_pending_endpoint(
     exec_ok = (
         isinstance(exec_result, dict) and exec_result.get("ok") is not False
     )
+    # Extract a short, user-readable error excerpt for the room message + the
+    # pending doc's result field. Try the standardized envelope keys in order
+    # of helpfulness; tail whichever we find. Keep it well under any future
+    # Firestore field-size concerns.
+    error_excerpt: str | None = None
+    if not exec_ok and isinstance(exec_result, dict):
+        for key in ("error", "summary", "agentNote", "stderr"):
+            v = exec_result.get(key)
+            if isinstance(v, str) and v.strip():
+                error_excerpt = v.strip()[:500]
+                break
+
     mark_pending_completed(pending["id"], result={
         "summary": (pending.get("actionTitle") or pending.get("actionId") or "") + " executed",
         "status": "ok" if exec_ok else "error",
+        # Persist the error so the pending doc carries debug info too
+        # (visible in /admin/hermes-insights once that wires the field).
+        **({"error": error_excerpt} if error_excerpt else {}),
     })
     outcome_label = "approved_executed" if exec_ok else "approved_failed"
-    post_room_approval_message(pending=pending, outcome=outcome_label, actor_uid=req.userId)
+    post_room_approval_message(
+        pending=pending,
+        outcome=outcome_label,
+        actor_uid=req.userId,
+        error_excerpt=error_excerpt,
+    )
     write_approval_memory(pending=pending, outcome=outcome_label, actor_uid=req.userId)
     logger.info(
         "Supervisor-approved execution: id=%s skill=%s ok=%s by=%s",

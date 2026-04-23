@@ -365,9 +365,15 @@ def mark_completed(pending_id: str, result: dict | None = None) -> bool:
         return False
     ref = db.collection(COLLECTION).document(pending_id)
     summary = result.get("summary") if isinstance(result, dict) else None
-    result_payload = (
-        {"summary": summary, "status": result.get("status")} if summary else None
-    )
+    if summary:
+        result_payload = {"summary": summary, "status": result.get("status")}
+        # Carry through the error excerpt when the caller persisted one so
+        # the admin UI / debug paths can show it without re-querying logs.
+        err = result.get("error") if isinstance(result, dict) else None
+        if isinstance(err, str) and err.strip():
+            result_payload["error"] = err.strip()[:500]
+    else:
+        result_payload = None
     try:
         from firebase_admin import firestore as _fs
         transaction = db.transaction()
@@ -690,10 +696,23 @@ def _resolve_display_name(db, uid: str) -> str:
     return uid[:8]
 
 
-def _format_outcome_text(outcome: str, title: str, actor_name: str) -> str:
+def _format_outcome_text(
+    outcome: str,
+    title: str,
+    actor_name: str,
+    error_excerpt: str | None = None,
+) -> str:
     if outcome == "approved_executed":
         return f"**Approved by {actor_name}** — {title} ran successfully."
     if outcome == "approved_failed":
+        # Include the actual error so the user (and Lynx in the next turn) can
+        # see what failed. Keep it short — a long stderr dump in chat is noisy.
+        if error_excerpt:
+            snippet = error_excerpt.strip()[:300]
+            return (
+                f"**Approved by {actor_name}** — {title} ran but errored:\n"
+                f"```\n{snippet}\n```"
+            )
         return f"**Approved by {actor_name}** — {title} executed but reported an error."
     if outcome == "approved_revoked":
         return (
@@ -715,10 +734,21 @@ def _format_outcome_text(outcome: str, title: str, actor_name: str) -> str:
     return f"{title}: {outcome}"
 
 
-def post_room_approval_message(*, pending: dict, outcome: str, actor_uid: str) -> None:
+def post_room_approval_message(
+    *,
+    pending: dict,
+    outcome: str,
+    actor_uid: str,
+    error_excerpt: str | None = None,
+) -> None:
     """Append a synthetic assistant message to the pending's chat room so the
     UI reflects the sign-off outcome. No-op if the pending has no roomId
     (direct-chat pendings; future scope).
+
+    `error_excerpt` is an optional short string from the failed exec_result
+    (typically the skill's `error` field or a stderr tail). When provided,
+    it's included verbatim in the synthetic message so the user can see
+    what went wrong without ssh'ing the orchestrator log.
 
     Uses the shared transactional helper so concurrent writers (active chat
     stream + this approval outcome + future task-result posts) can't race on
@@ -733,7 +763,7 @@ def post_room_approval_message(*, pending: dict, outcome: str, actor_uid: str) -
 
     actor_name = _resolve_display_name(db, actor_uid)
     title = pending.get("actionTitle") or pending.get("actionId") or "action"
-    text = _format_outcome_text(outcome, title, actor_name)
+    text = _format_outcome_text(outcome, title, actor_name, error_excerpt)
 
     from room_messages import post_synthetic_assistant_message
     post_synthetic_assistant_message(
