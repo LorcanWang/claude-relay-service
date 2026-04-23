@@ -74,6 +74,7 @@ from pending_actions import (
 from attachments import (
     extract_attachment_ids_from_message,
     resolve_attachments_for_skill,
+    upload_skill_output,
 )
 from stream import sse, sse_agent_status, sse_agent_switch, stream_error
 from mcp_config import collect_mcp_configs
@@ -1288,11 +1289,24 @@ def confirm_pending_endpoint(
                 error_excerpt = v.strip()[:500]
                 break
 
+    # Upload any file outputs to GCS so the chat UI can preview/download them.
+    approval_attachments: list[dict] = []
+    if exec_ok and isinstance(exec_result, dict):
+        data = exec_result.get("data")
+        if isinstance(data, dict) and data.get("path"):
+            att = upload_skill_output(
+                local_path=data["path"],
+                org_id=pending.get("orgId") or "",
+                room_id=pending.get("roomId") or "",
+                skill_name=pending.get("skill") or "",
+                delete_local=True,
+            )
+            if att:
+                approval_attachments.append(att)
+
     mark_pending_completed(pending["id"], result={
         "summary": (pending.get("actionTitle") or pending.get("actionId") or "") + " executed",
         "status": "ok" if exec_ok else "error",
-        # Persist the error so the pending doc carries debug info too
-        # (visible in /admin/hermes-insights once that wires the field).
         **({"error": error_excerpt} if error_excerpt else {}),
     })
     outcome_label = "approved_executed" if exec_ok else "approved_failed"
@@ -1301,6 +1315,7 @@ def confirm_pending_endpoint(
         outcome=outcome_label,
         actor_uid=req.userId,
         error_excerpt=error_excerpt,
+        attachments=approval_attachments or None,
     )
     write_approval_memory(pending=pending, outcome=outcome_label, actor_uid=req.userId)
 

@@ -1,6 +1,7 @@
 """
-Phase 10 — attachment resolution for the orchestrator.
+Phase 10 — attachment resolution + upload for the orchestrator.
 
+**Download path (user → skill)**:
 The Next.js frontend uploads files directly to GCS and writes an
 `attachments/{id}` metadata doc. User chat messages carry a reference via
 `data-attachment` parts with shape:
@@ -12,6 +13,11 @@ This module walks those parts, fetches the authoritative Firestore doc, mints
 a fresh 7-day signed download URL, and returns a normalized payload the
 executor injects as `LYNX_ATTACHMENTS_JSON`.
 
+**Upload path (skill → user)**:
+When a skill execution produces a local file (e.g. image gen, video gen),
+`upload_skill_output` pushes the file to GCS and creates an `attachments`
+Firestore doc so the chat UI can show a preview / download chip.
+
 Security model (matches the Next.js download route):
   The Firestore doc is the authority. We verify org + room match the caller's
   request context before surfacing a URL — prevents a model-generated
@@ -21,10 +27,12 @@ from __future__ import annotations
 
 import datetime
 import logging
+import mimetypes
+import uuid
 from pathlib import Path
 from typing import Optional
 
-from hermes_store import _get_db
+from hermes_store import _get_db, _now_iso
 
 logger = logging.getLogger("attachments")
 
@@ -188,3 +196,83 @@ def resolve_attachments_for_skill(
         len(out), len(attachment_ids),
     )
     return out
+
+
+def upload_skill_output(
+    *,
+    local_path: str,
+    org_id: str,
+    room_id: str,
+    skill_name: str,
+    delete_local: bool = True,
+) -> Optional[dict]:
+    """Upload a skill-generated file to GCS and create an attachments doc.
+
+    Returns `{"attachmentId", "name", "mimeType", "sizeBytes", "url"}` on
+    success, or None on failure. The returned dict is ready to embed as a
+    `data-attachment` part in a synthetic room message.
+    """
+    fp = Path(local_path)
+    if not fp.exists():
+        logger.warning("[upload] file not found: %s", local_path)
+        return None
+
+    storage_client = _get_storage_client()
+    if storage_client is None:
+        logger.warning("[upload] GCS client unavailable; skipping upload")
+        return None
+    db = _get_db()
+    if db is None:
+        logger.warning("[upload] Firestore unavailable; skipping upload")
+        return None
+
+    attachment_id = uuid.uuid4().hex
+    mime_type = mimetypes.guess_type(fp.name)[0] or "application/octet-stream"
+    size_bytes = fp.stat().st_size
+    storage_path = f"skill-outputs/{org_id}/{skill_name}/{attachment_id}_{fp.name}"
+
+    try:
+        bucket = storage_client.bucket(HIVE_BUCKET_NAME)
+        blob = bucket.blob(storage_path)
+        blob.upload_from_filename(str(fp), content_type=mime_type)
+        url = blob.generate_signed_url(
+            version="v4",
+            expiration=SIGNED_URL_TTL,
+            method="GET",
+        )
+    except Exception as exc:
+        logger.warning("[upload] GCS upload failed for %s: %s", local_path, exc)
+        return None
+
+    try:
+        db.collection("attachments").document(attachment_id).set({
+            "name": fp.name,
+            "mimeType": mime_type,
+            "sizeBytes": size_bytes,
+            "storagePath": storage_path,
+            "orgId": org_id,
+            "roomId": room_id,
+            "skillName": skill_name,
+            "createdAt": _now_iso(),
+            "source": "skill_output",
+        })
+    except Exception as exc:
+        logger.warning("[upload] Firestore doc creation failed: %s", exc)
+
+    if delete_local:
+        try:
+            fp.unlink()
+        except Exception:
+            pass
+
+    logger.info(
+        "[upload] skill output uploaded: id=%s name=%s size=%dB skill=%s",
+        attachment_id, fp.name, size_bytes, skill_name,
+    )
+    return {
+        "attachmentId": attachment_id,
+        "name": fp.name,
+        "mimeType": mime_type,
+        "sizeBytes": size_bytes,
+        "url": url,
+    }

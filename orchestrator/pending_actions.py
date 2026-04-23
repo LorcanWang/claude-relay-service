@@ -740,6 +740,7 @@ def post_room_approval_message(
     outcome: str,
     actor_uid: str,
     error_excerpt: str | None = None,
+    attachments: list[dict] | None = None,
 ) -> None:
     """Append a synthetic assistant message to the pending's chat room so the
     UI reflects the sign-off outcome. No-op if the pending has no roomId
@@ -749,6 +750,10 @@ def post_room_approval_message(
     (typically the skill's `error` field or a stderr tail). When provided,
     it's included verbatim in the synthetic message so the user can see
     what went wrong without ssh'ing the orchestrator log.
+
+    `attachments` is an optional list of `{attachmentId, name, mimeType, sizeBytes}`
+    dicts that get embedded as `data-attachment` parts in the message so the
+    chat UI renders previews / download chips alongside the approval text.
 
     Uses the shared transactional helper so concurrent writers (active chat
     stream + this approval outcome + future task-result posts) can't race on
@@ -765,10 +770,11 @@ def post_room_approval_message(
     title = pending.get("actionTitle") or pending.get("actionId") or "action"
     text = _format_outcome_text(outcome, title, actor_name, error_excerpt)
 
-    from room_messages import post_synthetic_assistant_message
-    post_synthetic_assistant_message(
+    from room_messages import post_synthetic_message
+    post_synthetic_message(
         room_id=room_id,
         text=text,
+        attachments=attachments,
         meta={
             "kind": "approval_outcome",
             "outcome": outcome,

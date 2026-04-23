@@ -34,6 +34,7 @@ def post_synthetic_message(
     meta: dict | None = None,
     sender_user_id: str | None = None,
     sender_display_name: str | None = None,
+    attachments: list[dict] | None = None,
 ) -> Optional[str]:
     """Append a message to chatRooms/{roomId}/messages in a single
     transaction that allocates `index` from room.messageCount. Returns
@@ -98,10 +99,22 @@ def post_synthetic_message(
                 )
             next_index = max(stored_count, actual_max + 1)
 
+            parts: list[dict] = [{"type": "text", "text": text}]
+            if attachments:
+                for att in attachments:
+                    parts.append({
+                        "type": "data-attachment",
+                        "data": {
+                            "attachmentId": att["attachmentId"],
+                            "name": att["name"],
+                            "mimeType": att["mimeType"],
+                            "sizeBytes": att.get("sizeBytes", 0),
+                        },
+                    })
             msg_doc: dict = {
                 "clientId": None,
                 "role": role,
-                "parts": [{"type": "text", "text": text}],
+                "parts": parts,
                 "content": text,
                 "createdAt": now_iso,
                 "index": next_index,
