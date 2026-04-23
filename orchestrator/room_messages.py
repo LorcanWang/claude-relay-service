@@ -69,13 +69,34 @@ def post_synthetic_message(
                 logger.warning("post_synthetic_message: room %s not found", room_id)
                 raise RuntimeError("room_not_found")
             room_data = room_snap.to_dict() or {}
-            # messageCount is the authoritative counter maintained by the
-            # frontend's saveRoomMessages + this helper. On first write to a
-            # legacy room missing the field, default 0 — minor risk of index
-            # collision only if another writer is simultaneously initializing
-            # the same legacy room for the first time, which is effectively
-            # impossible for rooms old enough to lack the field.
-            next_index = int(room_data.get("messageCount", 0) or 0)
+            # Authoritative next_index — read MAX(index) from the messages
+            # collection itself, same as saveRoomMessages on the frontend.
+            # Don't trust `room.messageCount` alone: it drifts from the real
+            # max whenever a writer skips the increment (e.g. frontend's
+            # FieldValue.increment was undefined in some import path) or
+            # whenever two writers race outside this txn. Drift produced
+            # synthetic approval messages with index=0 → they floated to
+            # the top of the chat above current turns.
+            #
+            # Pattern: take MAX(actual messages index, room.messageCount).
+            # Within the txn the read set includes the messages query, so
+            # a concurrent batch on messages forces our commit to retry.
+            stored_count = int(room_data.get("messageCount", 0) or 0)
+            actual_max = -1
+            try:
+                snaps = list(
+                    messages_ref.order_by("index", direction=_fs.Query.DESCENDING)
+                    .limit(1)
+                    .get(transaction=txn)
+                )
+                if snaps:
+                    actual_max = int(snaps[0].to_dict().get("index", -1) or -1)
+            except Exception as exc:
+                logger.warning(
+                    "post_synthetic_message: max-index lookup failed (room=%s): %s",
+                    room_id, exc,
+                )
+            next_index = max(stored_count, actual_max + 1)
 
             msg_doc: dict = {
                 "clientId": None,
@@ -93,6 +114,8 @@ def post_synthetic_message(
                 msg_doc["senderDisplayName"] = sender_display_name
 
             txn.set(msg_ref, msg_doc)
+            # Heal stored_count back up if it had drifted below actual max
+            # — avoids the next writer hitting the same off-by-N issue.
             txn.update(room_ref, {
                 "messageCount": next_index + 1,
                 "lastMessageAt": now_iso,
