@@ -37,8 +37,8 @@ from hermes_store import _get_db, _now_iso
 logger = logging.getLogger("attachments")
 
 HIVE_BUCKET_NAME = "zeonsolutions"
-PUBLIC_BUCKET_NAME = "zeon-public-media"
 SIGNED_URL_TTL = datetime.timedelta(days=7)  # GCS v4 max
+CATBOX_UPLOAD_URL = "https://catbox.moe/user/api.php"
 
 _storage_client = None
 
@@ -74,6 +74,47 @@ def _get_storage_client():
         logger.error("Failed to init GCS client: %s", exc)
         _storage_client = None
     return _storage_client
+
+
+def _upload_to_catbox(local_path: str) -> Optional[str]:
+    """Upload a file to catbox.moe and return the public URL.
+
+    catbox serves files from files.catbox.moe — a domain that external
+    services like Instagram's Graph API can fetch from (unlike
+    storage.googleapis.com which Instagram blocks entirely).
+    """
+    import urllib.request
+    fp = Path(local_path)
+    if not fp.exists():
+        return None
+    try:
+        boundary = uuid.uuid4().hex
+        body = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="reqtype"\r\n\r\n'
+            f"fileupload\r\n"
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="fileToUpload"; '
+            f'filename="{fp.name}"\r\n'
+            f"Content-Type: {mimetypes.guess_type(fp.name)[0] or 'application/octet-stream'}\r\n\r\n"
+        ).encode()
+        body += fp.read_bytes()
+        body += f"\r\n--{boundary}--\r\n".encode()
+        req = urllib.request.Request(
+            CATBOX_UPLOAD_URL,
+            data=body,
+            method="POST",
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            url = resp.read().decode().strip()
+        if url.startswith("https://"):
+            logger.info("[upload] catbox public URL: %s", url)
+            return url
+        logger.warning("[upload] catbox returned unexpected response: %s", url[:200])
+    except Exception as exc:
+        logger.warning("[upload] catbox upload failed: %s", exc)
+    return None
 
 
 def extract_attachment_ids_from_message(message: dict | object) -> list[str]:
@@ -240,21 +281,15 @@ def upload_skill_output(
         logger.warning("[upload] GCS upload failed for %s: %s", local_path, exc)
         return None
 
-    public_url = f"https://storage.googleapis.com/{HIVE_BUCKET_NAME}/{storage_path}"
-    try:
-        pub_bucket = storage_client.bucket(PUBLIC_BUCKET_NAME)
-        pub_blob = pub_bucket.blob(f"{attachment_id}_{fp.name}")
-        pub_blob.upload_from_filename(str(fp), content_type=mime_type)
-        public_url = f"https://storage.googleapis.com/{PUBLIC_BUCKET_NAME}/{attachment_id}_{fp.name}"
-        logger.info("[upload] public copy uploaded: %s", public_url)
-    except Exception as exc:
-        logger.warning("[upload] public bucket copy failed (falling back to signed): %s", exc)
+    public_url = _upload_to_catbox(str(fp))
+    if not public_url:
+        logger.warning("[upload] catbox upload failed; falling back to signed GCS URL")
         try:
             public_url = blob.generate_signed_url(
                 version="v4", expiration=SIGNED_URL_TTL, method="GET",
             )
         except Exception:
-            pass
+            public_url = f"https://storage.googleapis.com/{HIVE_BUCKET_NAME}/{storage_path}"
 
     try:
         db.collection("attachments").document(attachment_id).set({
