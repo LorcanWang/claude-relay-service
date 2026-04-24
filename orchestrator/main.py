@@ -2184,6 +2184,12 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                                 (matched_action and matched_action.get("requiresConfirmation"))
                                 or is_gap_gate
                             )
+                            if needs_gate and matched_action and matched_action.get("autoApprove"):
+                                logger.info(
+                                    "autoApprove: skipping gate for %s/%s",
+                                    skill_name, matched_action.get("id"),
+                                )
+                                needs_gate = False
                             # Gate pre-validation: an argv that the executor will
                             # refuse (interpreter_not_allowed, bad path, etc.)
                             # should never open an approval card. Previously such
