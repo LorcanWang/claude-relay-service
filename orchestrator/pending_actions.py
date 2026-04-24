@@ -98,10 +98,15 @@ def create_pending(
     in_platform: bool = True,
     long_running: bool = False,
     is_gap: bool = False,
+    self_approve: bool = False,
 ) -> dict | None:
     """Create a pending action doc. SNAPSHOTS the room's supervisorUserIds
     onto the doc at create time so later supervisor edits don't retroactively
     affect already-pending actions.
+
+    When *self_approve* is True the requester's userId is added to the
+    supervisors snapshot so they can approve their own action without
+    needing to be a room supervisor.
 
     Returns the created record (with id) or None if Firestore is unavailable
     OR the room has no supervisors assigned.
@@ -112,9 +117,9 @@ def create_pending(
         return None
 
     supervisors = _load_room_supervisors(db, room_id or "")
+    if self_approve and user_id and user_id not in supervisors:
+        supervisors = [*supervisors, user_id]
     if not supervisors:
-        # Fail safe: no supervisors → no approval possible → don't create the
-        # pending. Caller's tool envelope will signal an error.
         logger.warning(
             "Refusing to create pending — room %s has no supervisors", room_id,
         )

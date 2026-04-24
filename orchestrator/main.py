@@ -2184,12 +2184,9 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                                 (matched_action and matched_action.get("requiresConfirmation"))
                                 or is_gap_gate
                             )
-                            if needs_gate and matched_action and matched_action.get("autoApprove"):
-                                logger.info(
-                                    "autoApprove: skipping gate for %s/%s",
-                                    skill_name, matched_action.get("id"),
-                                )
-                                needs_gate = False
+                            gate_self_approve = bool(
+                                needs_gate and matched_action and matched_action.get("selfApprove")
+                            )
                             # Gate pre-validation: an argv that the executor will
                             # refuse (interpreter_not_allowed, bad path, etc.)
                             # should never open an approval card. Previously such
@@ -2306,6 +2303,7 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                                         in_platform=bool(req.inPlatform),
                                         long_running=gate_long_running,
                                         is_gap=is_gap_gate,
+                                        self_approve=gate_self_approve,
                                     )
                                     _publish_agent_status(
                                         session_id,
@@ -2326,6 +2324,7 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                                             "expiresAt": pending_doc["expiresAt"],
                                             "requesterUserId": req.userId or "",
                                             "isGap": is_gap_gate,
+                                            "selfApprove": gate_self_approve,
                                         }
                                         collected_actions.append({
                                             "action": "pending",
