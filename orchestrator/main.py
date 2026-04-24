@@ -1281,8 +1281,7 @@ def _augment_exec_result_with_upload(
         return new_result, att
 
     aid = att.get("attachmentId", "")
-    name = att.get("name", "file")
-    public_url = f"{ORCHESTRATOR_PUBLIC_URL}/dl/{aid}/{name}" if aid else att["url"]
+    public_url = att["url"]
     new_data = {**data, "public_url": public_url, "attachment_id": aid}
     new_result = {**exec_result, "data": new_data}
     logger.info(

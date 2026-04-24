@@ -785,7 +785,7 @@ def post_room_approval_message(
             text += "\n\n**Generated files:**\n" + "\n".join(url_lines)
 
     from room_messages import post_synthetic_message
-    post_synthetic_message(
+    msg_id = post_synthetic_message(
         room_id=room_id,
         text=text,
         attachments=attachments,
@@ -798,6 +798,10 @@ def post_room_approval_message(
             "skill": pending.get("skill"),
         },
     )
+    if msg_id:
+        logger.info("approval message posted: room=%s msg=%s outcome=%s", room_id, msg_id, outcome)
+    else:
+        logger.warning("approval message FAILED: room=%s outcome=%s pending=%s", room_id, outcome, pending.get("id"))
 
 
 def write_approval_memory(*, pending: dict, outcome: str, actor_uid: str) -> None:

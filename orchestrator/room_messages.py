@@ -99,15 +99,22 @@ def post_synthetic_message(
             try:
                 actual_max = _extract_max(list(txn.get(max_query)))
             except Exception as exc:
-                logger.debug("txn.get(max_query) failed (room=%s): %s", room_id, exc)
+                logger.warning("txn.get(max_query) failed (room=%s): %s", room_id, exc)
             if actual_max < 0:
                 try:
                     actual_max = _extract_max(list(max_query.get()))
                 except Exception as exc:
-                    logger.warning(
-                        "post_synthetic_message: max-index lookup failed (room=%s): %s",
+                    logger.error(
+                        "post_synthetic_message: BOTH max-index lookups failed (room=%s): %s",
                         room_id, exc,
                     )
+            if actual_max < 0 and stored_count == 0:
+                logger.error(
+                    "post_synthetic_message: refusing to write — actual_max=%d stored_count=%d "
+                    "would produce index=0 (room=%s)",
+                    actual_max, stored_count, room_id,
+                )
+                raise RuntimeError("unsafe_index_zero")
             next_index = max(stored_count, actual_max + 1)
             logger.info(
                 "post_synthetic_message: room=%s stored_count=%d actual_max=%d → next_index=%d",
