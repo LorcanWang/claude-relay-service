@@ -1029,14 +1029,10 @@ def health():
     }
 
 
+@app.get("/dl/{attachment_id}/{filename:path}")
 @app.get("/dl/{attachment_id}")
-def download_attachment(attachment_id: str):
-    """Public download proxy for skill outputs.
-
-    Instagram's Graph API (and other external services) need a publicly
-    accessible URL to fetch media. GCS signed URLs are rejected by some
-    platforms. This endpoint streams the blob directly — no auth required.
-    """
+def download_attachment(attachment_id: str, filename: str = ""):
+    """Public download proxy for skill outputs."""
     from hermes_store import _get_db
 
     db = _get_db()
@@ -1284,10 +1280,9 @@ def _augment_exec_result_with_upload(
         }
         return new_result, att
 
-    # Use the orchestrator's own /dl/ proxy so external services (Instagram
-    # Graph API etc.) can fetch the file without GCS auth.
     aid = att.get("attachmentId", "")
-    public_url = f"{ORCHESTRATOR_PUBLIC_URL}/dl/{aid}" if aid else att["url"]
+    name = att.get("name", "file")
+    public_url = f"{ORCHESTRATOR_PUBLIC_URL}/dl/{aid}/{name}" if aid else att["url"]
     new_data = {**data, "public_url": public_url, "attachment_id": aid}
     new_result = {**exec_result, "data": new_data}
     logger.info(
