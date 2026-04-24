@@ -36,7 +36,7 @@ if _env_file.exists():
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
@@ -72,6 +72,8 @@ from pending_actions import (
     load_pending as load_pending_action,
 )
 from attachments import (
+    HIVE_BUCKET_NAME,
+    _get_storage_client,
     extract_attachment_ids_from_message,
     resolve_attachments_for_skill,
     upload_skill_output,
@@ -163,6 +165,9 @@ COMPACT_PRESERVE_TOOL_PAIRS = int(os.environ.get("COMPACT_PRESERVE_TOOL_PAIRS", 
 # Override relay URL to bypass Cloudflare/CDN gzip compression on SSE streams.
 # If set, this replaces the baseURL sent by the frontend.
 RELAY_BASE_URL = os.environ.get("RELAY_BASE_URL", "")
+ORCHESTRATOR_PUBLIC_URL = os.environ.get(
+    "ORCHESTRATOR_PUBLIC_URL", "https://claude-orchestrator.clawdbots.dev"
+)
 
 app = FastAPI(title="Orchestrator", version="1.0.0")
 app.add_middleware(
@@ -1024,6 +1029,44 @@ def health():
     }
 
 
+@app.get("/dl/{attachment_id}")
+def download_attachment(attachment_id: str):
+    """Public download proxy for skill outputs.
+
+    Instagram's Graph API (and other external services) need a publicly
+    accessible URL to fetch media. GCS signed URLs are rejected by some
+    platforms. This endpoint streams the blob directly — no auth required.
+    """
+    from hermes_store import _get_db
+
+    db = _get_db()
+    if db is None:
+        raise HTTPException(502, "Storage unavailable")
+    snap = db.collection("attachments").document(attachment_id).get()
+    if not snap.exists:
+        raise HTTPException(404, "Not found")
+    doc = snap.to_dict() or {}
+    storage_path = doc.get("storagePath")
+    if not storage_path:
+        raise HTTPException(404, "Not found")
+
+    storage_client = _get_storage_client()
+    if storage_client is None:
+        raise HTTPException(502, "Storage unavailable")
+    bucket = storage_client.bucket(HIVE_BUCKET_NAME)
+    blob = bucket.blob(storage_path)
+    if not blob.exists():
+        raise HTTPException(404, "Not found")
+
+    content = blob.download_as_bytes()
+    mime = doc.get("mimeType") or "application/octet-stream"
+    return Response(
+        content=content,
+        media_type=mime,
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
 @app.get("/lookups/{source}")
 def lookups(source: str, _=Depends(verify_token)):
     """Return option lists for Hive space config dropdowns (VPS-local skill data)."""
@@ -1241,8 +1284,11 @@ def _augment_exec_result_with_upload(
         }
         return new_result, att
 
-    # Shallow-copy so we don't mutate a dict the caller may still inspect.
-    new_data = {**data, "public_url": att["url"], "attachment_id": att.get("attachmentId")}
+    # Use the orchestrator's own /dl/ proxy so external services (Instagram
+    # Graph API etc.) can fetch the file without GCS auth.
+    aid = att.get("attachmentId", "")
+    public_url = f"{ORCHESTRATOR_PUBLIC_URL}/dl/{aid}" if aid else att["url"]
+    new_data = {**data, "public_url": public_url, "attachment_id": aid}
     new_result = {**exec_result, "data": new_data}
     logger.info(
         "[upload] exec_result augmented: skill=%s attachment_id=%s",
