@@ -37,6 +37,7 @@ from hermes_store import _get_db, _now_iso
 logger = logging.getLogger("attachments")
 
 HIVE_BUCKET_NAME = "zeonsolutions"
+PUBLIC_BUCKET_NAME = "zeon-public-media"
 SIGNED_URL_TTL = datetime.timedelta(days=7)  # GCS v4 max
 
 _storage_client = None
@@ -235,14 +236,25 @@ def upload_skill_output(
         bucket = storage_client.bucket(HIVE_BUCKET_NAME)
         blob = bucket.blob(storage_path)
         blob.upload_from_filename(str(fp), content_type=mime_type)
-        signed_url = blob.generate_signed_url(
-            version="v4",
-            expiration=SIGNED_URL_TTL,
-            method="GET",
-        )
     except Exception as exc:
         logger.warning("[upload] GCS upload failed for %s: %s", local_path, exc)
         return None
+
+    public_url = f"https://storage.googleapis.com/{HIVE_BUCKET_NAME}/{storage_path}"
+    try:
+        pub_bucket = storage_client.bucket(PUBLIC_BUCKET_NAME)
+        pub_blob = pub_bucket.blob(f"{attachment_id}_{fp.name}")
+        pub_blob.upload_from_filename(str(fp), content_type=mime_type)
+        public_url = f"https://storage.googleapis.com/{PUBLIC_BUCKET_NAME}/{attachment_id}_{fp.name}"
+        logger.info("[upload] public copy uploaded: %s", public_url)
+    except Exception as exc:
+        logger.warning("[upload] public bucket copy failed (falling back to signed): %s", exc)
+        try:
+            public_url = blob.generate_signed_url(
+                version="v4", expiration=SIGNED_URL_TTL, method="GET",
+            )
+        except Exception:
+            pass
 
     try:
         db.collection("attachments").document(attachment_id).set({
@@ -274,5 +286,5 @@ def upload_skill_output(
         "name": fp.name,
         "mimeType": mime_type,
         "sizeBytes": size_bytes,
-        "url": signed_url,
+        "url": public_url,
     }
