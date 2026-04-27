@@ -1956,6 +1956,10 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
             # returns empty again.
             recovered_empty_end_turn = False
             continuation_nudges = 0
+            # Track consecutive identical errors per skill so we can tell the
+            # model to stop retrying a fundamentally broken skill (e.g. missing
+            # API credentials).
+            _skill_error_streak: dict[str, tuple[str, int]] = {}
 
             api_kwargs = dict(
                 base_url=RELAY_BASE_URL or req.anthropicConfig.baseURL,
@@ -2486,6 +2490,30 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                         matched_action=matched_action,
                         action_gap=action_gap,
                     )
+
+                    # ── Repeated-error circuit breaker ─────────────────
+                    _cb_skill = inp.get("skill", tool_name)
+                    if envelope.get("status") != "ok":
+                        _cb_err = (envelope.get("error") or envelope.get("summary") or "")[:120]
+                        _prev_err, _prev_count = _skill_error_streak.get(_cb_skill, ("", 0))
+                        if _cb_err == _prev_err:
+                            _skill_error_streak[_cb_skill] = (_cb_err, _prev_count + 1)
+                        else:
+                            _skill_error_streak[_cb_skill] = (_cb_err, 1)
+                        _, streak = _skill_error_streak[_cb_skill]
+                        if streak >= 2:
+                            envelope["STOP"] = (
+                                f"Same error {streak}x in a row. This is a structural failure "
+                                "(missing credentials, unsupported flag, etc.), NOT transient. "
+                                "Do NOT retry this skill. Present the data you already have "
+                                "and note which source was unavailable."
+                            )
+                            logger.info(
+                                "Circuit breaker: skill=%s streak=%d error=%s",
+                                _cb_skill, streak, _cb_err[:80],
+                            )
+                    else:
+                        _skill_error_streak.pop(_cb_skill, None)
 
                     # ── Hermes: track tool execution ────────────────────
                     _hermes_tool_names.append(tool_name)
