@@ -2189,414 +2189,414 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
 
                     await writer.send_data({"type": "finish-step"})
 
-                # ── Execute tool calls ───────────────────────────────────────
-                tool_results = []
-                for tool in tool_uses:
-                    tool_id = tool["id"]
-                    tool_name = tool.get("name", "")
-                    inp = tool.get("input", {})
-                    # Phase 2 manifest validation — populated only by the
-                    # run_command branch when the skill has actions[] declared.
-                    matched_action: dict | None = None
-                    action_gap = False
+                    # ── Execute tool calls ───────────────────────────────────────
+                    tool_results = []
+                    for tool in tool_uses:
+                        tool_id = tool["id"]
+                        tool_name = tool.get("name", "")
+                        inp = tool.get("input", {})
+                        # Phase 2 manifest validation — populated only by the
+                        # run_command branch when the skill has actions[] declared.
+                        matched_action: dict | None = None
+                        action_gap = False
 
-                    if tool_name == "app_action":
-                        collected_actions.append(inp)
-                        logger.info("App action collected: %r", inp)
-                        result = {"ok": True, "action": inp.get("action", "")}
-                    elif tool_name == "describe_skill":
-                        skill_name = (inp.get("name") or "").strip()
-                        enabled_set = {s.name for s in effective_skills}
-                        # Skills with disableModelInvocation are hidden from the
-                        # model — also block describe_skill from peeking at their docs.
-                        invocable_set = {n for n in enabled_set if is_model_invocable(n)}
-                        if skill_name not in invocable_set:
-                            result = {
-                                "ok": False,
-                                "error": (
-                                    f"Skill '{skill_name}' is not enabled for this room. "
-                                    f"Available: {sorted(invocable_set)}"
-                                ),
-                            }
-                        else:
-                            doc = await asyncio.to_thread(load_skill_doc, skill_name)
-                            if doc:
-                                result = {"ok": True, "data": doc}
-                            else:
+                        if tool_name == "app_action":
+                            collected_actions.append(inp)
+                            logger.info("App action collected: %r", inp)
+                            result = {"ok": True, "action": inp.get("action", "")}
+                        elif tool_name == "describe_skill":
+                            skill_name = (inp.get("name") or "").strip()
+                            enabled_set = {s.name for s in effective_skills}
+                            # Skills with disableModelInvocation are hidden from the
+                            # model — also block describe_skill from peeking at their docs.
+                            invocable_set = {n for n in enabled_set if is_model_invocable(n)}
+                            if skill_name not in invocable_set:
                                 result = {
                                     "ok": False,
-                                    "error": f"No SKILL.md found for '{skill_name}'",
+                                    "error": (
+                                        f"Skill '{skill_name}' is not enabled for this room. "
+                                        f"Available: {sorted(invocable_set)}"
+                                    ),
                                 }
-                    elif mcp_mgr and mcp_mgr.is_mcp_tool(tool_name):
-                        _publish_agent_switch(session_id, "lynx", tool_name, f"Calling {tool_name}")
-                        _publish_agent_status(session_id, tool_name, "working", f"Calling {tool_name}")
-                        logger.info("MCP tool call: %s", tool_name)
-                        result = await mcp_mgr.call_tool(tool_name, inp)
-                        logger.info("MCP tool result ok=%s", result.get("ok"))
-                        note = result.get("agentNote") if isinstance(result, dict) else ""
-                        _publish_agent_status(
-                            session_id,
-                            tool_name,
-                            "completed",
-                            note or "Done",
-                        )
-                        _publish_agent_switch(session_id, tool_name, "lynx", "Returned to Lynx")
-                    else:
-                        skill_name = inp.get("skill", "")
-                        command = inp.get("command", "")
-                        skill_id = _slugify_agent_id(skill_name)
-                        preview = command.strip()[:120] if isinstance(command, str) else ""
-                        # Block run_command on disableModelInvocation skills — model
-                        # could otherwise guess the name and bypass the index/docs filter.
-                        if skill_name and not is_model_invocable(skill_name):
-                            logger.warning(
-                                "Refused run_command on hidden skill %r (disableModelInvocation)",
-                                skill_name,
+                            else:
+                                doc = await asyncio.to_thread(load_skill_doc, skill_name)
+                                if doc:
+                                    result = {"ok": True, "data": doc}
+                                else:
+                                    result = {
+                                        "ok": False,
+                                        "error": f"No SKILL.md found for '{skill_name}'",
+                                    }
+                        elif mcp_mgr and mcp_mgr.is_mcp_tool(tool_name):
+                            _publish_agent_switch(session_id, "lynx", tool_name, f"Calling {tool_name}")
+                            _publish_agent_status(session_id, tool_name, "working", f"Calling {tool_name}")
+                            logger.info("MCP tool call: %s", tool_name)
+                            result = await mcp_mgr.call_tool(tool_name, inp)
+                            logger.info("MCP tool result ok=%s", result.get("ok"))
+                            note = result.get("agentNote") if isinstance(result, dict) else ""
+                            _publish_agent_status(
+                                session_id,
+                                tool_name,
+                                "completed",
+                                note or "Done",
                             )
-                            result = {
-                                "ok": False,
-                                "error": (
-                                    f"Skill '{skill_name}' is not available to the model. "
-                                    "It is reserved for human/admin invocation."
-                                ),
-                            }
-                        elif skill_name and _skill_error_streak.get(skill_name, ("", 0))[1] >= 3:
-                            _cb_prev_err = _skill_error_streak[skill_name][0]
-                            _cb_streak = _skill_error_streak[skill_name][1]
-                            logger.info(
-                                "Circuit breaker BLOCKED execution: skill=%s streak=%d",
-                                skill_name, _cb_streak,
-                            )
-                            result = {
-                                "ok": False,
-                                "error": (
-                                    f"BLOCKED: skill '{skill_name}' has failed {_cb_streak}x "
-                                    f"with the same error ({_cb_prev_err[:80]}). This is a "
-                                    "structural failure (missing credentials or config). "
-                                    "Do NOT retry. Present what you have and note this "
-                                    "data source was unavailable."
-                                ),
-                            }
+                            _publish_agent_switch(session_id, tool_name, "lynx", "Returned to Lynx")
                         else:
-                            _publish_agent_switch(session_id, "lynx", skill_id, f"Delegating to {skill_name}")
-                            _publish_agent_status(session_id, skill_id, "working", preview or "Running command")
-                            # Phase 2 permissive validation: try to match the
-                            # command against the skill's declared actions
-                            # manifest. Log the result either way; do not block.
-                            if get_skill_actions(skill_name):
-                                matched_action = match_command_to_action(skill_name, command)
-                                if matched_action:
-                                    logger.info(
-                                        "Action matched: skill=%s action=%s",
-                                        skill_name, matched_action.get("id"),
-                                    )
-                                else:
-                                    action_gap = True
-                                    logger.warning(
-                                        "Action gap: skill=%s command=%r — declare in manifest actions[]",
-                                        skill_name, command[:200],
-                                    )
-
-                            # Phase 6 + Phase 9: route through the supervisor
-                            # approval gate when EITHER
-                            #   (a) the matched action declares requiresConfirmation, OR
-                            #   (b) the command doesn't match any declared action and
-                            #       STRICT_ACTIONS is on (gap → user must authorize).
-                            # Both paths share the same resume/gate machinery; the
-                            # only difference is the action metadata seeded onto the
-                            # pending doc (real action fields vs synthetic gap fields).
-                            is_gap_gate = bool(action_gap and not matched_action and STRICT_ACTIONS)
-                            needs_gate = (
-                                (matched_action and matched_action.get("requiresConfirmation"))
-                                or is_gap_gate
-                            )
-                            gate_self_approve = bool(
-                                needs_gate and matched_action and matched_action.get("selfApprove")
-                            )
-                            # Gate pre-validation: an argv that the executor will
-                            # refuse (interpreter_not_allowed, bad path, etc.)
-                            # should never open an approval card. Previously such
-                            # commands would reach the UI, get clicked "Confirm",
-                            # then silently fail at exec — wasted click and no
-                            # useful feedback to the model. Run the same allowlist
-                            # check synchronously now; on failure, short-circuit
-                            # with the refusal the executor would have produced so
-                            # the model can self-correct without bothering the user.
-                            gate_preflight_error = None
-                            if needs_gate:
-                                pre = preflight_check(skill_name, command, enabled_names)
-                                if not pre.get("ok"):
-                                    gate_preflight_error = pre.get(
-                                        "error", "refused_command: preflight_failed"
-                                    )
-                                    logger.info(
-                                        "Gate pre-validation refused: skill=%s reason=%s gap=%s",
-                                        skill_name, gate_preflight_error, is_gap_gate,
-                                    )
-
-                            if gate_preflight_error is not None:
-                                _publish_agent_status(
-                                    session_id, skill_id, "completed",
-                                    "Refused before approval",
+                            skill_name = inp.get("skill", "")
+                            command = inp.get("command", "")
+                            skill_id = _slugify_agent_id(skill_name)
+                            preview = command.strip()[:120] if isinstance(command, str) else ""
+                            # Block run_command on disableModelInvocation skills — model
+                            # could otherwise guess the name and bypass the index/docs filter.
+                            if skill_name and not is_model_invocable(skill_name):
+                                logger.warning(
+                                    "Refused run_command on hidden skill %r (disableModelInvocation)",
+                                    skill_name,
                                 )
-                                _publish_agent_switch(session_id, skill_id, "lynx", "Returned to Lynx")
-                                result = {"ok": False, "error": gate_preflight_error}
-                            elif needs_gate:
-                                if is_gap_gate:
-                                    preview_cmd = (command or "").strip().split("\n")[0][:60]
-                                    gate_action_id = "__gap__"
-                                    gate_action_title = f"Undeclared: {skill_name} · {preview_cmd}"
-                                    gate_destructive = False
-                                    gate_affects_ad_spend = False
-                                    gate_long_running = False
-                                else:
-                                    gate_action_id = matched_action.get("id", "")
-                                    gate_action_title = matched_action.get("title", "")
-                                    gate_destructive = bool(matched_action.get("destructive"))
-                                    gate_affects_ad_spend = bool(matched_action.get("affectsAdSpend"))
-                                    gate_long_running = bool(matched_action.get("longRunning"))
-
-                                claimed = claim_confirmed_for_execution(
-                                    org_id=req.orgId or "",
-                                    user_id=req.userId or "",
-                                    skill=skill_name,
-                                    command=command,
+                                result = {
+                                    "ok": False,
+                                    "error": (
+                                        f"Skill '{skill_name}' is not available to the model. "
+                                        "It is reserved for human/admin invocation."
+                                    ),
+                                }
+                            elif skill_name and _skill_error_streak.get(skill_name, ("", 0))[1] >= 3:
+                                _cb_prev_err = _skill_error_streak[skill_name][0]
+                                _cb_streak = _skill_error_streak[skill_name][1]
+                                logger.info(
+                                    "Circuit breaker BLOCKED execution: skill=%s streak=%d",
+                                    skill_name, _cb_streak,
                                 )
-                                if claimed:
-                                    # Resume path: atomic claim succeeded — the doc
-                                    # is now status=executing and reserved for us.
-                                    pending_id = claimed.get("id", "")
-                                    logger.info(
-                                        "Resuming claimed pending: id=%s skill=%s action=%s gap=%s",
-                                        pending_id, skill_name, gate_action_id, is_gap_gate,
+                                result = {
+                                    "ok": False,
+                                    "error": (
+                                        f"BLOCKED: skill '{skill_name}' has failed {_cb_streak}x "
+                                        f"with the same error ({_cb_prev_err[:80]}). This is a "
+                                        "structural failure (missing credentials or config). "
+                                        "Do NOT retry. Present what you have and note this "
+                                        "data source was unavailable."
+                                    ),
+                                }
+                            else:
+                                _publish_agent_switch(session_id, "lynx", skill_id, f"Delegating to {skill_name}")
+                                _publish_agent_status(session_id, skill_id, "working", preview or "Running command")
+                                # Phase 2 permissive validation: try to match the
+                                # command against the skill's declared actions
+                                # manifest. Log the result either way; do not block.
+                                if get_skill_actions(skill_name):
+                                    matched_action = match_command_to_action(skill_name, command)
+                                    if matched_action:
+                                        logger.info(
+                                            "Action matched: skill=%s action=%s",
+                                            skill_name, matched_action.get("id"),
+                                        )
+                                    else:
+                                        action_gap = True
+                                        logger.warning(
+                                            "Action gap: skill=%s command=%r — declare in manifest actions[]",
+                                            skill_name, command[:200],
+                                        )
+
+                                # Phase 6 + Phase 9: route through the supervisor
+                                # approval gate when EITHER
+                                #   (a) the matched action declares requiresConfirmation, OR
+                                #   (b) the command doesn't match any declared action and
+                                #       STRICT_ACTIONS is on (gap → user must authorize).
+                                # Both paths share the same resume/gate machinery; the
+                                # only difference is the action metadata seeded onto the
+                                # pending doc (real action fields vs synthetic gap fields).
+                                is_gap_gate = bool(action_gap and not matched_action and STRICT_ACTIONS)
+                                needs_gate = (
+                                    (matched_action and matched_action.get("requiresConfirmation"))
+                                    or is_gap_gate
+                                )
+                                gate_self_approve = bool(
+                                    needs_gate and matched_action and matched_action.get("selfApprove")
+                                )
+                                # Gate pre-validation: an argv that the executor will
+                                # refuse (interpreter_not_allowed, bad path, etc.)
+                                # should never open an approval card. Previously such
+                                # commands would reach the UI, get clicked "Confirm",
+                                # then silently fail at exec — wasted click and no
+                                # useful feedback to the model. Run the same allowlist
+                                # check synchronously now; on failure, short-circuit
+                                # with the refusal the executor would have produced so
+                                # the model can self-correct without bothering the user.
+                                gate_preflight_error = None
+                                if needs_gate:
+                                    pre = preflight_check(skill_name, command, enabled_names)
+                                    if not pre.get("ok"):
+                                        gate_preflight_error = pre.get(
+                                            "error", "refused_command: preflight_failed"
+                                        )
+                                        logger.info(
+                                            "Gate pre-validation refused: skill=%s reason=%s gap=%s",
+                                            skill_name, gate_preflight_error, is_gap_gate,
+                                        )
+
+                                if gate_preflight_error is not None:
+                                    _publish_agent_status(
+                                        session_id, skill_id, "completed",
+                                        "Refused before approval",
                                     )
-                                    _publish_agent_switch(session_id, "lynx", skill_id, f"Delegating to {skill_name} (approved)")
-                                    _publish_agent_status(session_id, skill_id, "working", preview or "Running approved command")
-                                    # Hop the blocking subprocess off the event loop so other
-                                    # rooms' /chat requests aren't serialized behind it. Wrap
-                                    # the run + completion bookkeeping in asyncio.shield so a
-                                    # client disconnect mid-run doesn't leave the pending doc
-                                    # orphaned in `executing` (sweep_stuck_executing is the
-                                    # second line of defense).
-                                    async def _run_resume():
-                                        r = await asyncio.to_thread(
-                                            execute_command, skill_name, command, enabled_names,
-                                            context={
-                                                "org_id": req.orgId,
-                                                "user_id": req.userId,
-                                                "session_id": session_id,
-                                                "in_platform": req.inPlatform,
-                                                "skill_configs": req.skillConfigs or {},
-                                                "room_id": req.roomId,
-                                                "attachments": turn_attachments,
-                                            },
-                                        )
-                                        # Mirror the confirm-endpoint post-exec step: upload
-                                        # any file output to GCS and splice `public_url` onto
-                                        # exec_result["data"] so the envelope fed back to
-                                        # Claude carries a URL it can hand to `instagram-post`
-                                        # etc. The file is `delete_local=True` inside the
-                                        # helper, matching the confirm path.
-                                        r, _ = _augment_exec_result_with_upload(
-                                            r,
-                                            org_id=req.orgId or "",
-                                            room_id=req.roomId or "",
-                                            skill_name=skill_name,
-                                        )
-                                        mark_pending_completed(pending_id, result={
-                                            "summary": (gate_action_title or gate_action_id or "") + " executed",
-                                            "status": "ok" if (isinstance(r, dict) and r.get("ok") is not False) else "error",
-                                        })
-                                        return r
-                                    result = await asyncio.shield(_run_resume())
-                                    note = result.get("agentNote") if isinstance(result, dict) else ""
-                                    _publish_agent_status(session_id, skill_id, "completed", note or "Done")
                                     _publish_agent_switch(session_id, skill_id, "lynx", "Returned to Lynx")
-                                else:
-                                    # Gate path: new pending, no execution.
-                                    pending_doc = create_pending_action(
+                                    result = {"ok": False, "error": gate_preflight_error}
+                                elif needs_gate:
+                                    if is_gap_gate:
+                                        preview_cmd = (command or "").strip().split("\n")[0][:60]
+                                        gate_action_id = "__gap__"
+                                        gate_action_title = f"Undeclared: {skill_name} · {preview_cmd}"
+                                        gate_destructive = False
+                                        gate_affects_ad_spend = False
+                                        gate_long_running = False
+                                    else:
+                                        gate_action_id = matched_action.get("id", "")
+                                        gate_action_title = matched_action.get("title", "")
+                                        gate_destructive = bool(matched_action.get("destructive"))
+                                        gate_affects_ad_spend = bool(matched_action.get("affectsAdSpend"))
+                                        gate_long_running = bool(matched_action.get("longRunning"))
+
+                                    claimed = claim_confirmed_for_execution(
+                                        org_id=req.orgId or "",
+                                        user_id=req.userId or "",
+                                        skill=skill_name,
+                                        command=command,
+                                    )
+                                    if claimed:
+                                        # Resume path: atomic claim succeeded — the doc
+                                        # is now status=executing and reserved for us.
+                                        pending_id = claimed.get("id", "")
+                                        logger.info(
+                                            "Resuming claimed pending: id=%s skill=%s action=%s gap=%s",
+                                            pending_id, skill_name, gate_action_id, is_gap_gate,
+                                        )
+                                        _publish_agent_switch(session_id, "lynx", skill_id, f"Delegating to {skill_name} (approved)")
+                                        _publish_agent_status(session_id, skill_id, "working", preview or "Running approved command")
+                                        # Hop the blocking subprocess off the event loop so other
+                                        # rooms' /chat requests aren't serialized behind it. Wrap
+                                        # the run + completion bookkeeping in asyncio.shield so a
+                                        # client disconnect mid-run doesn't leave the pending doc
+                                        # orphaned in `executing` (sweep_stuck_executing is the
+                                        # second line of defense).
+                                        async def _run_resume():
+                                            r = await asyncio.to_thread(
+                                                execute_command, skill_name, command, enabled_names,
+                                                context={
+                                                    "org_id": req.orgId,
+                                                    "user_id": req.userId,
+                                                    "session_id": session_id,
+                                                    "in_platform": req.inPlatform,
+                                                    "skill_configs": req.skillConfigs or {},
+                                                    "room_id": req.roomId,
+                                                    "attachments": turn_attachments,
+                                                },
+                                            )
+                                            # Mirror the confirm-endpoint post-exec step: upload
+                                            # any file output to GCS and splice `public_url` onto
+                                            # exec_result["data"] so the envelope fed back to
+                                            # Claude carries a URL it can hand to `instagram-post`
+                                            # etc. The file is `delete_local=True` inside the
+                                            # helper, matching the confirm path.
+                                            r, _ = _augment_exec_result_with_upload(
+                                                r,
+                                                org_id=req.orgId or "",
+                                                room_id=req.roomId or "",
+                                                skill_name=skill_name,
+                                            )
+                                            mark_pending_completed(pending_id, result={
+                                                "summary": (gate_action_title or gate_action_id or "") + " executed",
+                                                "status": "ok" if (isinstance(r, dict) and r.get("ok") is not False) else "error",
+                                            })
+                                            return r
+                                        result = await asyncio.shield(_run_resume())
+                                        note = result.get("agentNote") if isinstance(result, dict) else ""
+                                        _publish_agent_status(session_id, skill_id, "completed", note or "Done")
+                                        _publish_agent_switch(session_id, skill_id, "lynx", "Returned to Lynx")
+                                    else:
+                                        # Gate path: new pending, no execution.
+                                        pending_doc = create_pending_action(
+                                            org_id=req.orgId or "",
+                                            user_id=req.userId or "",
+                                            room_id=req.roomId,
+                                            session_id=session_id,
+                                            skill=skill_name,
+                                            command=command,
+                                            action_id=gate_action_id,
+                                            action_title=gate_action_title,
+                                            destructive=gate_destructive,
+                                            affects_ad_spend=gate_affects_ad_spend,
+                                            skill_configs=req.skillConfigs or {},
+                                            in_platform=bool(req.inPlatform),
+                                            long_running=gate_long_running,
+                                            is_gap=is_gap_gate,
+                                            self_approve=gate_self_approve,
+                                        )
+                                        _publish_agent_status(
+                                            session_id,
+                                            skill_id,
+                                            "completed",
+                                            "Awaiting approval",
+                                        )
+                                        _publish_agent_switch(session_id, skill_id, "lynx", "Returned to Lynx")
+                                        if pending_doc:
+                                            pending_payload = {
+                                                "id": pending_doc["id"],
+                                                "actionId": gate_action_id,
+                                                "actionTitle": gate_action_title,
+                                                "command": command,
+                                                "skill": skill_name,
+                                                "destructive": gate_destructive,
+                                                "affectsAdSpend": gate_affects_ad_spend,
+                                                "expiresAt": pending_doc["expiresAt"],
+                                                "requesterUserId": req.userId or "",
+                                                "isGap": is_gap_gate,
+                                                "selfApprove": gate_self_approve,
+                                            }
+                                            collected_actions.append({
+                                                "action": "pending",
+                                                "pending": pending_payload,
+                                            })
+                                            result = {
+                                                "ok": True,
+                                                "awaiting_confirmation": True,
+                                                "pending": pending_payload,
+                                            }
+                                        else:
+                                            result = {
+                                                "ok": False,
+                                                "error": (
+                                                    "Confirmation store unavailable — "
+                                                    "cannot gate this action safely. Please "
+                                                    "retry in a moment."
+                                                ),
+                                            }
+                                elif matched_action and matched_action.get("longRunning"):
+                                    # Phase 7: durable path — action exceeds the synchronous
+                                    # 60s subprocess ceiling (deep scrapes, bulk ops). Write
+                                    # a task doc, return an awaiting_task envelope to the
+                                    # model, and let task_worker.py execute it independently
+                                    # of this HTTP request. The frontend renders a live
+                                    # status card that listens on the task doc.
+                                    from tasks import create_task as _create_task
+                                    task_doc = _create_task(
                                         org_id=req.orgId or "",
                                         user_id=req.userId or "",
                                         room_id=req.roomId,
                                         session_id=session_id,
                                         skill=skill_name,
                                         command=command,
-                                        action_id=gate_action_id,
-                                        action_title=gate_action_title,
-                                        destructive=gate_destructive,
-                                        affects_ad_spend=gate_affects_ad_spend,
+                                        action_id=matched_action.get("id", ""),
+                                        action_title=matched_action.get("title", ""),
+                                        destructive=bool(matched_action.get("destructive")),
+                                        affects_ad_spend=bool(matched_action.get("affectsAdSpend")),
                                         skill_configs=req.skillConfigs or {},
                                         in_platform=bool(req.inPlatform),
-                                        long_running=gate_long_running,
-                                        is_gap=is_gap_gate,
-                                        self_approve=gate_self_approve,
                                     )
                                     _publish_agent_status(
                                         session_id,
                                         skill_id,
                                         "completed",
-                                        "Awaiting approval",
+                                        "Task queued",
                                     )
                                     _publish_agent_switch(session_id, skill_id, "lynx", "Returned to Lynx")
-                                    if pending_doc:
-                                        pending_payload = {
-                                            "id": pending_doc["id"],
-                                            "actionId": gate_action_id,
-                                            "actionTitle": gate_action_title,
-                                            "command": command,
+                                    if task_doc:
+                                        task_payload = {
+                                            "id": task_doc["id"],
+                                            "actionId": matched_action.get("id"),
+                                            "actionTitle": matched_action.get("title"),
                                             "skill": skill_name,
-                                            "destructive": gate_destructive,
-                                            "affectsAdSpend": gate_affects_ad_spend,
-                                            "expiresAt": pending_doc["expiresAt"],
-                                            "requesterUserId": req.userId or "",
-                                            "isGap": is_gap_gate,
-                                            "selfApprove": gate_self_approve,
+                                            "status": "queued",
                                         }
                                         collected_actions.append({
-                                            "action": "pending",
-                                            "pending": pending_payload,
+                                            "action": "task",
+                                            "task": task_payload,
                                         })
                                         result = {
                                             "ok": True,
-                                            "awaiting_confirmation": True,
-                                            "pending": pending_payload,
+                                            "awaiting_task": True,
+                                            "task": task_payload,
                                         }
                                     else:
                                         result = {
                                             "ok": False,
                                             "error": (
-                                                "Confirmation store unavailable — "
-                                                "cannot gate this action safely. Please "
-                                                "retry in a moment."
+                                                "Task store unavailable — cannot enqueue "
+                                                "this long-running action. Please retry."
                                             ),
                                         }
-                            elif matched_action and matched_action.get("longRunning"):
-                                # Phase 7: durable path — action exceeds the synchronous
-                                # 60s subprocess ceiling (deep scrapes, bulk ops). Write
-                                # a task doc, return an awaiting_task envelope to the
-                                # model, and let task_worker.py execute it independently
-                                # of this HTTP request. The frontend renders a live
-                                # status card that listens on the task doc.
-                                from tasks import create_task as _create_task
-                                task_doc = _create_task(
-                                    org_id=req.orgId or "",
-                                    user_id=req.userId or "",
-                                    room_id=req.roomId,
-                                    session_id=session_id,
-                                    skill=skill_name,
-                                    command=command,
-                                    action_id=matched_action.get("id", ""),
-                                    action_title=matched_action.get("title", ""),
-                                    destructive=bool(matched_action.get("destructive")),
-                                    affects_ad_spend=bool(matched_action.get("affectsAdSpend")),
-                                    skill_configs=req.skillConfigs or {},
-                                    in_platform=bool(req.inPlatform),
-                                )
-                                _publish_agent_status(
-                                    session_id,
-                                    skill_id,
-                                    "completed",
-                                    "Task queued",
-                                )
-                                _publish_agent_switch(session_id, skill_id, "lynx", "Returned to Lynx")
-                                if task_doc:
-                                    task_payload = {
-                                        "id": task_doc["id"],
-                                        "actionId": matched_action.get("id"),
-                                        "actionTitle": matched_action.get("title"),
-                                        "skill": skill_name,
-                                        "status": "queued",
-                                    }
-                                    collected_actions.append({
-                                        "action": "task",
-                                        "task": task_payload,
-                                    })
-                                    result = {
-                                        "ok": True,
-                                        "awaiting_task": True,
-                                        "task": task_payload,
-                                    }
                                 else:
-                                    result = {
-                                        "ok": False,
-                                        "error": (
-                                            "Task store unavailable — cannot enqueue "
-                                            "this long-running action. Please retry."
-                                        ),
-                                    }
-                            else:
-                                logger.info("Tool call: skill=%r command=%r", skill_name, command)
-                                # Hop subprocess off the event loop. No pending doc on this
-                                # path so no shield is needed — a client disconnect just drops
-                                # the result; nothing leaks.
-                                result = await asyncio.to_thread(
-                                    execute_command, skill_name, command, enabled_names,
-                                    context={
-                                        "org_id": req.orgId,
-                                        "user_id": req.userId,
-                                        "session_id": session_id,
-                                        "in_platform": req.inPlatform,
-                                        "skill_configs": req.skillConfigs or {},
-                                        "room_id": req.roomId,
-                                        "attachments": turn_attachments,
-                                    },
-                                )
-                                logger.info("Tool result ok=%s", result.get("ok", True) if isinstance(result, dict) else True)
-                                note = result.get("agentNote") if isinstance(result, dict) else ""
-                                _publish_agent_status(
-                                    session_id,
-                                    skill_id,
-                                    "completed",
-                                    note or "Done",
-                                )
-                                _publish_agent_switch(session_id, skill_id, "lynx", "Returned to Lynx")
+                                    logger.info("Tool call: skill=%r command=%r", skill_name, command)
+                                    # Hop subprocess off the event loop. No pending doc on this
+                                    # path so no shield is needed — a client disconnect just drops
+                                    # the result; nothing leaks.
+                                    result = await asyncio.to_thread(
+                                        execute_command, skill_name, command, enabled_names,
+                                        context={
+                                            "org_id": req.orgId,
+                                            "user_id": req.userId,
+                                            "session_id": session_id,
+                                            "in_platform": req.inPlatform,
+                                            "skill_configs": req.skillConfigs or {},
+                                            "room_id": req.roomId,
+                                            "attachments": turn_attachments,
+                                        },
+                                    )
+                                    logger.info("Tool result ok=%s", result.get("ok", True) if isinstance(result, dict) else True)
+                                    note = result.get("agentNote") if isinstance(result, dict) else ""
+                                    _publish_agent_status(
+                                        session_id,
+                                        skill_id,
+                                        "completed",
+                                        note or "Done",
+                                    )
+                                    _publish_agent_switch(session_id, skill_id, "lynx", "Returned to Lynx")
 
-                    # ── Normalize into envelope ─────────────────────────
-                    envelope = _build_tool_envelope(
-                        tool_name,
-                        inp,
-                        result,
-                        matched_action=matched_action,
-                        action_gap=action_gap,
-                    )
-
-                    # ── Repeated-error streak tracker ──────────────────
-                    # Increments the streak so the pre-execution gate (above)
-                    # can block future calls after 3 identical failures.
-                    _cb_skill = inp.get("skill", tool_name)
-                    if envelope.get("status") != "ok":
-                        _cb_err = (envelope.get("error") or envelope.get("summary") or "")[:120]
-                        _prev_err, _prev_count = _skill_error_streak.get(_cb_skill, ("", 0))
-                        if _cb_err == _prev_err:
-                            _skill_error_streak[_cb_skill] = (_cb_err, _prev_count + 1)
-                        else:
-                            _skill_error_streak[_cb_skill] = (_cb_err, 1)
-                    else:
-                        _skill_error_streak.pop(_cb_skill, None)
-
-                    # ── Hermes: track tool execution ────────────────────
-                    _hermes_tool_names.append(tool_name)
-                    try:
-                        emit_tool_executed(
-                            org_id=req.orgId,
-                            session_id=session_id,
-                            tool_name=tool_name,
-                            skill_name=inp.get("skill", tool_name),
-                            result_ok=envelope["status"] == "ok",
-                            result_summary=envelope.get("summary", "")[:200],
+                        # ── Normalize into envelope ─────────────────────────
+                        envelope = _build_tool_envelope(
+                            tool_name,
+                            inp,
+                            result,
+                            matched_action=matched_action,
+                            action_gap=action_gap,
                         )
-                    except Exception:
-                        pass
 
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": tool_id,
-                        "content": _envelope_to_tool_content(envelope),
-                    })
+                        # ── Repeated-error streak tracker ──────────────────
+                        # Increments the streak so the pre-execution gate (above)
+                        # can block future calls after 3 identical failures.
+                        _cb_skill = inp.get("skill", tool_name)
+                        if envelope.get("status") != "ok":
+                            _cb_err = (envelope.get("error") or envelope.get("summary") or "")[:120]
+                            _prev_err, _prev_count = _skill_error_streak.get(_cb_skill, ("", 0))
+                            if _cb_err == _prev_err:
+                                _skill_error_streak[_cb_skill] = (_cb_err, _prev_count + 1)
+                            else:
+                                _skill_error_streak[_cb_skill] = (_cb_err, 1)
+                        else:
+                            _skill_error_streak.pop(_cb_skill, None)
 
-                session["messages"].append({"role": "user", "content": tool_results})
-                started_tool_work = True
-                planning_only_nudges = 0
+                        # ── Hermes: track tool execution ────────────────────
+                        _hermes_tool_names.append(tool_name)
+                        try:
+                            emit_tool_executed(
+                                org_id=req.orgId,
+                                session_id=session_id,
+                                tool_name=tool_name,
+                                skill_name=inp.get("skill", tool_name),
+                                result_ok=envelope["status"] == "ok",
+                                result_summary=envelope.get("summary", "")[:200],
+                            )
+                        except Exception:
+                            pass
+
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": tool_id,
+                            "content": _envelope_to_tool_content(envelope),
+                        })
+
+                    session["messages"].append({"role": "user", "content": tool_results})
+                    started_tool_work = True
+                    planning_only_nudges = 0
 
                 _scrub_ephemeral_attachments(session["messages"])
                 save_session(session_id, session)
