@@ -172,6 +172,9 @@ RELAY_BASE_URL = os.environ.get("RELAY_BASE_URL", "")
 ORCHESTRATOR_PUBLIC_URL = os.environ.get(
     "ORCHESTRATOR_PUBLIC_URL", "https://claude-orchestrator.clawdbots.dev"
 )
+SSE_KEEPALIVE_INTERVAL_SECONDS = float(
+    os.environ.get("SSE_KEEPALIVE_INTERVAL_SECONDS", "15")
+)
 
 app = FastAPI(title="Orchestrator", version="1.0.0")
 app.add_middleware(
@@ -448,6 +451,78 @@ def _slugify_agent_id(name: str) -> str:
 def _status_sse(event: dict) -> str:
     event_type = event.get("type", "message")
     return f"event: {event_type}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+
+class _SSEStreamWriter:
+    """Queue-backed SSE writer with background keepalives.
+
+    FastAPI's StreamingResponse only advances when the async generator yields.
+    The chat loop has long `await` gaps during tool execution and while waiting
+    for Anthropic to emit the next visible text delta. A background task pushes
+    SSE comments into the same queue so the downstream connection never sits
+    idle across those phases.
+    """
+
+    _SENTINEL = object()
+
+    def __init__(self, keepalive_interval: float = SSE_KEEPALIVE_INTERVAL_SECONDS):
+        self._queue: asyncio.Queue[object] = asyncio.Queue()
+        self._keepalive_interval = max(5.0, float(keepalive_interval))
+        self._last_emit = time.monotonic()
+        self._closed = False
+        self._keepalive_task: asyncio.Task | None = None
+
+    async def start(self) -> None:
+        if self._keepalive_task is None:
+            self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+
+    async def send(self, chunk: str) -> None:
+        if self._closed:
+            return
+        self._last_emit = time.monotonic()
+        await self._queue.put(chunk)
+
+    async def send_data(self, data) -> None:
+        await self.send(sse(data))
+
+    async def send_comment(self, comment: str = "keepalive") -> None:
+        if self._closed:
+            return
+        self._last_emit = time.monotonic()
+        await self._queue.put(f": {comment}\n\n")
+
+    async def finish(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._keepalive_task is not None:
+            self._keepalive_task.cancel()
+            try:
+                await self._keepalive_task
+            except asyncio.CancelledError:
+                pass
+        await self._queue.put(self._SENTINEL)
+
+    async def iter_chunks(self):
+        while True:
+            item = await self._queue.get()
+            if item is self._SENTINEL:
+                break
+            yield item
+
+    async def _keepalive_loop(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self._keepalive_interval)
+                if self._closed:
+                    return
+                idle_for = time.monotonic() - self._last_emit
+                if idle_for >= self._keepalive_interval:
+                    logger.info("SSE keepalive fired (idle %.1fs)", idle_for)
+                    await self._queue.put(": keepalive\n\n")
+                    self._last_emit = time.monotonic()
+        except asyncio.CancelledError:
+            raise
 
 
 def _publish_agent_roster(session_id: str, enabled_skills: list[SkillMeta]):
@@ -1659,533 +1734,460 @@ async def status_stream(
 @app.post("/chat")
 async def chat(req: ChatRequest, _=Depends(verify_token)):
     async def event_stream():
-        import secrets
-        # Session key: room mode uses room:{roomId}, personal mode uses orgId_userId
-        if req.roomId:
-            session_id = f"room:{req.roomId}"
-        else:
-            session_id = req.sessionId or f"{req.orgId}_{req.userId}"
+        writer = _SSEStreamWriter()
+        await writer.start()
 
-        # ── Redis lock for rooms — prevents concurrent turns corrupting session ─
-        lock_token = secrets.token_hex(16)
-        lock_key = f"hermes:lock:room:{req.roomId}" if req.roomId else None
-        lock_acquired = False
-        if lock_key:
+        async def _run_chat_stream():
+            import secrets
+            # Session key: room mode uses room:{roomId}, personal mode uses orgId_userId
+            if req.roomId:
+                session_id = f"room:{req.roomId}"
+            else:
+                session_id = req.sessionId or f"{req.orgId}_{req.userId}"
+
+            # ── Redis lock for rooms — prevents concurrent turns corrupting session ─
+            lock_token = secrets.token_hex(16)
+            lock_key = f"hermes:lock:room:{req.roomId}" if req.roomId else None
+            lock_acquired = False
+            mcp_mgr = None
+            iteration = 0
+            # ── per-turn agent metrics (JSONL) ────────────────────────────────
+            _metric_run_id = new_run_id()
+            _metric_t0_ms = int(time.time() * 1000)
+            _metric_tool_calls = 0
+            _metric_retrieval_hits = 0
+            _metric_retrieval_empty = True
+            _metric_outcome = "success"
+
             try:
-                from hermes_redis import get_redis
-                r = get_redis()
-                if r:
-                    acquired = r.set(lock_key, lock_token, nx=True, ex=180)
-                    if not acquired:
-                        holder = r.get(lock_key)
-                        holder_str = holder.decode() if isinstance(holder, bytes) else str(holder or "")
-                        yield sse({
-                            "type": "error",
-                            "error": "Room is busy — another user is asking a question. Please wait.",
-                            "code": "ROOM_BUSY",
-                            "holder": holder_str[:8],
-                        })
-                        # Emit metric for the early-return path so the
-                        # finally-block emit isn't the only call site.
-                        # Otherwise ROOM_BUSY rejections are invisible in
-                        # logs/agent_metrics.ndjson.
+                if lock_key:
+                    try:
+                        from hermes_redis import get_redis
+                        r = get_redis()
+                        if r:
+                            acquired = r.set(lock_key, lock_token, nx=True, ex=180)
+                            if not acquired:
+                                holder = r.get(lock_key)
+                                holder_str = holder.decode() if isinstance(holder, bytes) else str(holder or "")
+                                await writer.send_data({
+                                    "type": "error",
+                                    "error": "Room is busy — another user is asking a question. Please wait.",
+                                    "code": "ROOM_BUSY",
+                                    "holder": holder_str[:8],
+                                })
+                                try:
+                                    emit_run_completed(
+                                        run_id=new_run_id(),
+                                        session_id=session_id,
+                                        room_id=req.roomId,
+                                        org_id=req.orgId,
+                                        user_id=req.userId,
+                                        final_outcome="room_busy",
+                                    )
+                                except Exception:
+                                    pass
+                                return
+                            lock_acquired = True
+                    except Exception as exc:
+                        logger.warning("Redis lock failed, continuing without lock: %s", exc)
+
+                # Scope agent roster to room's agents if specified
+                effective_skills = req.enabledSkills
+                if req.roomAgentIds is not None:
+                    room_set = set(req.roomAgentIds)
+                    effective_skills = [s for s in req.enabledSkills if _slugify_agent_id(s.name) in room_set]
+
+                enabled_names = [s.name for s in effective_skills]
+                model = req.anthropicConfig.model or DEFAULT_MODEL
+                if isinstance(model, str) and "[1m]" in model:
+                    logger.info("Stripping [1m] suffix: %s → 200k variant", model)
+                    model = model.replace("[1m]", "")
+
+                if req.clearSession:
+                    try:
+                        old = get_session(session_id)
+                        if old:
+                            emit_session_closed(
+                                org_id=req.orgId, user_id=req.userId,
+                                session_id=session_id, room_id=req.roomId,
+                                message_count=len(old.get("messages", [])),
+                            )
+                    except Exception:
+                        pass
+                    clear_session(session_id)
+
+                session = get_session(session_id) or new_session(session_id)
+
+                user_messages = [msg for msg in req.messages if msg.role == "user"]
+                if user_messages:
+                    last_user = ui_to_anthropic(user_messages[-1])
+                    if req.roomId and req.senderDisplayName and isinstance(last_user.get("content"), str):
+                        last_user["content"] = f"[{req.senderDisplayName}]: {last_user['content']}"
+                    session["messages"].append(last_user)
+
+                turn_attachments: list[dict] = []
+                if user_messages:
+                    _att_ids = extract_attachment_ids_from_message(user_messages[-1])
+                    logger.info(
+                        "[phase10] turn start session=%s room=%s attachment_ids=%d",
+                        session_id, req.roomId, len(_att_ids),
+                    )
+                    if _att_ids:
+                        turn_attachments = resolve_attachments_for_skill(
+                            attachment_ids=_att_ids,
+                            expected_org_id=req.orgId or "",
+                            expected_room_id=req.roomId,
+                        )
+                        if turn_attachments:
+                            _rebuild_last_user_with_attachments(
+                                session["messages"],
+                                turn_attachments,
+                            )
+                            logger.info(
+                                "[phase10] turn ready attachments=%d ids=%s",
+                                len(turn_attachments),
+                                [a["id"][:8] for a in turn_attachments],
+                            )
+                        else:
+                            logger.warning(
+                                "[phase10] turn had %d ids but resolve returned 0 — check Firestore / scope / GCS",
+                                len(_att_ids),
+                            )
+
+                system_blocks = build_system_prompt(
+                    req.systemPrompt,
+                    [s.dict() for s in effective_skills],
+                    org_id=req.orgId,
+                    user_id=req.userId,
+                    in_platform=req.inPlatform,
+                    skill_configs=req.skillConfigs or {},
+                    room_id=req.roomId,
+                )
+                if system_blocks:
+                    system_blocks[0] = {
+                        **system_blocks[0],
+                        "cache_control": {"type": "ephemeral"},
+                    }
+
+                if effective_skills:
+                    tools = [RUN_COMMAND_TOOL, DESCRIBE_SKILL_TOOL, APP_ACTION_TOOL]
+                else:
+                    tools = [APP_ACTION_TOOL]
+
+                mcp_enabled = os.environ.get("MCP_ENABLED", "false").lower() == "true"
+                if mcp_enabled and effective_skills and MCPManager.available():
+                    mcp_configs = collect_mcp_configs(enabled_names, req.skillConfigs)
+                    if mcp_configs:
                         try:
-                            emit_run_completed(
-                                run_id=new_run_id(),
-                                session_id=session_id,
-                                room_id=req.roomId,
+                            mcp_mgr = MCPManager()
+                            await mcp_mgr.initialize(mcp_configs)
+                            mcp_tools = mcp_mgr.get_anthropic_tools()
+                            if mcp_tools:
+                                tools.extend(mcp_tools)
+                                logger.info("Added %d MCP tools", len(mcp_tools))
+                        except Exception as exc:
+                            logger.warning("MCP init failed, continuing without MCP: %s", exc)
+                            if mcp_mgr:
+                                await mcp_mgr.shutdown()
+                            mcp_mgr = None
+
+                compacted = compact_session(
+                    session,
+                    base_url=RELAY_BASE_URL or req.anthropicConfig.baseURL,
+                    auth_token=req.anthropicConfig.authToken,
+                    model=model,
+                )
+                if compacted:
+                    _scrub_ephemeral_attachments(session["messages"])
+                    save_session(session_id, session)
+
+                logger.info(
+                    "Chat [%s] model=%s skills=%s messages=%d%s",
+                    session_id, model, enabled_names, len(session["messages"]),
+                    " (compacted)" if compacted else "",
+                )
+
+                memory_bundle_str = ""
+                try:
+                    memory_bundle = await asyncio.to_thread(
+                        build_memory_bundle,
+                        req.orgId,
+                        req.userId,
+                        req.roomId,
+                    )
+                    if memory_bundle:
+                        system_blocks.append({"type": "text", "text": memory_bundle})
+                        memory_bundle_str = memory_bundle
+                        logger.info("Hermes memory injected (%d chars)", len(memory_bundle))
+                        _metric_retrieval_empty = False
+                        _metric_retrieval_hits = memory_bundle.count("\n- ")
+                except Exception as exc:
+                    logger.warning("Hermes retrieval failed, continuing without: %s", exc)
+
+                _context_debug_payload: dict | None = None
+                try:
+                    _system_chars = sum(
+                        len(b.get("text", "")) for b in system_blocks
+                        if isinstance(b, dict)
+                    )
+                    _enabled_agents = [
+                        {
+                            "id": _slugify_agent_id(s.name),
+                            "name": s.name,
+                        }
+                        for s in effective_skills
+                    ]
+                    _skill_config_keys: dict[str, list[str]] = {}
+                    for agent_id, cfg in (req.skillConfigs or {}).items():
+                        if isinstance(cfg, dict):
+                            _skill_config_keys[agent_id] = sorted(cfg.keys())
+                    _pendings: list[dict] = []
+                    if req.roomId:
+                        try:
+                            from hermes_store import _get_db as _gdb
+                            _db2 = _gdb()
+                            if _db2 is not None:
+                                _psnap = (
+                                    _db2.collection("pendingActions")
+                                    .where("roomId", "==", req.roomId)
+                                    .where("status", "in", ["pending", "confirmed"])
+                                    .limit(10)
+                                    .stream()
+                                )
+                                for _d in _psnap:
+                                    _pd = _d.to_dict() or {}
+                                    _pendings.append({
+                                        "id": _pd.get("id"),
+                                        "actionTitle": _pd.get("actionTitle"),
+                                        "skill": _pd.get("skill"),
+                                        "status": _pd.get("status"),
+                                        "requesterUserId": _pd.get("userId"),
+                                        "expiresAt": _pd.get("expiresAt"),
+                                    })
+                        except Exception as _exc:
+                            logger.debug("context-debug pending lookup failed: %s", _exc)
+
+                    _context_debug_payload = {
+                        "model": model,
+                        "roomId": req.roomId,
+                        "systemPromptChars": _system_chars,
+                        "memoryBundleChars": len(memory_bundle_str),
+                        "memoryBundleMarkdown": memory_bundle_str[:2000],
+                        "enabledAgents": _enabled_agents,
+                        "skillConfigKeys": _skill_config_keys,
+                        "pendingActions": _pendings,
+                        "inPlatform": bool(req.inPlatform),
+                        "capturedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    }
+                except Exception as _exc:
+                    logger.debug("context-debug build failed: %s", _exc)
+
+                collected_actions: list[dict] = []
+                step_id = 0
+                _hermes_tool_names: list[str] = []
+                recovered_empty_end_turn = False
+                planning_only_nudges = 0
+                max_tokens_retries = 0
+                started_tool_work = False
+                cumulative_input_tokens = 0
+                cumulative_output_tokens = 0
+                _skill_error_streak: dict[str, tuple[str, int]] = {}
+
+                api_kwargs = dict(
+                    base_url=RELAY_BASE_URL or req.anthropicConfig.baseURL,
+                    auth_token=req.anthropicConfig.authToken,
+                    system=system_blocks,
+                    tools=tools,
+                    model=model,
+                    max_tokens=max_tokens_for(model),
+                    thinking_budget=OPUS_THINKING_BUDGET,
+                )
+
+                await writer.send_data({"type": "start"})
+                if _context_debug_payload:
+                    await writer.send_data({
+                        "type": "data-context-debug",
+                        "data": _context_debug_payload,
+                    })
+                _publish_agent_roster(session_id, effective_skills)
+                _publish_agent_status(session_id, "lynx", "thinking", "Planning")
+
+                while True:
+                    iteration += 1
+                    if iteration > MAX_LOOP:
+                        logger.warning("Max loop iterations reached for [%s]", session_id)
+                        _metric_outcome = "max_loop_exhausted"
+                        await writer.send_data({"type": "start-step"})
+                        _eid = str(step_id)
+                        await writer.send_data({"type": "text-start", "id": _eid})
+                        await writer.send_data({"type": "text-delta", "id": _eid, "delta": "I reached the maximum number of steps. Here is what I found so far."})
+                        await writer.send_data({"type": "text-end", "id": _eid})
+                        await writer.send_data({"type": "finish-step"})
+                        await writer.send_data({"type": "finish", "finishReason": "stop"})
+                        _publish_agent_status(session_id, "lynx", "completed", "Done")
+                        await writer.send(sse("[DONE]"))
+                        break
+                    logger.info("Loop iteration %d/%d for [%s]", iteration, MAX_LOOP, session_id)
+
+                    stream = AnthropicStream(messages=session["messages"], **api_kwargs)
+
+                    await writer.send_data({"type": "start-step"})
+                    text_id = str(step_id)
+                    has_text = False
+
+                    async for delta in stream:
+                        if not has_text:
+                            await writer.send_data({"type": "text-start", "id": text_id})
+                            has_text = True
+                        await writer.send_data({"type": "text-delta", "id": text_id, "delta": delta})
+
+                    if has_text:
+                        await writer.send_data({"type": "text-end", "id": text_id})
+                    step_id += 1
+
+                    stop_reason = stream.stop_reason
+                    # Log usage so prompt-cache hits are verifiable. cache_read_input_tokens
+                    # > 0 = we hit the cached prefix. cache_creation_input_tokens > 0 on the
+                    # first turn means we wrote the cache.
+                    if stream.usage:
+                        logger.info(
+                            "Stream usage [%s iter=%d]: in=%d cache_create=%d cache_read=%d out=%d stop=%s",
+                            session_id,
+                            iteration,
+                            stream.usage.get("input_tokens", 0),
+                            stream.usage.get("cache_creation_input_tokens", 0),
+                            stream.usage.get("cache_read_input_tokens", 0),
+                            stream.usage.get("output_tokens", 0),
+                            stop_reason,
+                        )
+                    else:
+                        logger.info("Stop reason: %s (iteration %d)", stop_reason, iteration)
+
+                    if stream.usage:
+                        cumulative_input_tokens += stream.usage.get("input_tokens", 0)
+                        cumulative_output_tokens += stream.usage.get("output_tokens", 0)
+
+                    if stream.content:
+                        session["messages"].append(
+                            {"role": "assistant", "content": stream.content}
+                        )
+
+                    if stop_reason == "pause_turn":
+                        logger.info("pause_turn — continuing (session=%s, iter=%d)", session_id, iteration)
+                        continue
+
+                    if stop_reason == "max_tokens":
+                        if max_tokens_retries < 2:
+                            max_tokens_retries += 1
+                            logger.info(
+                                "max_tokens recovery %d/2 (session=%s, iter=%d)",
+                                max_tokens_retries, session_id, iteration,
+                            )
+                            session["messages"].append({
+                                "role": "user",
+                                "content": (
+                                    "Your response was cut off. Continue exactly from "
+                                    "where you left off. If you need more data, use "
+                                    "tools. Do not repeat prior text."
+                                ),
+                            })
+                            continue
+                        logger.warning("max_tokens exhausted after 2 retries (session=%s)", session_id)
+
+                    if stop_reason != "tool_use":
+                        if (
+                            not has_text
+                            and collected_actions
+                            and not recovered_empty_end_turn
+                        ):
+                            logger.info(
+                                "Empty end_turn after app_action — requesting text "
+                                "summary (session=%s, iter=%d)",
+                                session_id, iteration,
+                            )
+                            recovered_empty_end_turn = True
+                            session["messages"].append({
+                                "role": "user",
+                                "content": (
+                                    "Please provide a short text summary (2-4 "
+                                    "sentences) of what you found or did in this "
+                                    "turn. Do not call additional tools — just "
+                                    "reply with text."
+                                ),
+                            })
+                            continue
+
+                        _assistant_text_so_far = "".join(
+                            b.get("text", "") for b in (stream.content or [])
+                            if b.get("type") == "text"
+                        )
+                        if (
+                            has_text
+                            and planning_only_nudges < 2
+                            and _is_planning_only(_assistant_text_so_far, started_tool_work)
+                        ):
+                            planning_only_nudges += 1
+                            logger.info(
+                                "Planning-only nudge %d/2 — model described plan "
+                                "without tool calls (session=%s, iter=%d)",
+                                planning_only_nudges, session_id, iteration,
+                            )
+                            session["messages"].append({
+                                "role": "user",
+                                "content": (
+                                    "Do not restate the plan. Act now: take the next "
+                                    "concrete tool action you need. If the task is "
+                                    "truly complete, provide the final answer."
+                                ),
+                            })
+                            continue
+
+                        if collected_actions:
+                            for action in collected_actions:
+                                await writer.send_data({"type": "data-action", "data": action})
+                        await writer.send_data({"type": "finish-step"})
+                        await writer.send_data({"type": "finish", "finishReason": "stop"})
+                        _publish_agent_status(session_id, "lynx", "completed", "Done")
+
+                        try:
+                            _assistant_text = extract_text(stream.content) if stream.content else ""
+                            _user_text = ""
+                            if user_messages:
+                                _last = user_messages[-1]
+                                _user_text = _last.content if hasattr(_last, "content") else str(_last)
+                            _crm_customer_id = (req.skillConfigs or {}).get("crm-notes", {}).get("customer_id")
+                            emit_turn_completed(
                                 org_id=req.orgId,
                                 user_id=req.userId,
-                                final_outcome="room_busy",
+                                session_id=session_id,
+                                room_id=req.roomId,
+                                sender_name=req.senderDisplayName,
+                                user_text=str(_user_text)[:1000],
+                                assistant_text=_assistant_text[:2000],
+                                tool_names=_hermes_tool_names,
+                                message_index=len(session["messages"]),
+                                customer_id=_crm_customer_id,
+                                skill_configs=req.skillConfigs or {},
                             )
-                        except Exception:
-                            pass
-                        return
-                    lock_acquired = True
-            except Exception as exc:
-                logger.warning("Redis lock failed, continuing without lock: %s", exc)
+                        except Exception as _hermes_exc:
+                            logger.debug("Hermes emit failed: %s", _hermes_exc)
 
-        # Scope agent roster to room's agents if specified
-        effective_skills = req.enabledSkills
-        if req.roomAgentIds is not None:
-            room_set = set(req.roomAgentIds)
-            effective_skills = [s for s in req.enabledSkills if _slugify_agent_id(s.name) in room_set]
+                        await writer.send(sse("[DONE]"))
+                        break
 
-        enabled_names = [s.name for s in effective_skills]
-        model = req.anthropicConfig.model or DEFAULT_MODEL
-        # Cap runner context at 200k. The "[1m]" suffix is how the frontend
-        # opts into the long-context beta, but at 1M the model's reasoning
-        # quality drops noticeably on tool-use / planning turns. Strip it
-        # here so the relay always sees the standard 200k variant.
-        if isinstance(model, str) and "[1m]" in model:
-            logger.info("Stripping [1m] suffix: %s → 200k variant", model)
-            model = model.replace("[1m]", "")
+                    tool_uses = stream.tool_uses
+                    _metric_tool_calls += len(tool_uses or [])
+                    if not tool_uses:
+                        if collected_actions:
+                            for action in collected_actions:
+                                await writer.send_data({"type": "data-action", "data": action})
+                        await writer.send_data({"type": "finish-step"})
+                        await writer.send_data({"type": "finish", "finishReason": "stop"})
+                        _publish_agent_status(session_id, "lynx", "completed", "Done")
+                        await writer.send(sse("[DONE]"))
+                        break
 
-        # ── per-turn agent metrics (JSONL) ────────────────────────────────────
-        # Mint a run_id at handler entry so the metric record correlates with
-        # whatever the chat loop logs along the way. Counters mutate inside
-        # the loop; finally-block emits exactly one line per turn regardless
-        # of how the handler exits.
-        _metric_run_id = new_run_id()
-        _metric_t0_ms = int(time.time() * 1000)
-        _metric_tool_calls = 0
-        _metric_retrieval_hits = 0
-        _metric_retrieval_empty = True
-        _metric_outcome = "success"
-
-        # ── session ───────────────────────────────────────────────────────────
-        if req.clearSession:
-            try:
-                old = get_session(session_id)
-                if old:
-                    emit_session_closed(
-                        org_id=req.orgId, user_id=req.userId,
-                        session_id=session_id, room_id=req.roomId,
-                        message_count=len(old.get("messages", [])),
-                    )
-            except Exception:
-                pass
-            clear_session(session_id)
-
-        session = get_session(session_id) or new_session(session_id)
-
-        # Only append the LAST user message from this request.
-        user_messages = [msg for msg in req.messages if msg.role == "user"]
-        if user_messages:
-            last_user = ui_to_anthropic(user_messages[-1])
-            # In room mode, prefix with sender name so Claude knows who is talking
-            if req.roomId and req.senderDisplayName and isinstance(last_user.get("content"), str):
-                last_user["content"] = f"[{req.senderDisplayName}]: {last_user['content']}"
-            session["messages"].append(last_user)
-
-        # Phase 10: resolve any uploaded attachments on the last user message
-        # into signed URLs + metadata. Same payload is reused across every
-        # execute_command call in this turn — skills get the attachments via
-        # LYNX_ATTACHMENTS_JSON env var. PDFs/images additionally become
-        # Anthropic content blocks so Claude can read them natively without
-        # requiring pdftotext on the VPS.
-        turn_attachments: list[dict] = []
-        if user_messages:
-            _att_ids = extract_attachment_ids_from_message(user_messages[-1])
-            logger.info(
-                "[phase10] turn start session=%s room=%s attachment_ids=%d",
-                session_id, req.roomId, len(_att_ids),
-            )
-            if _att_ids:
-                turn_attachments = resolve_attachments_for_skill(
-                    attachment_ids=_att_ids,
-                    expected_org_id=req.orgId or "",
-                    expected_room_id=req.roomId,
-                )
-                if turn_attachments:
-                    _rebuild_last_user_with_attachments(
-                        session["messages"],
-                        turn_attachments,
-                    )
-                    logger.info(
-                        "[phase10] turn ready attachments=%d ids=%s",
-                        len(turn_attachments),
-                        [a["id"][:8] for a in turn_attachments],
-                    )
-                else:
-                    logger.warning(
-                        "[phase10] turn had %d ids but resolve returned 0 — check Firestore / scope / GCS",
-                        len(_att_ids),
-                    )
-
-        # ── build system prompt as segmented blocks ───────────────────────────
-        # system_blocks[0] is the stable core (platform rules + app_action + skill
-        # usage). We attach cache_control to it so repeat turns hit the Anthropic
-        # prompt cache. Skill index + dynamic tail stay uncached because they
-        # vary per room/turn.
-        system_blocks = build_system_prompt(
-            req.systemPrompt,
-            [s.dict() for s in effective_skills],
-            org_id=req.orgId,
-            user_id=req.userId,
-            in_platform=req.inPlatform,
-            skill_configs=req.skillConfigs or {},
-            room_id=req.roomId,
-        )
-        if system_blocks:
-            system_blocks[0] = {
-                **system_blocks[0],
-                "cache_control": {"type": "ephemeral"},
-            }
-
-        if effective_skills:
-            tools = [RUN_COMMAND_TOOL, DESCRIBE_SKILL_TOOL, APP_ACTION_TOOL]
-        else:
-            tools = [APP_ACTION_TOOL]
-
-        # ── MCP tools ─────────────────────────────────────────────────────────
-        mcp_mgr = None
-        mcp_enabled = os.environ.get("MCP_ENABLED", "false").lower() == "true"
-        if mcp_enabled and effective_skills and MCPManager.available():
-            mcp_configs = collect_mcp_configs(enabled_names, req.skillConfigs)
-            if mcp_configs:
-                try:
-                    mcp_mgr = MCPManager()
-                    await mcp_mgr.initialize(mcp_configs)
-                    mcp_tools = mcp_mgr.get_anthropic_tools()
-                    if mcp_tools:
-                        tools.extend(mcp_tools)
-                        logger.info("Added %d MCP tools", len(mcp_tools))
-                except Exception as exc:
-                    logger.warning("MCP init failed, continuing without MCP: %s", exc)
-                    if mcp_mgr:
-                        await mcp_mgr.shutdown()
-                    mcp_mgr = None
-
-        # ── compact if session is getting long ────────────────────────────────
-        compacted = compact_session(
-            session,
-            base_url=RELAY_BASE_URL or req.anthropicConfig.baseURL,
-            auth_token=req.anthropicConfig.authToken,
-            model=model,
-        )
-        if compacted:
-            _scrub_ephemeral_attachments(session["messages"])
-            save_session(session_id, session)
-
-        logger.info(
-            "Chat [%s] model=%s skills=%s messages=%d%s",
-            session_id, model, enabled_names, len(session["messages"]),
-            " (compacted)" if compacted else "",
-        )
-
-        # ── Hermes memory retrieval (off main thread) ────────────────────────
-        memory_bundle_str = ""
-        try:
-            memory_bundle = await asyncio.to_thread(
-                build_memory_bundle,
-                req.orgId,
-                req.userId,
-                req.roomId,
-            )
-            if memory_bundle:
-                # Memory is per-turn dynamic — append as an uncached tail block.
-                system_blocks.append({"type": "text", "text": memory_bundle})
-                memory_bundle_str = memory_bundle
-                logger.info("Hermes memory injected (%d chars)", len(memory_bundle))
-                # `retrieval_empty` is the precise "no bundle injected"
-                # signal. Hits is a cheap proxy for "how many memories
-                # landed" — count bullet leaders across the recent-decisions,
-                # insights, and cross-room sections (see hermes_retrieval.py).
-                # Profile-only sections without bullets won't increment hits,
-                # but `retrieval_empty` still reads false because the bundle
-                # was injected. That's the right semantics.
-                _metric_retrieval_empty = False
-                _metric_retrieval_hits = memory_bundle.count("\n- ")
-        except Exception as exc:
-            logger.warning("Hermes retrieval failed, continuing without: %s", exc)
-
-        # ── Phase 8: build context-debug snapshot ────────────────────────────
-        # Emit one snapshot per turn so the admin "context drawer" can render
-        # exactly what Lynx is operating with right now. Keep the payload
-        # compact — no signed URLs, no skill config VALUES (keys only, so
-        # secrets never leak through SSE). Actual emit happens after `start`
-        # so the AI SDK streaming protocol is properly initialized.
-        _context_debug_payload: dict | None = None
-        try:
-            _system_chars = sum(
-                len(b.get("text", "")) for b in system_blocks
-                if isinstance(b, dict)
-            )
-            _enabled_agents = [
-                {
-                    "id": _slugify_agent_id(s.name),
-                    "name": s.name,
-                }
-                for s in effective_skills
-            ]
-            _skill_config_keys: dict[str, list[str]] = {}
-            for agent_id, cfg in (req.skillConfigs or {}).items():
-                if isinstance(cfg, dict):
-                    _skill_config_keys[agent_id] = sorted(cfg.keys())
-            # Pending actions in this room that are still actionable — gives
-            # the drawer a count + first title so the admin knows there's
-            # something waiting on /hive/signoff without navigating away.
-            _pendings: list[dict] = []
-            if req.roomId:
-                try:
-                    from hermes_store import _get_db as _gdb
-                    _db2 = _gdb()
-                    if _db2 is not None:
-                        _psnap = (
-                            _db2.collection("pendingActions")
-                            .where("roomId", "==", req.roomId)
-                            .where("status", "in", ["pending", "confirmed"])
-                            .limit(10)
-                            .stream()
-                        )
-                        for _d in _psnap:
-                            _pd = _d.to_dict() or {}
-                            _pendings.append({
-                                "id": _pd.get("id"),
-                                "actionTitle": _pd.get("actionTitle"),
-                                "skill": _pd.get("skill"),
-                                "status": _pd.get("status"),
-                                "requesterUserId": _pd.get("userId"),
-                                "expiresAt": _pd.get("expiresAt"),
-                            })
-                except Exception as _exc:
-                    logger.debug("context-debug pending lookup failed: %s", _exc)
-
-            _context_debug_payload = {
-                "model": model,
-                "roomId": req.roomId,
-                "systemPromptChars": _system_chars,
-                "memoryBundleChars": len(memory_bundle_str),
-                # Trimmed to 2KB — this rides as a data-part on the assistant
-                # message and persists to Firestore, so keep the per-message
-                # footprint reasonable.
-                "memoryBundleMarkdown": memory_bundle_str[:2000],
-                "enabledAgents": _enabled_agents,
-                "skillConfigKeys": _skill_config_keys,
-                "pendingActions": _pendings,
-                "inPlatform": bool(req.inPlatform),
-                "capturedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            }
-        except Exception as _exc:
-            logger.debug("context-debug build failed: %s", _exc)
-
-        # ── AI tool loop (all iterations stream live) ─────────────────────────
-        try:
-            collected_actions: list[dict] = []
-            step_id = 0
-            _hermes_tool_names: list[str] = []
-            recovered_empty_end_turn = False
-            # ── State machine counters (Claude Code / OpenClaw patterns) ──
-            iteration = 0
-            planning_only_nudges = 0
-            max_tokens_retries = 0
-            started_tool_work = False
-            cumulative_input_tokens = 0
-            cumulative_output_tokens = 0
-            _skill_error_streak: dict[str, tuple[str, int]] = {}
-
-            api_kwargs = dict(
-                base_url=RELAY_BASE_URL or req.anthropicConfig.baseURL,
-                auth_token=req.anthropicConfig.authToken,
-                system=system_blocks,
-                tools=tools,
-                model=model,
-                max_tokens=max_tokens_for(model),
-                thinking_budget=OPUS_THINKING_BUDGET,
-            )
-
-            yield sse({"type": "start"})
-            # Emit the context-debug snapshot right after start so it lands as
-            # a data part on the assistant message — the chat UI's debug
-            # drawer reads it off message.parts.
-            if _context_debug_payload:
-                yield sse({
-                    "type": "data-context-debug",
-                    "data": _context_debug_payload,
-                })
-            _publish_agent_roster(session_id, effective_skills)
-            _publish_agent_status(session_id, "lynx", "thinking", "Planning")
-
-            while True:
-                iteration += 1
-                if iteration > MAX_LOOP:
-                    logger.warning("Max loop iterations reached for [%s]", session_id)
-                    _metric_outcome = "max_loop_exhausted"
-                    yield sse({"type": "start-step"})
-                    _eid = str(step_id)
-                    yield sse({"type": "text-start", "id": _eid})
-                    yield sse({"type": "text-delta", "id": _eid, "delta": "I reached the maximum number of steps. Here is what I found so far."})
-                    yield sse({"type": "text-end", "id": _eid})
-                    yield sse({"type": "finish-step"})
-                    yield sse({"type": "finish", "finishReason": "stop"})
-                    _publish_agent_status(session_id, "lynx", "completed", "Done")
-                    yield sse("[DONE]")
-                    break
-                logger.info("Loop iteration %d/%d for [%s]", iteration, MAX_LOOP, session_id)
-
-                # Every iteration streams from Anthropic in real-time
-                stream = AnthropicStream(messages=session["messages"], **api_kwargs)
-
-                yield sse({"type": "start-step"})
-                text_id = str(step_id)
-                has_text = False
-
-                async for delta in stream:
-                    if not has_text:
-                        yield sse({"type": "text-start", "id": text_id})
-                        has_text = True
-                    yield sse({"type": "text-delta", "id": text_id, "delta": delta})
-
-                if has_text:
-                    yield sse({"type": "text-end", "id": text_id})
-                step_id += 1
-
-                stop_reason = stream.stop_reason
-                # Log usage so prompt-cache hits are verifiable. cache_read_input_tokens
-                # > 0 = we hit the cached prefix. cache_creation_input_tokens > 0 on the
-                # first turn means we wrote the cache.
-                if stream.usage:
-                    logger.info(
-                        "Stream usage [%s iter=%d]: in=%d cache_create=%d cache_read=%d out=%d stop=%s",
-                        session_id,
-                        iteration,
-                        stream.usage.get("input_tokens", 0),
-                        stream.usage.get("cache_creation_input_tokens", 0),
-                        stream.usage.get("cache_read_input_tokens", 0),
-                        stream.usage.get("output_tokens", 0),
-                        stop_reason,
-                    )
-                else:
-                    logger.info("Stop reason: %s (iteration %d)", stop_reason, iteration)
-
-                # Track cumulative token usage for budget awareness
-                if stream.usage:
-                    cumulative_input_tokens += stream.usage.get("input_tokens", 0)
-                    cumulative_output_tokens += stream.usage.get("output_tokens", 0)
-
-                # Persist assistant message to session (skip if empty — Anthropic rejects blank content)
-                if stream.content:
-                    session["messages"].append(
-                        {"role": "assistant", "content": stream.content}
-                    )
-
-                # ── Stop-reason state machine (Claude Code / OpenClaw pattern) ──
-                # Branch on exact stop_reason rather than "not tool_use".
-                # tool_use falls through to the tool execution section below.
-
-                if stop_reason == "pause_turn":
-                    # Server-side tool paused — continue the loop (resend
-                    # assistant content as-is per Anthropic docs).
-                    logger.info("pause_turn — continuing (session=%s, iter=%d)", session_id, iteration)
-                    continue
-
-                if stop_reason == "max_tokens":
-                    # Model was cut off mid-generation. Retry with a
-                    # continuation prompt (Claude Code escalates output cap;
-                    # we nudge instead since our relay doesn't support dynamic cap).
-                    if max_tokens_retries < 2:
-                        max_tokens_retries += 1
-                        logger.info(
-                            "max_tokens recovery %d/2 (session=%s, iter=%d)",
-                            max_tokens_retries, session_id, iteration,
-                        )
-                        session["messages"].append({
-                            "role": "user",
-                            "content": (
-                                "Your response was cut off. Continue exactly from "
-                                "where you left off. If you need more data, use "
-                                "tools. Do not repeat prior text."
-                            ),
-                        })
-                        continue
-                    logger.warning("max_tokens exhausted after 2 retries (session=%s)", session_id)
-                    # Fall through to finalize with whatever we have
-
-                if stop_reason != "tool_use":
-                    # ── Safety net: empty end_turn after an app_action ───────
-                    if (
-                        not has_text
-                        and collected_actions
-                        and not recovered_empty_end_turn
-                    ):
-                        logger.info(
-                            "Empty end_turn after app_action — requesting text "
-                            "summary (session=%s, iter=%d)",
-                            session_id, iteration,
-                        )
-                        recovered_empty_end_turn = True
-                        session["messages"].append({
-                            "role": "user",
-                            "content": (
-                                "Please provide a short text summary (2-4 "
-                                "sentences) of what you found or did in this "
-                                "turn. Do not call additional tools — just "
-                                "reply with text."
-                            ),
-                        })
-                        continue
-
-                    # ���─ Planning-only nudge (OpenClaw pattern) ───────────────
-                    # If the model described a plan but emitted zero tool
-                    # calls, nudge it to act. Capped at 2 (OpenClaw uses 1-2).
-                    _assistant_text_so_far = "".join(
-                        b.get("text", "") for b in (stream.content or [])
-                        if b.get("type") == "text"
-                    )
-                    if (
-                        has_text
-                        and planning_only_nudges < 2
-                        and _is_planning_only(_assistant_text_so_far, started_tool_work)
-                    ):
-                        planning_only_nudges += 1
-                        logger.info(
-                            "Planning-only nudge %d/2 — model described plan "
-                            "without tool calls (session=%s, iter=%d)",
-                            planning_only_nudges, session_id, iteration,
-                        )
-                        session["messages"].append({
-                            "role": "user",
-                            "content": (
-                                "Do not restate the plan. Act now: take the next "
-                                "concrete tool action you need. If the task is "
-                                "truly complete, provide the final answer."
-                            ),
-                        })
-                        continue
-
-                    # ── end_turn / refusal: emit actions + finish ────────────
-                    if collected_actions:
-                        for action in collected_actions:
-                            yield sse({"type": "data-action", "data": action})
-                    yield sse({"type": "finish-step"})
-                    yield sse({"type": "finish", "finishReason": "stop"})
-                    _publish_agent_status(session_id, "lynx", "completed", "Done")
-
-                    # ── Hermes: emit turn completed ─────────────────────────
-                    try:
-                        _assistant_text = extract_text(stream.content) if stream.content else ""
-                        _user_text = ""
-                        if user_messages:
-                            _last = user_messages[-1]
-                            _user_text = _last.content if hasattr(_last, "content") else str(_last)
-                        _crm_customer_id = (req.skillConfigs or {}).get("crm-notes", {}).get("customer_id")
-                        emit_turn_completed(
-                            org_id=req.orgId,
-                            user_id=req.userId,
-                            session_id=session_id,
-                            room_id=req.roomId,
-                            sender_name=req.senderDisplayName,
-                            user_text=str(_user_text)[:1000],
-                            assistant_text=_assistant_text[:2000],
-                            tool_names=_hermes_tool_names,
-                            message_index=len(session["messages"]),
-                            customer_id=_crm_customer_id,
-                            skill_configs=req.skillConfigs or {},
-                        )
-                    except Exception as _hermes_exc:
-                        logger.debug("Hermes emit failed: %s", _hermes_exc)
-
-                    yield sse("[DONE]")
-                    break
-
-                # ── tool_use: extract and execute ────────────────────────────
-                tool_uses = stream.tool_uses
-                # Per-turn metric: count tool calls the model intends to make
-                # in this iteration (sums across loop iterations).
-                _metric_tool_calls += len(tool_uses or [])
-                if not tool_uses:
-                    # Edge case: stop_reason=tool_use but no blocks found
-                    if collected_actions:
-                        for action in collected_actions:
-                            yield sse({"type": "data-action", "data": action})
-                    yield sse({"type": "finish-step"})
-                    yield sse({"type": "finish", "finishReason": "stop"})
-                    _publish_agent_status(session_id, "lynx", "completed", "Done")
-                    yield sse("[DONE]")
-                    break
-
-                yield sse({"type": "finish-step"})
+                    await writer.send_data({"type": "finish-step"})
 
                 # ── Execute tool calls ───────────────────────────────────────
                 tool_results = []
@@ -2595,61 +2597,71 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                 session["messages"].append({"role": "user", "content": tool_results})
                 started_tool_work = True
                 planning_only_nudges = 0
-                yield ": keepalive\n\n"
 
-            _scrub_ephemeral_attachments(session["messages"])
-            save_session(session_id, session)
-
-        except asyncio.CancelledError:
-            logger.warning(
-                "Client disconnected mid-stream [%s] at iter=%d",
-                session_id, iteration,
-            )
-            _metric_outcome = "cancelled"
-            raise
-        except Exception as exc:
-            logger.exception("Error in chat loop for [%s]: %s", session_id, exc)
-            _metric_outcome = "error"
-            try:
                 _scrub_ephemeral_attachments(session["messages"])
                 save_session(session_id, session)
-            except Exception:
-                pass
-            async for chunk in stream_error(str(exc)):
-                yield chunk
-        finally:
-            # Emit per-turn agent metric record exactly once, regardless of
-            # how the handler exits. Best-effort — append failures don't
-            # touch /chat success.
-            try:
-                emit_run_completed(
-                    run_id=_metric_run_id,
-                    session_id=session_id,
-                    room_id=req.roomId,
-                    org_id=req.orgId,
-                    user_id=req.userId,
-                    tool_call_count=_metric_tool_calls,
-                    retrieval_hit_count=_metric_retrieval_hits,
-                    retrieval_empty=_metric_retrieval_empty,
-                    final_outcome=_metric_outcome,
-                    duration_ms=int(time.time() * 1000) - _metric_t0_ms,
+
+            except asyncio.CancelledError:
+                logger.warning(
+                    "Client disconnected mid-stream [%s] at iter=%d",
+                    session_id, iteration,
                 )
-            except Exception:
-                pass
-            if mcp_mgr:
-                await mcp_mgr.shutdown()
-            # Release Redis lock only if we still own it (compare-and-delete)
-            if lock_acquired and lock_key:
+                _metric_outcome = "cancelled"
+                raise
+            except Exception as exc:
+                logger.exception("Error in chat loop for [%s]: %s", session_id, exc)
+                _metric_outcome = "error"
                 try:
-                    from hermes_redis import get_redis
-                    r = get_redis()
-                    if r:
-                        current = r.get(lock_key)
-                        current_str = current.decode() if isinstance(current, bytes) else str(current or "")
-                        if current_str == lock_token:
-                            r.delete(lock_key)
+                    _scrub_ephemeral_attachments(session["messages"])
+                    save_session(session_id, session)
                 except Exception:
                     pass
+                async for chunk in stream_error(str(exc)):
+                    await writer.send(chunk)
+            finally:
+                try:
+                    emit_run_completed(
+                        run_id=_metric_run_id,
+                        session_id=session_id,
+                        room_id=req.roomId,
+                        org_id=req.orgId,
+                        user_id=req.userId,
+                        tool_call_count=_metric_tool_calls,
+                        retrieval_hit_count=_metric_retrieval_hits,
+                        retrieval_empty=_metric_retrieval_empty,
+                        final_outcome=_metric_outcome,
+                        duration_ms=int(time.time() * 1000) - _metric_t0_ms,
+                    )
+                except Exception:
+                    pass
+                if mcp_mgr:
+                    await mcp_mgr.shutdown()
+                if lock_acquired and lock_key:
+                    try:
+                        from hermes_redis import get_redis
+                        r = get_redis()
+                        if r:
+                            current = r.get(lock_key)
+                            current_str = current.decode() if isinstance(current, bytes) else str(current or "")
+                            if current_str == lock_token:
+                                r.delete(lock_key)
+                    except Exception:
+                        pass
+                await writer.finish()
+
+        producer = asyncio.create_task(_run_chat_stream())
+        try:
+            async for chunk in writer.iter_chunks():
+                yield chunk
+            await producer
+        finally:
+            if not producer.done():
+                producer.cancel()
+                try:
+                    await producer
+                except asyncio.CancelledError:
+                    pass
+            await writer.finish()
 
     return StreamingResponse(
         event_stream(),
