@@ -96,6 +96,7 @@ logger = logging.getLogger("orchestrator")
 RUNNER_KEY = os.environ.get("RUNNER_KEY", "")
 DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "claude-sonnet-4-6")
 MAX_LOOP = int(os.environ.get("MAX_LOOP_ITERATIONS", "50"))
+MAX_CONTINUATION_NUDGES = int(os.environ.get("MAX_CONTINUATION_NUDGES", "5"))
 # Phase 9: strict-mode flip. When a skill has actions[] declared and the
 # model emits a command that doesn't match any declared action, gate the
 # execution through the pending-action approval flow instead of running it
@@ -482,8 +483,26 @@ def _publish_agent_switch(session_id: str, from_agent_id: str, to_agent_id: str,
 
 # ── tool-result envelope ──────────────────────────────────────────────────────
 
-TOOL_RESULT_MAX_TOTAL = 20000  # max chars of the JSON-serialized envelope
-TOOL_RESULT_MAX_DATA = 18000   # max chars of the inner `data` when stringified
+TOOL_RESULT_MAX_TOTAL = 85000  # max chars of the JSON-serialized envelope
+TOOL_RESULT_MAX_DATA = 80000   # max chars of the inner `data` when stringified
+
+_MID_WORK_RE = re.compile(
+    r"(?i)\b(?:let me|i(?:'ll| will| need to| should| can)\b.*(?:try|fetch|pull|run|get|check|query|call|request|split|break|aggregate|compute))"
+    r"|(?:truncat(?:ed|ion)|incomplete|partial|too (?:large|much)|cut off)"
+    r"|(?:next(?:,| step| i))"
+    r"|(?:now (?:i|let))"
+    r"|(?:alternatively|another approach|different (?:approach|strategy|way))"
+)
+
+
+def _looks_like_mid_work(text: str) -> bool:
+    """Return True if assistant text signals planned follow-up work rather
+    than a finished answer.  Used to decide whether to nudge the model to
+    continue calling tools instead of exiting the loop."""
+    if not text or len(text) < 20:
+        return False
+    last_200 = text[-200:]
+    return bool(_MID_WORK_RE.search(last_200))
 
 
 def _summarize_data(data) -> str:
@@ -605,7 +624,10 @@ def _build_tool_envelope(
             else json.dumps(data, ensure_ascii=False, default=str)
         )
         if len(data_str) > TOOL_RESULT_MAX_DATA:
-            data_serialized = data_str[:TOOL_RESULT_MAX_DATA] + "\n... [truncated]"
+            data_serialized = (
+                data_str[:TOOL_RESULT_MAX_DATA]
+                + "\n... [truncated — split into smaller date ranges or fewer fields to get complete data]"
+            )
             truncated = True
         else:
             data_serialized = data if not isinstance(data, str) else data_str
@@ -1933,6 +1955,7 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
             # bubble isn't blank. Flag prevents an infinite loop if the model
             # returns empty again.
             recovered_empty_end_turn = False
+            continuation_nudges = 0
 
             api_kwargs = dict(
                 base_url=RELAY_BASE_URL or req.anthropicConfig.baseURL,
@@ -2023,6 +2046,36 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                                 "sentences) of what you found or did in this "
                                 "turn. Do not call additional tools — just "
                                 "reply with text."
+                            ),
+                        })
+                        continue
+
+                    # ── Continuation nudge: mid-work text → keep iterating ──
+                    # Like Claude Code, if the model emitted text that signals
+                    # planned follow-up work (e.g. "let me try...",
+                    # "truncated", "next step") rather than a finished answer,
+                    # nudge it to continue calling tools instead of exiting.
+                    _assistant_text_so_far = "".join(
+                        b.get("text", "") for b in (stream.content or [])
+                        if b.get("type") == "text"
+                    )
+                    if (
+                        has_text
+                        and continuation_nudges < MAX_CONTINUATION_NUDGES
+                        and _looks_like_mid_work(_assistant_text_so_far)
+                    ):
+                        continuation_nudges += 1
+                        logger.info(
+                            "Continuation nudge %d/%d — model text signals "
+                            "planned follow-up (session=%s, iter=%d)",
+                            continuation_nudges, MAX_CONTINUATION_NUDGES,
+                            session_id, iteration + 1,
+                        )
+                        session["messages"].append({
+                            "role": "user",
+                            "content": (
+                                "Continue — execute your next step using tools. "
+                                "Do not repeat your previous explanation."
                             ),
                         })
                         continue
