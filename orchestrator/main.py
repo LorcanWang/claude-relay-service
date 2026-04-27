@@ -86,6 +86,10 @@ from hermes_emitter import emit_turn_completed, emit_tool_executed, emit_session
 from hermes_retrieval import build_memory_bundle
 from metrics_emitter import emit_run_completed, new_run_id
 
+if not sys.stdout.isatty():
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -2591,13 +2595,16 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                 session["messages"].append({"role": "user", "content": tool_results})
                 started_tool_work = True
                 planning_only_nudges = 0
+                yield ": keepalive\n\n"
 
             _scrub_ephemeral_attachments(session["messages"])
             save_session(session_id, session)
 
         except asyncio.CancelledError:
-            # Client disconnected mid-stream. Don't double-log a Traceback;
-            # just record the outcome and re-raise so SSE cleanup runs.
+            logger.warning(
+                "Client disconnected mid-stream [%s] at iter=%d",
+                session_id, iteration,
+            )
             _metric_outcome = "cancelled"
             raise
         except Exception as exc:
