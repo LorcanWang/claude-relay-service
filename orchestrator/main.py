@@ -96,7 +96,6 @@ logger = logging.getLogger("orchestrator")
 RUNNER_KEY = os.environ.get("RUNNER_KEY", "")
 DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "claude-sonnet-4-6")
 MAX_LOOP = int(os.environ.get("MAX_LOOP_ITERATIONS", "50"))
-MAX_CONTINUATION_NUDGES = int(os.environ.get("MAX_CONTINUATION_NUDGES", "5"))
 # Phase 9: strict-mode flip. When a skill has actions[] declared and the
 # model emits a command that doesn't match any declared action, gate the
 # execution through the pending-action approval flow instead of running it
@@ -486,23 +485,25 @@ def _publish_agent_switch(session_id: str, from_agent_id: str, to_agent_id: str,
 TOOL_RESULT_MAX_TOTAL = 85000  # max chars of the JSON-serialized envelope
 TOOL_RESULT_MAX_DATA = 80000   # max chars of the inner `data` when stringified
 
-_MID_WORK_RE = re.compile(
-    r"(?i)\b(?:let me|i(?:'ll| will| need to| should| can)\b.*(?:try|fetch|pull|run|get|check|query|call|request|split|break|aggregate|compute))"
-    r"|(?:truncat(?:ed|ion)|incomplete|partial|too (?:large|much)|cut off)"
-    r"|(?:next(?:,| step| i))"
+_PLANNING_ONLY_RE = re.compile(
+    r"(?i)(?:"
+    r"\b(?:let me|i(?:'ll| will| need to| should| can)\b.*?(?:try|fetch|pull|run|get|check|query|call|request|split|break|aggregate|compute))"
     r"|(?:now (?:i|let))"
+    r"|(?:next(?:,| step| i| ,))"
+    r"|(?:first[, ]+i)"
     r"|(?:alternatively|another approach|different (?:approach|strategy|way))"
+    r")"
 )
 
 
-def _looks_like_mid_work(text: str) -> bool:
-    """Return True if assistant text signals planned follow-up work rather
-    than a finished answer.  Used to decide whether to nudge the model to
-    continue calling tools instead of exiting the loop."""
-    if not text or len(text) < 20:
+def _is_planning_only(text: str, started_tool_work: bool) -> bool:
+    """Detect OpenClaw-style planning-only turn: assistant describes a plan or
+    next steps but emits zero tool calls.  Only triggers when we've already
+    started tool work (so a normal conversational answer isn't nudged)."""
+    if not started_tool_work or not text or len(text) < 30:
         return False
-    last_200 = text[-200:]
-    return bool(_MID_WORK_RE.search(last_200))
+    last_300 = text[-300:]
+    return bool(_PLANNING_ONLY_RE.search(last_300))
 
 
 def _summarize_data(data) -> str:
@@ -1950,15 +1951,14 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
             collected_actions: list[dict] = []
             step_id = 0
             _hermes_tool_names: list[str] = []
-            # Fires at most once per turn: if Claude ends with empty text after
-            # calling app_action, we re-prompt it for a text summary so the chat
-            # bubble isn't blank. Flag prevents an infinite loop if the model
-            # returns empty again.
             recovered_empty_end_turn = False
-            continuation_nudges = 0
-            # Track consecutive identical errors per skill so we can tell the
-            # model to stop retrying a fundamentally broken skill (e.g. missing
-            # API credentials).
+            # ── State machine counters (Claude Code / OpenClaw patterns) ──
+            iteration = 0
+            planning_only_nudges = 0
+            max_tokens_retries = 0
+            started_tool_work = False
+            cumulative_input_tokens = 0
+            cumulative_output_tokens = 0
             _skill_error_streak: dict[str, tuple[str, int]] = {}
 
             api_kwargs = dict(
@@ -1983,8 +1983,22 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
             _publish_agent_roster(session_id, effective_skills)
             _publish_agent_status(session_id, "lynx", "thinking", "Planning")
 
-            for iteration in range(MAX_LOOP):
-                logger.info("Loop iteration %d/%d for [%s]", iteration + 1, MAX_LOOP, session_id)
+            while True:
+                iteration += 1
+                if iteration > MAX_LOOP:
+                    logger.warning("Max loop iterations reached for [%s]", session_id)
+                    _metric_outcome = "max_loop_exhausted"
+                    yield sse({"type": "start-step"})
+                    _eid = str(step_id)
+                    yield sse({"type": "text-start", "id": _eid})
+                    yield sse({"type": "text-delta", "id": _eid, "delta": "I reached the maximum number of steps. Here is what I found so far."})
+                    yield sse({"type": "text-end", "id": _eid})
+                    yield sse({"type": "finish-step"})
+                    yield sse({"type": "finish", "finishReason": "stop"})
+                    _publish_agent_status(session_id, "lynx", "completed", "Done")
+                    yield sse("[DONE]")
+                    break
+                logger.info("Loop iteration %d/%d for [%s]", iteration, MAX_LOOP, session_id)
 
                 # Every iteration streams from Anthropic in real-time
                 stream = AnthropicStream(messages=session["messages"], **api_kwargs)
@@ -2011,7 +2025,7 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                     logger.info(
                         "Stream usage [%s iter=%d]: in=%d cache_create=%d cache_read=%d out=%d stop=%s",
                         session_id,
-                        iteration + 1,
+                        iteration,
                         stream.usage.get("input_tokens", 0),
                         stream.usage.get("cache_creation_input_tokens", 0),
                         stream.usage.get("cache_read_input_tokens", 0),
@@ -2019,7 +2033,12 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                         stop_reason,
                     )
                 else:
-                    logger.info("Stop reason: %s (iteration %d)", stop_reason, iteration + 1)
+                    logger.info("Stop reason: %s (iteration %d)", stop_reason, iteration)
+
+                # Track cumulative token usage for budget awareness
+                if stream.usage:
+                    cumulative_input_tokens += stream.usage.get("input_tokens", 0)
+                    cumulative_output_tokens += stream.usage.get("output_tokens", 0)
 
                 # Persist assistant message to session (skip if empty — Anthropic rejects blank content)
                 if stream.content:
@@ -2027,11 +2046,40 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                         {"role": "assistant", "content": stream.content}
                     )
 
+                # ── Stop-reason state machine (Claude Code / OpenClaw pattern) ──
+                # Branch on exact stop_reason rather than "not tool_use".
+                # tool_use falls through to the tool execution section below.
+
+                if stop_reason == "pause_turn":
+                    # Server-side tool paused — continue the loop (resend
+                    # assistant content as-is per Anthropic docs).
+                    logger.info("pause_turn — continuing (session=%s, iter=%d)", session_id, iteration)
+                    continue
+
+                if stop_reason == "max_tokens":
+                    # Model was cut off mid-generation. Retry with a
+                    # continuation prompt (Claude Code escalates output cap;
+                    # we nudge instead since our relay doesn't support dynamic cap).
+                    if max_tokens_retries < 2:
+                        max_tokens_retries += 1
+                        logger.info(
+                            "max_tokens recovery %d/2 (session=%s, iter=%d)",
+                            max_tokens_retries, session_id, iteration,
+                        )
+                        session["messages"].append({
+                            "role": "user",
+                            "content": (
+                                "Your response was cut off. Continue exactly from "
+                                "where you left off. If you need more data, use "
+                                "tools. Do not repeat prior text."
+                            ),
+                        })
+                        continue
+                    logger.warning("max_tokens exhausted after 2 retries (session=%s)", session_id)
+                    # Fall through to finalize with whatever we have
+
                 if stop_reason != "tool_use":
                     # ── Safety net: empty end_turn after an app_action ───────
-                    # If the model ended the turn with zero text but did emit
-                    # an app_action earlier, the user would see a blank chat
-                    # bubble. Re-prompt once for a text summary.
                     if (
                         not has_text
                         and collected_actions
@@ -2040,7 +2088,7 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                         logger.info(
                             "Empty end_turn after app_action — requesting text "
                             "summary (session=%s, iter=%d)",
-                            session_id, iteration + 1,
+                            session_id, iteration,
                         )
                         recovered_empty_end_turn = True
                         session["messages"].append({
@@ -2054,37 +2102,35 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                         })
                         continue
 
-                    # ── Continuation nudge: mid-work text → keep iterating ──
-                    # Like Claude Code, if the model emitted text that signals
-                    # planned follow-up work (e.g. "let me try...",
-                    # "truncated", "next step") rather than a finished answer,
-                    # nudge it to continue calling tools instead of exiting.
+                    # ���─ Planning-only nudge (OpenClaw pattern) ───────────────
+                    # If the model described a plan but emitted zero tool
+                    # calls, nudge it to act. Capped at 2 (OpenClaw uses 1-2).
                     _assistant_text_so_far = "".join(
                         b.get("text", "") for b in (stream.content or [])
                         if b.get("type") == "text"
                     )
                     if (
                         has_text
-                        and continuation_nudges < MAX_CONTINUATION_NUDGES
-                        and _looks_like_mid_work(_assistant_text_so_far)
+                        and planning_only_nudges < 2
+                        and _is_planning_only(_assistant_text_so_far, started_tool_work)
                     ):
-                        continuation_nudges += 1
+                        planning_only_nudges += 1
                         logger.info(
-                            "Continuation nudge %d/%d — model text signals "
-                            "planned follow-up (session=%s, iter=%d)",
-                            continuation_nudges, MAX_CONTINUATION_NUDGES,
-                            session_id, iteration + 1,
+                            "Planning-only nudge %d/2 — model described plan "
+                            "without tool calls (session=%s, iter=%d)",
+                            planning_only_nudges, session_id, iteration,
                         )
                         session["messages"].append({
                             "role": "user",
                             "content": (
-                                "Continue — execute your next step using tools. "
-                                "Do not repeat your previous explanation."
+                                "Do not restate the plan. Act now: take the next "
+                                "concrete tool action you need. If the task is "
+                                "truly complete, provide the final answer."
                             ),
                         })
                         continue
 
-                    # ── end_turn: emit actions + finish ──────────────────────
+                    # ── end_turn / refusal: emit actions + finish ────────────
                     if collected_actions:
                         for action in collected_actions:
                             yield sse({"type": "data-action", "data": action})
@@ -2536,20 +2582,8 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                     })
 
                 session["messages"].append({"role": "user", "content": tool_results})
-
-            else:
-                # Hit max iterations without end_turn
-                yield sse({"type": "start-step"})
-                text_id = str(step_id)
-                yield sse({"type": "text-start", "id": text_id})
-                yield sse({"type": "text-delta", "id": text_id, "delta": "I reached the maximum number of steps. Please try a simpler request."})
-                yield sse({"type": "text-end", "id": text_id})
-                yield sse({"type": "finish-step"})
-                yield sse({"type": "finish", "finishReason": "stop"})
-                _publish_agent_status(session_id, "lynx", "completed", "Done")
-                yield sse("[DONE]")
-                logger.warning("Max loop iterations reached for [%s]", session_id)
-                _metric_outcome = "max_loop_exhausted"
+                started_tool_work = True
+                planning_only_nudges = 0
 
             _scrub_ephemeral_attachments(session["messages"])
             save_session(session_id, session)

@@ -39,6 +39,7 @@ status: active
 
 ## Skills & Tool Use
 
+- [[agent-loop-architecture|Agent Loop Architecture]] `architecture` `orchestrator` `tool-use` `claude` `agent-loop`
 - [[skill-manifest-evolution|Skill Manifest Evolution]] `architecture` `skills` `orchestrator` `agent-json` `manifest` `validation`
 - [[tool-envelope|Tool Result Envelope]] `orchestrator` `tool-use` `observability` `claude`
 - [[skill-concurrency|Skill Concurrency Model]] `orchestrator` `skills` `concurrency` `race-condition` `executor`
