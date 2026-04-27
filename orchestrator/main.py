@@ -173,7 +173,7 @@ ORCHESTRATOR_PUBLIC_URL = os.environ.get(
     "ORCHESTRATOR_PUBLIC_URL", "https://claude-orchestrator.clawdbots.dev"
 )
 SSE_KEEPALIVE_INTERVAL_SECONDS = float(
-    os.environ.get("SSE_KEEPALIVE_INTERVAL_SECONDS", "15")
+    os.environ.get("SSE_KEEPALIVE_INTERVAL_SECONDS", "10")
 )
 
 app = FastAPI(title="Orchestrator", version="1.0.0")
@@ -475,7 +475,6 @@ class _SSEStreamWriter:
     async def start(self) -> None:
         if self._keepalive_task is None:
             self._keepalive_task = asyncio.create_task(self._keepalive_loop())
-            logger.info("SSE keepalive task started (interval=%.0fs)", self._keepalive_interval)
 
     async def send(self, chunk: str) -> None:
         if self._closed:
@@ -516,7 +515,6 @@ class _SSEStreamWriter:
             while True:
                 await asyncio.sleep(self._keepalive_interval)
                 if self._closed:
-                    logger.debug("SSE keepalive loop: writer closed, exiting")
                     return
                 idle_for = time.monotonic() - self._last_emit
                 if idle_for >= self._keepalive_interval:
