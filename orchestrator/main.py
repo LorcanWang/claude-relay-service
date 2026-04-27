@@ -2254,6 +2254,23 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                                     "It is reserved for human/admin invocation."
                                 ),
                             }
+                        elif skill_name and _skill_error_streak.get(skill_name, ("", 0))[1] >= 3:
+                            _cb_prev_err = _skill_error_streak[skill_name][0]
+                            _cb_streak = _skill_error_streak[skill_name][1]
+                            logger.info(
+                                "Circuit breaker BLOCKED execution: skill=%s streak=%d",
+                                skill_name, _cb_streak,
+                            )
+                            result = {
+                                "ok": False,
+                                "error": (
+                                    f"BLOCKED: skill '{skill_name}' has failed {_cb_streak}x "
+                                    f"with the same error ({_cb_prev_err[:80]}). This is a "
+                                    "structural failure (missing credentials or config). "
+                                    "Do NOT retry. Present what you have and note this "
+                                    "data source was unavailable."
+                                ),
+                            }
                         else:
                             _publish_agent_switch(session_id, "lynx", skill_id, f"Delegating to {skill_name}")
                             _publish_agent_status(session_id, skill_id, "working", preview or "Running command")
@@ -2537,7 +2554,9 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                         action_gap=action_gap,
                     )
 
-                    # ── Repeated-error circuit breaker ─────────────────
+                    # ── Repeated-error streak tracker ──────────────────
+                    # Increments the streak so the pre-execution gate (above)
+                    # can block future calls after 3 identical failures.
                     _cb_skill = inp.get("skill", tool_name)
                     if envelope.get("status") != "ok":
                         _cb_err = (envelope.get("error") or envelope.get("summary") or "")[:120]
@@ -2546,18 +2565,6 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                             _skill_error_streak[_cb_skill] = (_cb_err, _prev_count + 1)
                         else:
                             _skill_error_streak[_cb_skill] = (_cb_err, 1)
-                        _, streak = _skill_error_streak[_cb_skill]
-                        if streak >= 2:
-                            envelope["STOP"] = (
-                                f"Same error {streak}x in a row. This is a structural failure "
-                                "(missing credentials, unsupported flag, etc.), NOT transient. "
-                                "Do NOT retry this skill. Present the data you already have "
-                                "and note which source was unavailable."
-                            )
-                            logger.info(
-                                "Circuit breaker: skill=%s streak=%d error=%s",
-                                _cb_skill, streak, _cb_err[:80],
-                            )
                     else:
                         _skill_error_streak.pop(_cb_skill, None)
 
