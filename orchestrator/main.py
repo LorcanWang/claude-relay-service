@@ -475,6 +475,7 @@ class _SSEStreamWriter:
     async def start(self) -> None:
         if self._keepalive_task is None:
             self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+            logger.info("SSE keepalive task started (interval=%.0fs)", self._keepalive_interval)
 
     async def send(self, chunk: str) -> None:
         if self._closed:
@@ -515,6 +516,7 @@ class _SSEStreamWriter:
             while True:
                 await asyncio.sleep(self._keepalive_interval)
                 if self._closed:
+                    logger.debug("SSE keepalive loop: writer closed, exiting")
                     return
                 idle_for = time.monotonic() - self._last_emit
                 if idle_for >= self._keepalive_interval:
@@ -523,6 +525,8 @@ class _SSEStreamWriter:
                     self._last_emit = time.monotonic()
         except asyncio.CancelledError:
             raise
+        except Exception:
+            logger.exception("SSE keepalive loop crashed")
 
 
 def _publish_agent_roster(session_id: str, enabled_skills: list[SkillMeta]):
