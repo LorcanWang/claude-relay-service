@@ -2191,9 +2191,8 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
 
                     await writer.send_data({"type": "finish-step"})
 
-                    # ── Execute tool calls ───────────────────────────────────────
-                    tool_results = []
-                    for tool in tool_uses:
+                    # ── Execute tool calls (parallel) ─────────────────────────────
+                    async def _exec_tool(tool):
                         tool_id = tool["id"]
                         tool_name = tool.get("name", "")
                         inp = tool.get("input", {})
@@ -2590,12 +2589,15 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                         except Exception:
                             pass
 
-                        tool_results.append({
+                        return {
                             "type": "tool_result",
                             "tool_use_id": tool_id,
                             "content": _envelope_to_tool_content(envelope),
-                        })
+                        }
 
+                    tool_results = list(await asyncio.gather(
+                        *[_exec_tool(t) for t in tool_uses]
+                    ))
                     session["messages"].append({"role": "user", "content": tool_results})
                     started_tool_work = True
                     planning_only_nudges = 0
