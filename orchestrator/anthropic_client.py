@@ -324,7 +324,10 @@ class AnthropicStream:
     async def __aiter__(self) -> AsyncIterator[str]:
         """Yield text delta strings as they arrive. Populates self.content/stop_reason/tool_uses."""
         # Use aiohttp — httpx corrupts binary data via implicit UTF-8 decoding
-        timeout = aiohttp.ClientTimeout(connect=30, sock_read=300)
+        timeout = aiohttp.ClientTimeout(total=600, connect=30, sock_read=300)
+        logger.info("API stream opening: model=%s messages=%d url=%s",
+                     self._payload.get("model", "?"), len(self._payload.get("messages", [])),
+                     self._url[:80])
         async with aiohttp.ClientSession(timeout=timeout, auto_decompress=False) as session:
             async with session.post(self._url, json=self._payload, headers=self._headers) as resp:
                 if resp.status != 200:
@@ -332,6 +335,7 @@ class AnthropicStream:
                     raise RuntimeError(
                         f"Anthropic API error {resp.status}: {body.decode()[:500]}"
                     )
+                logger.info("API stream connected: status=%d", resp.status)
 
                 content_encoding = resp.headers.get("Content-Encoding", "").lower()
                 logger.debug("Stream response content-type: %s encoding: %s",
