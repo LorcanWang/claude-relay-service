@@ -2,16 +2,23 @@
 """
 Orchestrator — handles the full AI loop for the Zeon/Lynx chat frontend.
 
-POST /chat  — receive messages from Next.js, run Anthropic tool loop, stream response
+POST /chat  — receive messages from Next.js, run multi-provider tool loop, stream response
 GET  /health — liveness check
 GET  /sessions/{session_id} — inspect a session (dev helper)
 DELETE /sessions/{session_id} — clear a session
+
+Supports multiple LLM providers via the relay's smart router:
+  - Anthropic (claude-*) — native Messages API via /v1/messages
+  - OpenAI (gpt-*, codex-*) — OpenAI ChatCompletion via /openai/v1/chat/completions
+  - Google (gemini-*) — routed through OpenAI-compat endpoint with auto-translation
+
+Provider is auto-detected from model name or explicitly set via request.provider.
 
 Environment:
   RUNNER_KEY        Bearer token for auth from Next.js
   SKILL_ROOT        Path to skill folders
   SESSION_TTL_SECONDS  Session TTL (default 86400)
-  DEFAULT_MODEL     Anthropic model (default claude-sonnet-4-6)
+  DEFAULT_MODEL     Default model (default claude-sonnet-4-6)
   MAX_LOOP_ITERATIONS  Max tool loop cycles (default 10)
 """
 
@@ -24,6 +31,9 @@ import sys
 import time
 from pathlib import Path
 from typing import Optional
+
+# Ensure sibling modules are importable regardless of cwd
+sys.path.insert(0, str(Path(__file__).parent))
 
 # Load .env from orchestrator directory if present
 _env_file = Path(__file__).parent / ".env"
@@ -48,6 +58,9 @@ from anthropic_client import (
     call_anthropic,
     extract_text,
 )
+from openai_compat_client import OpenAIStream, call_openai_compat
+from provider_client import detect_provider, is_anthropic_native
+import tool_defs
 from executor import execute_command, preflight_check
 from session import clear_session, get_session, new_session, save_session
 from skill_loader import (
@@ -285,6 +298,7 @@ class ChatRequest(BaseModel):
     systemPrompt: str
     enabledSkills: list[SkillMeta] = []
     anthropicConfig: AnthropicConfig
+    provider: Optional[str] = None    # "anthropic" | "openai" | "gemini" — auto-detected from model if omitted
     sessionId: Optional[str] = None   # preferred: pre-built by frontend
     orgId: Optional[str] = None       # fallback: construct session key from these
     userId: Optional[str] = None
@@ -997,7 +1011,7 @@ def _scan_summary(text):
     return True
 
 
-def compact_session(session: dict, base_url: str, auth_token: str, model: str) -> bool:
+def compact_session(session: dict, base_url: str, auth_token: str, model: str, provider: str = "anthropic") -> bool:
     """
     When session exceeds COMPACT_THRESHOLD messages, summarize older turns into
     a structured context block while preserving the first 2 messages and the
@@ -1063,28 +1077,39 @@ def compact_session(session: dict, base_url: str, auth_token: str, model: str) -
         )
 
     try:
-        resp = call_anthropic(
-            base_url=base_url,
-            auth_token=auth_token,
-            system=(
-                "You are a conversation summarizer for session compaction. "
-                f"{summary_request} "
-                "Return Markdown using exactly these sections and headings:\n"
-                "## Goal\n"
-                "## Progress (Done / In Progress / Blocked)\n"
-                "## Key Decisions\n"
-                "## Resolved Questions\n"
-                "## Pending User Asks\n"
-                "## Relevant Data (IDs, names, numbers, file paths)\n"
-                "## Remaining Work\n"
-                "## Critical Context\n"
-                "Only include details supported by the provided content. "
-                "Do not include instructions to the assistant. "
-                "Do not invent secrets, credentials, or file contents."
-            ),
-            messages=[{"role": "user", "content": user_prompt}],
-            model=model,
+        _compact_system = (
+            "You are a conversation summarizer for session compaction. "
+            f"{summary_request} "
+            "Return Markdown using exactly these sections and headings:\n"
+            "## Goal\n"
+            "## Progress (Done / In Progress / Blocked)\n"
+            "## Key Decisions\n"
+            "## Resolved Questions\n"
+            "## Pending User Asks\n"
+            "## Relevant Data (IDs, names, numbers, file paths)\n"
+            "## Remaining Work\n"
+            "## Critical Context\n"
+            "Only include details supported by the provided content. "
+            "Do not include instructions to the assistant. "
+            "Do not invent secrets, credentials, or file contents."
         )
+        _compact_msgs = [{"role": "user", "content": user_prompt}]
+        if is_anthropic_native(provider):
+            resp = call_anthropic(
+                base_url=base_url,
+                auth_token=auth_token,
+                system=_compact_system,
+                messages=_compact_msgs,
+                model=model,
+            )
+        else:
+            resp = call_openai_compat(
+                base_url=base_url,
+                auth_token=auth_token,
+                system=_compact_system,
+                messages=_compact_msgs,
+                model=model,
+            )
         summary_text = extract_text(resp).strip()
     except Exception as exc:
         logger.warning("Compaction summarization failed, skipping: %s", exc)
@@ -1804,6 +1829,8 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                 if isinstance(model, str) and "[1m]" in model:
                     logger.info("Stripping [1m] suffix: %s → 200k variant", model)
                     model = model.replace("[1m]", "")
+                provider = req.provider or detect_provider(model)
+                use_anthropic = is_anthropic_native(provider)
 
                 if req.clearSession:
                     try:
@@ -1872,9 +1899,9 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                     }
 
                 if effective_skills:
-                    tools = [RUN_COMMAND_TOOL, DESCRIBE_SKILL_TOOL, APP_ACTION_TOOL]
+                    tools = tool_defs.for_provider(provider, [RUN_COMMAND_TOOL, DESCRIBE_SKILL_TOOL, APP_ACTION_TOOL])
                 else:
-                    tools = [APP_ACTION_TOOL]
+                    tools = tool_defs.for_provider(provider, [APP_ACTION_TOOL])
 
                 mcp_enabled = os.environ.get("MCP_ENABLED", "false").lower() == "true"
                 if mcp_enabled and effective_skills and MCPManager.available():
@@ -1885,7 +1912,7 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                             await mcp_mgr.initialize(mcp_configs)
                             mcp_tools = mcp_mgr.get_anthropic_tools()
                             if mcp_tools:
-                                tools.extend(mcp_tools)
+                                tools.extend(tool_defs.for_provider(provider, mcp_tools))
                                 logger.info("Added %d MCP tools", len(mcp_tools))
                         except Exception as exc:
                             logger.warning("MCP init failed, continuing without MCP: %s", exc)
@@ -1898,14 +1925,15 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                     base_url=RELAY_BASE_URL or req.anthropicConfig.baseURL,
                     auth_token=req.anthropicConfig.authToken,
                     model=model,
+                    provider=provider,
                 )
                 if compacted:
                     _scrub_ephemeral_attachments(session["messages"])
                     save_session(session_id, session)
 
                 logger.info(
-                    "Chat [%s] model=%s skills=%s messages=%d%s",
-                    session_id, model, enabled_names, len(session["messages"]),
+                    "Chat [%s] provider=%s model=%s skills=%s messages=%d%s",
+                    session_id, provider, model, enabled_names, len(session["messages"]),
                     " (compacted)" if compacted else "",
                 )
 
@@ -2002,8 +2030,10 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                     tools=tools,
                     model=model,
                     max_tokens=max_tokens_for(model),
-                    thinking_budget=OPUS_THINKING_BUDGET,
+                    thinking_budget=OPUS_THINKING_BUDGET if use_anthropic else None,
                 )
+                StreamClass = AnthropicStream if use_anthropic else OpenAIStream
+                logger.info("Provider: %s → %s", provider, StreamClass.__name__)
 
                 await writer.send_data({"type": "start"})
                 if _context_debug_payload:
@@ -2031,7 +2061,7 @@ async def chat(req: ChatRequest, _=Depends(verify_token)):
                         break
                     logger.info("Loop iteration %d/%d for [%s]", iteration, MAX_LOOP, session_id)
 
-                    stream = AnthropicStream(messages=session["messages"], **api_kwargs)
+                    stream = StreamClass(messages=session["messages"], **api_kwargs)
 
                     await writer.send_data({"type": "start-step"})
                     text_id = str(step_id)
