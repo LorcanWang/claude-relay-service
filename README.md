@@ -527,6 +527,8 @@ requires_openai_auth = true
 
 > ⚠️ 在通过 Nginx 反向代理 CRS 服务并使用 Codex CLI 时，需要在 http 块中添加 underscores_in_headers on;。因为 Nginx 默认会移除带下划线的请求头（如 session_id），一旦该头被丢弃，多账号环境下的粘性会话功能将失效。
 
+> 💡 想把你自己的模型服务接到 Codex、Droid CLI 或 Claude Code / CCR？可参考 [自定义模型服务接入指南](docs/custom-model-service-guide.md)。
+
 **Droid CLI 配置：**
 
 Droid CLI 读取 `~/.factory/config.json`。可以在该文件中添加自定义模型以指向本服务的新端点：
@@ -571,6 +573,8 @@ Droid CLI 读取 `~/.factory/config.json`。可以在该文件中添加自定义
 ```
 
 > 💡 将示例中的 `http://127.0.0.1:3000` 替换为你的服务域名或公网地址，并写入后台生成的 API 密钥（cr_ 开头）。
+
+> 💡 如果你要新增自己的模型服务，或判断应该走 `/openai`、`/droid/openai`、`/droid/comm/v1/` 还是 CCR 链路，可参考 [自定义模型服务接入指南](docs/custom-model-service-guide.md)。
 
 ### 5. 第三方工具API接入
 
